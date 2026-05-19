@@ -1,0 +1,58 @@
+services:
+  vectordb-postgres:
+    image: pgvector/pgvector:pg16
+    container_name: local-tooling-vectordb-postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-ai}
+      POSTGRES_USER: ${POSTGRES_USER:-ai}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ai}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - vectordb_pgdata:/var/lib/postgresql/data
+      - ./services/vectordb/db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ai} -d ${POSTGRES_DB:-ai}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  vectordb-api:
+    build:
+      context: ./services/vectordb
+    container_name: local-tooling-vectordb-api
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-ai}:${POSTGRES_PASSWORD:-ai}@vectordb-postgres:5432/${POSTGRES_DB:-ai}
+      EMBEDDING_DIM: ${EMBEDDING_DIM:-768}
+      EMBEDDING_BACKEND: ${EMBEDDING_BACKEND:-mock}
+      OLLAMA_URL: ${OLLAMA_URL:-http://host.docker.internal:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-nomic-embed-text}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_EMBEDDING_MODEL: ${OPENAI_EMBEDDING_MODEL:-text-embedding-3-small}
+      SEARCH_CANDIDATES: ${SEARCH_CANDIDATES:-50}
+    depends_on:
+      vectordb-postgres:
+        condition: service_healthy
+    ports:
+      - "${VDB_API_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  vectordb-mcp-bridge:
+    build:
+      context: ./services/vectordb-mcp-bridge
+    container_name: local-tooling-vectordb-mcp-bridge
+    environment:
+      VDB_API_URL: http://vectordb-api:8000
+      VDB_DEBUG: ${VDB_DEBUG:-false}
+    depends_on:
+      vectordb-api:
+        condition: service_started
+    stdin_open: true
+
+volumes:
+  vectordb_pgdata:

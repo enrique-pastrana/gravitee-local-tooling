@@ -1,0 +1,8 @@
+.env
+.local-tooling/
+manifests/generated/
+reports/
+*.bak
+__pycache__/
+*.pyc
+node_modules/
