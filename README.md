@@ -14,11 +14,25 @@ It packages:
 
 ## Quick start
 
+Run these commands from the `local-tooling` repository.
+
+`--repo` must point to the working code repository the developer wants the agent
+to understand and work on. It is not the path to `local-tooling`.
+
 ```bash
 cp .env.example .env
 # edit .env with your tokens and preferred embedding backend
 
-./bin/local-tooling setup --agents all --repo /path/to/your/repo --bootstrap
+./bin/local-tooling setup --agents all --repo /path/to/the/code-repo-you-work-on --bootstrap
+```
+
+Example for `gravitee-api-management`:
+
+```bash
+./bin/local-tooling setup --agents all \
+  --repo /Users/madamek/work/gravitee/repos/legacy/gravitee-api-management \
+  --profile gravitee-apim \
+  --bootstrap
 ```
 
 Then restart Codex, Cursor, or Claude if they were already running.
@@ -35,20 +49,18 @@ Configure yourself using the local-tooling repo and run doctor.
 ./bin/local-tooling start
 ./bin/local-tooling stop
 ./bin/local-tooling doctor
-./bin/local-tooling manifest --repo /path/to/repo --profile default
-./bin/local-tooling index --repo /path/to/repo --profile default
+./bin/local-tooling manifest --repo /path/to/the/code-repo-you-work-on --profile default
+./bin/local-tooling index --repo /path/to/the/code-repo-you-work-on --profile default
 ./bin/local-tooling print-config --agent codex
-```
-
-For `gravitee-api-management`, use:
-
-```bash
-./bin/local-tooling setup --agents all --repo /path/to/gravitee-api-management --profile gravitee-apim --bootstrap
 ```
 
 ## Bootstrap indexing
 
 Bootstrap indexing does not transfer a database. It generates a local manifest from files the developer already has access to, then ingests those files into their local vectordb.
+
+The `--repo` value controls what gets indexed. For example, if a developer works
+on `gravitee-api-management`, `--repo` should be the absolute path to their local
+checkout of `gravitee-api-management`.
 
 The default profile indexes high-signal repo context:
 

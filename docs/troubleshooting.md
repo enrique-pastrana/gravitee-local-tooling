@@ -7,9 +7,13 @@ Run:
 ```bash
 docker version
 docker compose version
+docker info
 ```
 
 Start Docker Desktop or your Docker daemon, then retry `./bin/local-tooling doctor`.
+
+If `docker info` fails, `local-tooling setup` and `local-tooling start` will stop
+before running Compose and print the daemon error directly.
 
 ## Port conflict
 
@@ -20,7 +24,7 @@ Change `VDB_API_PORT` or `POSTGRES_PORT` in `.env`.
 Run:
 
 ```bash
-./bin/local-tooling index --repo /path/to/repo --profile default
+./bin/local-tooling index --repo /path/to/the/code-repo-you-work-on --profile default
 ./bin/local-tooling doctor
 ```
 

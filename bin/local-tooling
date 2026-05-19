@@ -79,6 +79,58 @@ def command_exists(name: str) -> bool:
     return shutil.which(name) is not None
 
 
+def docker_daemon_running() -> tuple[bool, str]:
+    if not command_exists("docker"):
+        return False, "docker command is missing"
+    try:
+        result = subprocess.run(
+            ["docker", "info"],
+            cwd=ROOT,
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=10,
+        )
+    except subprocess.TimeoutExpired:
+        return False, "docker info timed out"
+    except OSError as exc:
+        return False, str(exc)
+    if result.returncode == 0:
+        return True, "running"
+    message = (result.stderr or result.stdout or "docker info failed").strip()
+    return False, message.splitlines()[0] if message else "docker info failed"
+
+
+def docker_compose_available() -> tuple[bool, str]:
+    if not command_exists("docker"):
+        return False, "docker command is missing"
+    result = subprocess.run(
+        ["docker", "compose", "version"],
+        cwd=ROOT,
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    if result.returncode == 0:
+        return True, result.stdout.strip()
+    message = (result.stderr or result.stdout or "docker compose version failed").strip()
+    return False, message.splitlines()[0] if message else "docker compose version failed"
+
+
+def require_docker() -> None:
+    compose_ok, compose_message = docker_compose_available()
+    if not compose_ok:
+        raise SystemExit(f"Docker Compose is not available: {compose_message}")
+
+    daemon_ok, daemon_message = docker_daemon_running()
+    if not daemon_ok:
+        raise SystemExit(
+            "Docker is installed, but the Docker daemon is not running or is not accessible.\n"
+            "Start Docker Desktop or your Docker daemon, then retry.\n"
+            f"Details: {daemon_message}"
+        )
+
+
 def backup_file(path: Path) -> None:
     if not path.exists():
         return
@@ -412,6 +464,7 @@ def check_port(host: str, port: int) -> bool:
 
 
 def start_stack(env: dict[str, str]) -> None:
+    require_docker()
     run(compose_cmd("up", "-d", "--build"), env=env)
 
 
@@ -444,14 +497,24 @@ def wait_for_health(env: dict[str, str], timeout_seconds: int = 60) -> None:
 
 
 def doctor(env: dict[str, str]) -> None:
+    compose_ok, compose_message = docker_compose_available()
+    daemon_ok, daemon_message = docker_daemon_running()
     checks = {
         "docker": command_exists("docker"),
+        "docker compose": compose_ok,
+        "docker daemon": daemon_ok,
         "node": command_exists("node"),
         "npm": command_exists("npm"),
     }
     for name, ok in checks.items():
         print(f"{name}: {'ok' if ok else 'missing'}")
     if not all(checks.values()):
+        if not compose_ok:
+            print(f"Docker Compose detail: {compose_message}")
+        if not daemon_ok:
+            print("Docker daemon detail:")
+            print(daemon_message)
+            print("Start Docker Desktop or your Docker daemon, then retry.")
         raise SystemExit(1)
 
     vdb_port = int(env.get("VDB_API_PORT", "8000"))

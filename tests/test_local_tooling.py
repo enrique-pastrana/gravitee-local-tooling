@@ -5,6 +5,8 @@ import importlib.util
 import json
 import tempfile
 import unittest
+from subprocess import CompletedProcess, TimeoutExpired
+from unittest import mock
 from pathlib import Path
 
 
@@ -67,6 +69,32 @@ class LocalToolingTest(unittest.TestCase):
             self.assertEqual(payload["contexts"][0]["root"], repo.resolve().as_posix())
             self.assertEqual(payload["contexts"][0]["metadata"]["profile"], "default")
             self.assertIn("**/target/**", payload["contexts"][0]["exclude"])
+
+    def test_docker_daemon_running_reports_stopped_daemon(self) -> None:
+        cli = load_cli()
+        result = CompletedProcess(
+            args=["docker", "info"],
+            returncode=1,
+            stdout="",
+            stderr="Cannot connect to the Docker daemon",
+        )
+        with mock.patch.object(cli, "command_exists", return_value=True), mock.patch.object(
+            cli.subprocess, "run", return_value=result
+        ):
+            running, message = cli.docker_daemon_running()
+
+        self.assertFalse(running)
+        self.assertEqual(message, "Cannot connect to the Docker daemon")
+
+    def test_docker_daemon_running_reports_timeout(self) -> None:
+        cli = load_cli()
+        with mock.patch.object(cli, "command_exists", return_value=True), mock.patch.object(
+            cli.subprocess, "run", side_effect=TimeoutExpired(["docker", "info"], timeout=10)
+        ):
+            running, message = cli.docker_daemon_running()
+
+        self.assertFalse(running)
+        self.assertEqual(message, "docker info timed out")
 
 
 if __name__ == "__main__":
