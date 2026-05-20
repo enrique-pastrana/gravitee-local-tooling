@@ -15,3 +15,9 @@ To preview what would be added, run:
 ```
 
 Generated configs call `bin/local-tooling mcp <server>` so secrets stay in `.env`.
+
+For target repositories, install lightweight workflow rules with:
+
+```bash
+./bin/local-tooling install-agent-rules --repo /path/to/the/code-repo-you-work-on --agents cursor
+```

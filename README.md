@@ -7,10 +7,12 @@ It packages:
 - local `pgvector` vectordb
 - a FastAPI ingestion/search API
 - an MCP bridge exposing `rag_health`, `rag_search`, and `rag_ingest`
+- `rag_prepare_task` for a first-pass task context search
 - read-only GitHub MCP wiring
 - read/search Atlassian MCP wiring
 - Kapa MCP wiring
 - local repo bootstrap indexing, generated on each developer machine
+- lightweight task sessions for context, review, and reusable learning
 
 ## Quick start
 
@@ -51,8 +53,51 @@ Configure yourself using the local-tooling repo and run doctor.
 ./bin/local-tooling doctor
 ./bin/local-tooling manifest --repo /path/to/the/code-repo-you-work-on --profile default
 ./bin/local-tooling index --repo /path/to/the/code-repo-you-work-on --profile default
+./bin/local-tooling context --repo /path/to/the/code-repo-you-work-on --task "APIM-12345 ..."
+./bin/local-tooling review-change --repo /path/to/the/code-repo-you-work-on
+./bin/local-tooling learn --repo /path/to/the/code-repo-you-work-on --task "APIM-12345 ..." --summary-file learning.md
+./bin/local-tooling install-agent-rules --repo /path/to/the/code-repo-you-work-on --agents cursor
 ./bin/local-tooling print-config --agent codex
 ```
+
+## Upgrade
+
+Existing users can update with the same flow as the initial setup. This keeps
+the local vectordb volume and rebuilds only the service images/configuration.
+
+```bash
+cd /path/to/local-tooling
+git pull
+
+./bin/local-tooling stop
+./bin/local-tooling setup --agents all --repo /path/to/the/code-repo-you-work-on --bootstrap
+```
+
+For `gravitee-api-management`:
+
+```bash
+cd /path/to/local-tooling
+git pull
+
+./bin/local-tooling stop
+./bin/local-tooling setup --agents all \
+  --repo /path/to/gravitee-api-management \
+  --profile gravitee-apim \
+  --bootstrap
+```
+
+If you want the target repo to receive/update the lightweight workflow rules
+used by Cursor/Codex/Claude, run:
+
+```bash
+./bin/local-tooling install-agent-rules --repo /path/to/the/code-repo-you-work-on --agents cursor
+```
+
+Restart Codex, Cursor, or Claude after upgrading so they reload MCP config and
+new tools such as `rag_prepare_task`.
+
+Do not run `docker compose down -v` unless you intentionally want to delete the
+local vectordb data.
 
 ## Bootstrap indexing
 
@@ -74,6 +119,53 @@ The default profile indexes high-signal repo context:
 The `gravitee-apim` profile adds APIM-specific module rules and higher-signal Java/Angular patterns.
 
 Generated manifests are written to `manifests/generated/`. Reports are written to `reports/`.
+
+## Task workflow
+
+The workflow is intentionally advisory by default. It improves context gathering
+without blocking simple local development.
+
+Start a non-trivial task with:
+
+```bash
+./bin/local-tooling context --repo /path/to/the/code-repo-you-work-on --task "APIM-12345 short task summary"
+```
+
+This queries vectordb, writes a context receipt under:
+
+```text
+<repo>/.local-tooling/sessions/<session-id>/context.json
+```
+
+When the target repo is a Git repository, `.local-tooling/` is added to its
+local `.git/info/exclude` so session receipts do not pollute commits.
+
+Before a final answer or commit, run:
+
+```bash
+./bin/local-tooling review-change --repo /path/to/the/code-repo-you-work-on
+```
+
+By default this is warning-only. Use `--strict` only when you want it to fail on
+missing context, missing test changes for production edits, or missing learning.
+
+When the task produced reusable knowledge, save it:
+
+```bash
+./bin/local-tooling learn --repo /path/to/the/code-repo-you-work-on --task "APIM-12345" --summary-file learning.md
+```
+
+If there is nothing useful to remember, record that explicitly without ingesting:
+
+```bash
+./bin/local-tooling learn --repo /path/to/the/code-repo-you-work-on --task "APIM-12345" --skip "mechanical rename, no reusable learning"
+```
+
+To make this workflow visible to agents in the target repo:
+
+```bash
+./bin/local-tooling install-agent-rules --repo /path/to/the/code-repo-you-work-on --agents cursor
+```
 
 ## Safety defaults
 
@@ -98,6 +190,7 @@ flowchart TD
     D --> E["vectordb API"]
     E --> F["vectordb MCP bridge"]
     G["Codex/Cursor/Claude"] --> F
+    G --> K["task sessions"]
     G --> H["GitHub MCP read-only"]
     G --> I["Atlassian MCP read/search"]
     G --> J["Kapa MCP"]

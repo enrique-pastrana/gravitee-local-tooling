@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.machinery
 import importlib.util
 import json
+import subprocess
 import tempfile
 import unittest
 from subprocess import CompletedProcess, TimeoutExpired
@@ -95,6 +96,89 @@ class LocalToolingTest(unittest.TestCase):
 
         self.assertFalse(running)
         self.assertEqual(message, "docker info timed out")
+
+    def test_review_change_warns_for_production_change_without_context(self) -> None:
+        cli = load_cli()
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            (repo / "src" / "main" / "java").mkdir(parents=True)
+            subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+            (repo / "src" / "main" / "java" / "App.java").write_text("class App {}\n", encoding="utf-8")
+
+            result = cli.review_change(repo, session_id=None, strict=True)
+
+        self.assertEqual(result, 1)
+
+    def test_review_change_passes_with_context_learning_and_tests(self) -> None:
+        cli = load_cli()
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            (repo / "src" / "main" / "java").mkdir(parents=True)
+            (repo / "src" / "test" / "java").mkdir(parents=True)
+            subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+            session = "20260520-test"
+            session_dir = cli.session_dir(repo, session)
+            session_dir.mkdir(parents=True)
+            (session_dir / "context.json").write_text("{}\n", encoding="utf-8")
+            (session_dir / "learning-skip.json").write_text("{}\n", encoding="utf-8")
+            cli.write_latest_session(repo, session)
+            (repo / "src" / "main" / "java" / "App.java").write_text("class App {}\n", encoding="utf-8")
+            (repo / "src" / "test" / "java" / "AppTest.java").write_text("class AppTest {}\n", encoding="utf-8")
+
+            result = cli.review_change(repo, session_id=None, strict=True)
+
+        self.assertEqual(result, 0)
+
+    def test_learn_skip_writes_receipt(self) -> None:
+        cli = load_cli()
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+
+            path = cli.learn(
+                repo,
+                {},
+                task="APIM-1 example",
+                session_id="session-1",
+                summary="",
+                summary_file=None,
+                skip="mechanical change",
+            )
+            payload = json.loads(path.read_text(encoding="utf-8"))
+
+        self.assertEqual(payload["skip_reason"], "mechanical change")
+        self.assertEqual(payload["session_id"], "session-1")
+
+    def test_prepare_context_writes_session_and_ignores_local_tooling(self) -> None:
+        cli = load_cli()
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+
+            with mock.patch.object(
+                cli,
+                "json_post",
+                return_value={"count": 1, "results": [{"source": "repo/test", "path": "README.md", "score": 1.0}]},
+            ):
+                session_dir = cli.prepare_context(repo, "APIM-1 example task", {"VDB_API_URL": "http://localhost:8000"})
+
+            self.assertTrue((session_dir / "context.json").exists())
+            self.assertEqual((repo / ".local-tooling" / "latest-session").read_text(encoding="utf-8").strip(), session_dir.name)
+            self.assertIn(".local-tooling/", (repo / ".git" / "info" / "exclude").read_text(encoding="utf-8"))
+
+    def test_install_agent_rules_writes_cursor_rule(self) -> None:
+        cli = load_cli()
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+
+            cli.install_agent_rules(repo, ["cursor"])
+            rule = repo / ".cursor" / "rules" / "local-tooling.mdc"
+
+            self.assertTrue(rule.exists())
+            self.assertIn("local-tooling context", rule.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

@@ -110,9 +110,25 @@ async function withToolLogging(toolName, callDetails, fn) {
 
 const server = new McpServer({
   name: "vectordb-mcp-bridge",
-  version: "0.1.0",
+  version: "0.2.0",
 });
 info("Server object created", { base_url: BASE_URL, debug_logs: DEBUG_LOGS });
+
+function prepareQueries(task) {
+  const compact = task.trim().replace(/\s+/g, " ");
+  const queries = [compact];
+  const words = compact.split(" ");
+  if (words.length > 8) {
+    queries.push(words.slice(0, 24).join(" "));
+  }
+  if (/\b[A-Z]+-\d+\b/.test(compact)) {
+    const withoutTicket = compact.replace(/\b[A-Z]+-\d+\b/g, "").trim();
+    if (withoutTicket) {
+      queries.push(withoutTicket);
+    }
+  }
+  return [...new Set(queries.filter(Boolean))];
+}
 
 server.tool(
   "rag_health",
@@ -147,6 +163,43 @@ server.tool(
           result_count: typeof result.count === "number" ? result.count : undefined,
         });
         return textResult(result);
+      },
+    );
+  },
+);
+
+server.tool(
+  "rag_prepare_task",
+  "Prepare initial task context by running several RAG searches. Use this before non-trivial Jira/code/debug tasks, then verify hits in real repo files.",
+  {
+    task: z.string().min(1).describe("Task, ticket, bug, or question description"),
+    limit: z.number().int().min(1).max(20).default(8),
+    source: z.string().optional().describe("Optional source filter"),
+    hybrid: z.boolean().default(true).describe("Use hybrid retrieval if true"),
+  },
+  async ({ task, limit = 8, source, hybrid = true }) => {
+    return withToolLogging(
+      "rag_prepare_task",
+      { limit, source: source || null, hybrid, task_len: task.length },
+      async () => {
+        const queries = prepareQueries(task);
+        const searches = [];
+        for (const query of queries) {
+          const result = await postJson("/search", { query, limit, source, hybrid });
+          searches.push({ query, result_count: result.count, results: result.results || [] });
+        }
+        return textResult({
+          status: "ok",
+          task,
+          queries,
+          searches,
+          next_steps: [
+            "Treat these results as orientation, not source of truth.",
+            "Open and verify relevant files in the current repo before editing or answering.",
+            "Run local-tooling review-change before final response or commit.",
+            "Use local-tooling learn when the task produces reusable knowledge.",
+          ],
+        });
       },
     );
   },
