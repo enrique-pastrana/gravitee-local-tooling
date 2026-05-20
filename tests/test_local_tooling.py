@@ -97,6 +97,40 @@ class LocalToolingTest(unittest.TestCase):
         self.assertFalse(running)
         self.assertEqual(message, "docker info timed out")
 
+    def test_doctor_warns_for_missing_embedding_api_key(self) -> None:
+        cli = load_cli()
+        env = {"EMBEDDING_BACKEND": "openai-compatible", "VDB_API_PORT": "8000"}
+        with mock.patch.object(cli, "docker_compose_available", return_value=(True, "ok")), mock.patch.object(
+            cli, "docker_daemon_running", return_value=(True, "running")
+        ), mock.patch.object(cli, "command_exists", return_value=True), mock.patch.object(
+            cli, "check_port", return_value=True
+        ), mock.patch.object(
+            cli, "health", return_value={"status": "ok", "documents": 0}
+        ), mock.patch(
+            "builtins.print"
+        ) as mocked_print:
+            cli.doctor(env)
+
+        output = "\n".join(str(call.args[0]) for call in mocked_print.call_args_list if call.args)
+        self.assertIn("EMBEDDING_API_KEY is required for EMBEDDING_BACKEND=openai-compatible", output)
+
+    def test_doctor_warns_for_unsupported_embedding_backend(self) -> None:
+        cli = load_cli()
+        env = {"EMBEDDING_BACKEND": "openai", "VDB_API_PORT": "8000"}
+        with mock.patch.object(cli, "docker_compose_available", return_value=(True, "ok")), mock.patch.object(
+            cli, "docker_daemon_running", return_value=(True, "running")
+        ), mock.patch.object(cli, "command_exists", return_value=True), mock.patch.object(
+            cli, "check_port", return_value=True
+        ), mock.patch.object(
+            cli, "health", return_value={"status": "ok", "documents": 0}
+        ), mock.patch(
+            "builtins.print"
+        ) as mocked_print:
+            cli.doctor(env)
+
+        output = "\n".join(str(call.args[0]) for call in mocked_print.call_args_list if call.args)
+        self.assertIn("Unsupported EMBEDDING_BACKEND=openai", output)
+
     def test_review_change_warns_for_production_change_without_context(self) -> None:
         cli = load_cli()
         with tempfile.TemporaryDirectory() as tmp:

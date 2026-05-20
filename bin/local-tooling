@@ -912,8 +912,15 @@ def doctor(env: dict[str, str]) -> None:
     print(json.dumps(payload, indent=2))
 
     warnings: list[str] = []
-    if env.get("EMBEDDING_BACKEND", "mock").lower() == "openai" and not env.get("OPENAI_API_KEY"):
-        warnings.append("OPENAI_API_KEY is required for EMBEDDING_BACKEND=openai")
+    embedding_backend = env.get("EMBEDDING_BACKEND", "mock").lower()
+    valid_embedding_backends = {"mock", "ollama", "openai-compatible"}
+    if embedding_backend not in valid_embedding_backends:
+        warnings.append(
+            "Unsupported EMBEDDING_BACKEND="
+            f"{embedding_backend}; expected one of: {', '.join(sorted(valid_embedding_backends))}"
+        )
+    if embedding_backend == "openai-compatible" and not env.get("EMBEDDING_API_KEY"):
+        warnings.append("EMBEDDING_API_KEY is required for EMBEDDING_BACKEND=openai-compatible")
     if not env.get("GITHUB_PERSONAL_ACCESS_TOKEN"):
         warnings.append("GITHUB_PERSONAL_ACCESS_TOKEN is empty; GitHub MCP will not authenticate")
     if warnings:

@@ -16,9 +16,9 @@ EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "768"))
 EMBEDDING_BACKEND = os.getenv("EMBEDDING_BACKEND", "mock").strip().lower()
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://host.docker.internal:11434").rstrip("/")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "nomic-embed-text")
-OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-OPENAI_EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small").strip()
+EMBEDDING_BASE_URL = os.getenv("EMBEDDING_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+EMBEDDING_API_KEY = os.getenv("EMBEDDING_API_KEY", "").strip()
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small").strip()
 SEARCH_CANDIDATES = int(os.getenv("SEARCH_CANDIDATES", "50"))
 
 app = FastAPI(title="Local pgvector RAG API", version="0.1.0")
@@ -96,23 +96,26 @@ def embed_ollama(text: str) -> list[float]:
     return finalize_embedding(payload.get("embedding"), "Ollama")
 
 
-def embed_openai(text: str) -> list[float]:
-    if not OPENAI_API_KEY:
-        raise HTTPException(status_code=500, detail="OPENAI_API_KEY is required for EMBEDDING_BACKEND=openai")
+def embed_openai_compatible(text: str) -> list[float]:
+    if not EMBEDDING_API_KEY:
+        raise HTTPException(
+            status_code=500,
+            detail="EMBEDDING_API_KEY is required for EMBEDDING_BACKEND=openai-compatible",
+        )
 
     body: dict[str, Any] = {
-        "model": OPENAI_EMBEDDING_MODEL,
+        "model": EMBEDDING_MODEL,
         "input": text,
     }
     # OpenAI text-embedding-3 models support server-side dimension reduction.
-    if OPENAI_EMBEDDING_MODEL.startswith("text-embedding-3"):
+    if EMBEDDING_MODEL.startswith("text-embedding-3"):
         body["dimensions"] = EMBEDDING_DIM
 
     try:
         response = requests.post(
-            f"{OPENAI_BASE_URL}/embeddings",
+            f"{EMBEDDING_BASE_URL}/embeddings",
             headers={
-                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Authorization": f"Bearer {EMBEDDING_API_KEY}",
                 "Content-Type": "application/json",
             },
             json=body,
@@ -121,23 +124,28 @@ def embed_openai(text: str) -> list[float]:
         response.raise_for_status()
         payload = response.json()
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"OpenAI embedding failed: {exc}") from exc
+        raise HTTPException(status_code=502, detail=f"OpenAI-compatible embedding provider failed: {exc}") from exc
 
     data = payload.get("data")
     if not isinstance(data, list) or not data:
-        raise HTTPException(status_code=502, detail="OpenAI did not return embedding data")
+        raise HTTPException(status_code=502, detail="OpenAI-compatible provider did not return embedding data")
     first = data[0]
     if not isinstance(first, dict):
-        raise HTTPException(status_code=502, detail="OpenAI did not return a valid embedding item")
-    return finalize_embedding(first.get("embedding"), "OpenAI")
+        raise HTTPException(status_code=502, detail="OpenAI-compatible provider did not return a valid embedding item")
+    return finalize_embedding(first.get("embedding"), "OpenAI-compatible provider")
 
 
 def embed_text(text: str) -> list[float]:
+    if EMBEDDING_BACKEND == "mock":
+        return embed_mock(text)
     if EMBEDDING_BACKEND == "ollama":
         return embed_ollama(text)
-    if EMBEDDING_BACKEND == "openai":
-        return embed_openai(text)
-    return embed_mock(text)
+    if EMBEDDING_BACKEND == "openai-compatible":
+        return embed_openai_compatible(text)
+    raise HTTPException(
+        status_code=500,
+        detail="Unsupported EMBEDDING_BACKEND. Expected one of: mock, ollama, openai-compatible",
+    )
 
 
 def chunk_text(text: str, size: int, overlap: int) -> list[str]:

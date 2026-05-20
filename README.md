@@ -16,25 +16,38 @@ It packages:
 
 ## Quick start
 
-Run these commands from the `local-tooling` repository.
+Run these commands from the `local-tooling` repository. `CODE_REPO` must point
+to the working code repository the developer wants the agent to understand and
+work on. It is not the path to `local-tooling`.
 
-`--repo` must point to the working code repository the developer wants the agent
-to understand and work on. It is not the path to `local-tooling`.
+Generic setup:
 
 ```bash
-cp .env.example .env
-# edit .env with your tokens and preferred embedding backend
+cd /path/to/local-tooling
 
-./bin/local-tooling setup --agents all --repo /path/to/the/code-repo-you-work-on --bootstrap
+cp .env.example .env
+# Edit .env before continuing:
+# - GITHUB_PERSONAL_ACCESS_TOKEN for GitHub MCP
+# - ATLASSIAN_SITE_URL for Jira/Confluence
+# - KAPA_* if Kapa is used
+# - EMBEDDING_BACKEND and related EMBEDDING_* / OLLAMA_* settings
+
+CODE_REPO=/path/to/the/code-repo-you-work-on
+
+./bin/local-tooling setup --agents all --repo "$CODE_REPO" --bootstrap
 ```
 
-Example for `gravitee-api-management`:
+`gravitee-api-management` setup:
 
 ```bash
-./bin/local-tooling setup --agents all \
-  --repo /Users/madamek/work/gravitee/repos/legacy/gravitee-api-management \
-  --profile gravitee-apim \
-  --bootstrap
+cd /path/to/local-tooling
+
+cp .env.example .env
+# Edit .env before continuing.
+
+CODE_REPO=/path/to/gravitee-api-management
+
+./bin/local-tooling setup --agents all --repo "$CODE_REPO" --profile gravitee-apim --bootstrap
 ```
 
 Then restart Codex, Cursor, or Claude if they were already running.
@@ -45,52 +58,50 @@ Ask your agent:
 Configure yourself using the local-tooling repo and run doctor.
 ```
 
-## Common commands
+Optional, recommended for Cursor users:
 
 ```bash
-./bin/local-tooling start
-./bin/local-tooling stop
-./bin/local-tooling doctor
-./bin/local-tooling manifest --repo /path/to/the/code-repo-you-work-on --profile default
-./bin/local-tooling index --repo /path/to/the/code-repo-you-work-on --profile default
-./bin/local-tooling context --repo /path/to/the/code-repo-you-work-on --task "APIM-12345 ..."
-./bin/local-tooling review-change --repo /path/to/the/code-repo-you-work-on
-./bin/local-tooling learn --repo /path/to/the/code-repo-you-work-on --task "APIM-12345 ..." --summary-file learning.md
-./bin/local-tooling install-agent-rules --repo /path/to/the/code-repo-you-work-on --agents cursor
-./bin/local-tooling print-config --agent codex
+CODE_REPO=/path/to/the/code-repo-you-work-on
+./bin/local-tooling install-agent-rules --repo "$CODE_REPO" --agents cursor
 ```
+
+This writes workflow rules into the target code repo, for example
+`.cursor/rules/local-tooling.mdc`.
 
 ## Upgrade
 
 Existing users can update with the same flow as the initial setup. This keeps
 the local vectordb volume and rebuilds only the service images/configuration.
 
-```bash
-cd /path/to/local-tooling
-git pull
-
-./bin/local-tooling stop
-./bin/local-tooling setup --agents all --repo /path/to/the/code-repo-you-work-on --bootstrap
-```
-
-For `gravitee-api-management`:
+Generic upgrade:
 
 ```bash
 cd /path/to/local-tooling
 git pull
 
+CODE_REPO=/path/to/the/code-repo-you-work-on
+
 ./bin/local-tooling stop
-./bin/local-tooling setup --agents all \
-  --repo /path/to/gravitee-api-management \
-  --profile gravitee-apim \
-  --bootstrap
+./bin/local-tooling setup --agents all --repo "$CODE_REPO" --bootstrap
 ```
 
-If you want the target repo to receive/update the lightweight workflow rules
-used by Cursor/Codex/Claude, run:
+`gravitee-api-management` upgrade:
 
 ```bash
-./bin/local-tooling install-agent-rules --repo /path/to/the/code-repo-you-work-on --agents cursor
+cd /path/to/local-tooling
+git pull
+
+CODE_REPO=/path/to/gravitee-api-management
+
+./bin/local-tooling stop
+./bin/local-tooling setup --agents all --repo "$CODE_REPO" --profile gravitee-apim --bootstrap
+```
+
+If the target repo should receive/update the optional Cursor workflow rules, run:
+
+```bash
+CODE_REPO=/path/to/the/code-repo-you-work-on
+./bin/local-tooling install-agent-rules --repo "$CODE_REPO" --agents cursor
 ```
 
 Restart Codex, Cursor, or Claude after upgrading so they reload MCP config and
@@ -98,6 +109,23 @@ new tools such as `rag_prepare_task`.
 
 Do not run `docker compose down -v` unless you intentionally want to delete the
 local vectordb data.
+
+## Common commands
+
+```bash
+CODE_REPO=/path/to/the/code-repo-you-work-on
+
+./bin/local-tooling start
+./bin/local-tooling stop
+./bin/local-tooling doctor
+./bin/local-tooling manifest --repo "$CODE_REPO" --profile default
+./bin/local-tooling index --repo "$CODE_REPO" --profile default
+./bin/local-tooling context --repo "$CODE_REPO" --task "APIM-12345 ..."
+./bin/local-tooling review-change --repo "$CODE_REPO"
+./bin/local-tooling learn --repo "$CODE_REPO" --task "APIM-12345 ..." --summary-file learning.md
+./bin/local-tooling install-agent-rules --repo "$CODE_REPO" --agents cursor
+./bin/local-tooling print-config --agent codex
+```
 
 ## Bootstrap indexing
 
@@ -128,7 +156,8 @@ without blocking simple local development.
 Start a non-trivial task with:
 
 ```bash
-./bin/local-tooling context --repo /path/to/the/code-repo-you-work-on --task "APIM-12345 short task summary"
+CODE_REPO=/path/to/the/code-repo-you-work-on
+./bin/local-tooling context --repo "$CODE_REPO" --task "APIM-12345 short task summary"
 ```
 
 This queries vectordb, writes a context receipt under:
@@ -143,7 +172,8 @@ local `.git/info/exclude` so session receipts do not pollute commits.
 Before a final answer or commit, run:
 
 ```bash
-./bin/local-tooling review-change --repo /path/to/the/code-repo-you-work-on
+CODE_REPO=/path/to/the/code-repo-you-work-on
+./bin/local-tooling review-change --repo "$CODE_REPO"
 ```
 
 By default this is warning-only. Use `--strict` only when you want it to fail on
@@ -152,19 +182,22 @@ missing context, missing test changes for production edits, or missing learning.
 When the task produced reusable knowledge, save it:
 
 ```bash
-./bin/local-tooling learn --repo /path/to/the/code-repo-you-work-on --task "APIM-12345" --summary-file learning.md
+CODE_REPO=/path/to/the/code-repo-you-work-on
+./bin/local-tooling learn --repo "$CODE_REPO" --task "APIM-12345" --summary-file learning.md
 ```
 
 If there is nothing useful to remember, record that explicitly without ingesting:
 
 ```bash
-./bin/local-tooling learn --repo /path/to/the/code-repo-you-work-on --task "APIM-12345" --skip "mechanical rename, no reusable learning"
+CODE_REPO=/path/to/the/code-repo-you-work-on
+./bin/local-tooling learn --repo "$CODE_REPO" --task "APIM-12345" --skip "mechanical rename, no reusable learning"
 ```
 
 To make this workflow visible to agents in the target repo:
 
 ```bash
-./bin/local-tooling install-agent-rules --repo /path/to/the/code-repo-you-work-on --agents cursor
+CODE_REPO=/path/to/the/code-repo-you-work-on
+./bin/local-tooling install-agent-rules --repo "$CODE_REPO" --agents cursor
 ```
 
 ## Safety defaults
