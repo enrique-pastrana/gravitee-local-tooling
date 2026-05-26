@@ -54,5 +54,24 @@ services:
         condition: service_started
     stdin_open: true
 
+  zendesk-mcp-adapter:
+    build:
+      context: ./services/zendesk-mcp-adapter
+    container_name: local-tooling-zendesk-mcp-adapter
+    environment:
+      ZENDESK_ENABLED: ${ZENDESK_ENABLED:-false}
+      ZENDESK_BASE_URL: ${ZENDESK_BASE_URL:-}
+      ZENDESK_AUTH_MODE: ${ZENDESK_AUTH_MODE:-oauth}
+      ZENDESK_OAUTH_ACCESS_TOKEN: ${ZENDESK_OAUTH_ACCESS_TOKEN:-}
+      ZENDESK_EMAIL: ${ZENDESK_EMAIL:-}
+      ZENDESK_API_TOKEN: ${ZENDESK_API_TOKEN:-}
+      ZENDESK_PAGE_SIZE: ${ZENDESK_PAGE_SIZE:-50}
+      ZENDESK_TIMEOUT_SECONDS: ${ZENDESK_TIMEOUT_SECONDS:-15}
+      VDB_API_URL: http://vectordb-api:8000
+    depends_on:
+      vectordb-api:
+        condition: service_started
+    stdin_open: true
+
 volumes:
   vectordb_pgdata:

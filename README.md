@@ -11,6 +11,7 @@ It packages:
 - read-only GitHub MCP wiring
 - read/search Atlassian MCP wiring
 - Kapa MCP wiring
+- optional read-only Zendesk MCP wiring and ticket indexing
 - local repo bootstrap indexing, generated on each developer machine
 - lightweight task sessions for context, review, and reusable learning
 
@@ -30,6 +31,7 @@ cp .env.example .env
 # - GITHUB_PERSONAL_ACCESS_TOKEN for GitHub MCP
 # - ATLASSIAN_SITE_URL for Jira/Confluence
 # - KAPA_* if Kapa is used
+# - ZENDESK_ENABLED=true and ZENDESK_* only if the team uses Zendesk
 # - EMBEDDING_BACKEND and related EMBEDDING_* / OLLAMA_* settings
 
 CODE_REPO=/path/to/the/code-repo-you-work-on
@@ -148,6 +150,34 @@ The `gravitee-apim` profile adds APIM-specific module rules and higher-signal Ja
 
 Generated manifests are written to `manifests/generated/`. Reports are written to `reports/`.
 
+## Zendesk
+
+Zendesk is disabled by default. Enable it only for teams that need Support
+ticket context:
+
+```bash
+ZENDESK_ENABLED=true
+ZENDESK_BASE_URL=https://your-subdomain.zendesk.com
+ZENDESK_AUTH_MODE=oauth
+ZENDESK_OAUTH_ACCESS_TOKEN=...
+ZENDESK_INDEX_DEFAULT_QUERY='type:ticket updated>2026-01-01'
+```
+
+When enabled, `setup` adds the read-only Zendesk MCP adapter to agent configs,
+`doctor` validates Zendesk auth, and `setup --bootstrap` indexes tickets
+matching `ZENDESK_INDEX_DEFAULT_QUERY`.
+
+Zendesk commands:
+
+```bash
+./bin/local-tooling zendesk-search --query "type:ticket tag:apim"
+./bin/local-tooling zendesk-index --query "type:ticket tag:apim updated>2026-01-01"
+./bin/local-tooling zendesk-index --ticket-id 12345
+```
+
+Indexed tickets are stored in vectordb with sources such as
+`zendesk/your-subdomain` and paths such as `tickets/12345`.
+
 ## Task workflow
 
 The workflow is intentionally advisory by default. It improves context gathering
@@ -202,7 +232,7 @@ CODE_REPO=/path/to/the/code-repo-you-work-on
 
 ## Safety defaults
 
-GitHub and Atlassian are configured as read-only by default. Mutating tools such as creating PRs, editing Jira issues, adding comments, or merging PRs are disabled in generated agent config.
+GitHub and Atlassian are configured as read-only by default. Mutating tools such as creating PRs, editing Jira issues, adding comments, or merging PRs are disabled in generated agent config. Zendesk only exposes read-only tools and local vectordb ingestion.
 
 If you need write-capable tools, add them explicitly after reviewing `docs/security.md`.
 
@@ -227,4 +257,6 @@ flowchart TD
     G --> H["GitHub MCP read-only"]
     G --> I["Atlassian MCP read/search"]
     G --> J["Kapa MCP"]
+    G --> L["Zendesk MCP read-only"]
+    L --> E
 ```

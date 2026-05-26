@@ -1,0 +1,17 @@
+{
+  "name": "zendesk-mcp-adapter",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Read-only Zendesk MCP adapter for local-tooling",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.17.5",
+    "zod": "^3.24.1"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

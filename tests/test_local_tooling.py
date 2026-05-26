@@ -37,6 +37,32 @@ class LocalToolingTest(unittest.TestCase):
             self.assertIn("vectordb", payload["mcpServers"])
             self.assertIn("create_pull_request", payload["mcpServers"]["github-mcp-server"]["disabledTools"])
             self.assertIn("addCommentToJiraIssue", payload["mcpServers"]["atlassian-mcp-server"]["disabledTools"])
+            self.assertNotIn("zendesk", payload["mcpServers"])
+
+    def test_zendesk_mcp_is_conditional(self) -> None:
+        cli = load_cli()
+
+        disabled = {"ZENDESK_ENABLED": "false"}
+        enabled = {"ZENDESK_ENABLED": "true"}
+
+        self.assertNotIn("zendesk", cli.mcp_json(disabled))
+        self.assertIn("zendesk", cli.mcp_json(enabled))
+        self.assertNotIn("[mcp_servers.zendesk]", cli.codex_block(disabled))
+        self.assertIn("[mcp_servers.zendesk]", cli.codex_block(enabled))
+
+    def test_patch_json_removes_stale_zendesk_when_disabled(self) -> None:
+        cli = load_cli()
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "mcp.json"
+            config.write_text(
+                json.dumps({"mcpServers": {"zendesk": {"command": "old", "args": ["mcp", "zendesk"]}}}),
+                encoding="utf-8",
+            )
+
+            cli.patch_json_mcp(config, {"ZENDESK_ENABLED": "false"})
+            payload = json.loads(config.read_text(encoding="utf-8"))
+
+        self.assertNotIn("zendesk", payload["mcpServers"])
 
     def test_patch_codex_replaces_managed_block(self) -> None:
         cli = load_cli()
@@ -130,6 +156,101 @@ class LocalToolingTest(unittest.TestCase):
 
         output = "\n".join(str(call.args[0]) for call in mocked_print.call_args_list if call.args)
         self.assertIn("Unsupported EMBEDDING_BACKEND=openai", output)
+
+    def test_doctor_reports_zendesk_disabled_without_secrets(self) -> None:
+        cli = load_cli()
+        env = {"ZENDESK_ENABLED": "false", "VDB_API_PORT": "8000"}
+        with mock.patch.object(cli, "docker_compose_available", return_value=(True, "ok")), mock.patch.object(
+            cli, "docker_daemon_running", return_value=(True, "running")
+        ), mock.patch.object(cli, "command_exists", return_value=True), mock.patch.object(
+            cli, "check_port", return_value=True
+        ), mock.patch.object(
+            cli, "health", return_value={"status": "ok", "documents": 0}
+        ), mock.patch(
+            "builtins.print"
+        ) as mocked_print:
+            cli.doctor(env)
+
+        output = "\n".join(str(call.args[0]) for call in mocked_print.call_args_list if call.args)
+        self.assertIn("zendesk: disabled", output)
+
+    def test_doctor_fails_when_zendesk_enabled_without_auth(self) -> None:
+        cli = load_cli()
+        env = {
+            "ZENDESK_ENABLED": "true",
+            "ZENDESK_BASE_URL": "https://example.zendesk.com",
+            "ZENDESK_AUTH_MODE": "oauth",
+            "VDB_API_PORT": "8000",
+        }
+        with mock.patch.object(cli, "docker_compose_available", return_value=(True, "ok")), mock.patch.object(
+            cli, "docker_daemon_running", return_value=(True, "running")
+        ), mock.patch.object(cli, "command_exists", return_value=True), mock.patch.object(
+            cli, "check_port", return_value=True
+        ), mock.patch.object(
+            cli, "health", return_value={"status": "ok", "documents": 0}
+        ):
+            with self.assertRaises(SystemExit):
+                cli.doctor(env)
+
+    def test_zendesk_api_token_auth_header(self) -> None:
+        cli = load_cli()
+        env = {"ZENDESK_AUTH_MODE": "api-token", "ZENDESK_EMAIL": "dev@example.com", "ZENDESK_API_TOKEN": "secret"}
+
+        headers = cli.zendesk_auth_headers(env)
+
+        self.assertEqual(headers["Authorization"], "Basic ZGV2QGV4YW1wbGUuY29tL3Rva2VuOnNlY3JldA==")
+
+    def test_zendesk_adapter_registers_no_write_tools(self) -> None:
+        adapter = Path(__file__).resolve().parents[1] / "services" / "zendesk-mcp-adapter" / "server.js"
+        text = adapter.read_text(encoding="utf-8")
+
+        self.assertNotIn("create_ticket", text)
+        self.assertNotIn("update_ticket", text)
+        self.assertNotIn("add_comment", text)
+        self.assertIn("zendesk_ingest_ticket", text)
+
+    def test_setup_bootstrap_skips_zendesk_when_disabled(self) -> None:
+        cli = load_cli()
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            args = mock.Mock(
+                repo=str(repo),
+                profile="default",
+                skip_start=True,
+                agents="codex",
+                bootstrap=True,
+                skip_doctor=True,
+            )
+            with mock.patch.object(cli, "configure_agents"), mock.patch.object(
+                cli, "generate_manifest", return_value=Path(tmp) / "manifest.json"
+            ), mock.patch.object(cli, "index_repo"), mock.patch.object(cli, "zendesk_index_query") as zendesk_index:
+                cli.setup(args, {"ZENDESK_ENABLED": "false"})
+
+        zendesk_index.assert_not_called()
+
+    def test_setup_bootstrap_indexes_zendesk_when_enabled(self) -> None:
+        cli = load_cli()
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            args = mock.Mock(
+                repo=str(repo),
+                profile="default",
+                skip_start=True,
+                agents="codex",
+                bootstrap=True,
+                skip_doctor=True,
+            )
+            env = {"ZENDESK_ENABLED": "true", "ZENDESK_INDEX_DEFAULT_QUERY": "type:ticket tag:apim"}
+            with mock.patch.object(cli, "configure_agents"), mock.patch.object(
+                cli, "generate_manifest", return_value=Path(tmp) / "manifest.json"
+            ), mock.patch.object(cli, "index_repo"), mock.patch.object(
+                cli, "zendesk_index_query", return_value={"ingested": []}
+            ) as zendesk_index:
+                cli.setup(args, env)
+
+        zendesk_index.assert_called_once_with(env, "type:ticket tag:apim")
 
     def test_review_change_warns_for_production_change_without_context(self) -> None:
         cli = load_cli()

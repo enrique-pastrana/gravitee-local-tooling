@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import os
@@ -13,6 +14,7 @@ import sys
 import time
 from pathlib import Path
 from urllib import error, request
+from urllib.parse import quote, urlencode, urlparse
 
 ROOT = Path(__file__).resolve().parents[1]
 ENV_FILE = ROOT / ".env"
@@ -53,6 +55,8 @@ ATLASSIAN_DISABLED_TOOLS = [
     "addWorklogToJiraIssue",
 ]
 
+ZENDESK_DISABLED_MESSAGE = "Zendesk is disabled. Set ZENDESK_ENABLED=true in .env and configure ZENDESK_* secrets."
+
 
 def load_env() -> dict[str, str]:
     env = dict(os.environ)
@@ -68,6 +72,81 @@ def load_env() -> dict[str, str]:
         if key and key not in env:
             env[key] = value
     return env
+
+
+def bool_env(env: dict[str, str], key: str, default: bool = False) -> bool:
+    raw = env.get(key)
+    if raw is None or raw == "":
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def zendesk_enabled(env: dict[str, str]) -> bool:
+    return bool_env(env, "ZENDESK_ENABLED", False)
+
+
+def require_zendesk_enabled(env: dict[str, str]) -> None:
+    if not zendesk_enabled(env):
+        raise SystemExit(ZENDESK_DISABLED_MESSAGE)
+
+
+def zendesk_base_url(env: dict[str, str]) -> str:
+    return env.get("ZENDESK_BASE_URL", "").strip().rstrip("/")
+
+
+def zendesk_subdomain(env: dict[str, str]) -> str:
+    host = urlparse(zendesk_base_url(env)).hostname or "unknown"
+    return host.split(".")[0] or "unknown"
+
+
+def zendesk_page_size(env: dict[str, str]) -> int:
+    try:
+        return max(1, min(int(env.get("ZENDESK_PAGE_SIZE", "50")), 100))
+    except ValueError:
+        return 50
+
+
+def zendesk_timeout(env: dict[str, str]) -> int:
+    try:
+        return max(1, int(env.get("ZENDESK_TIMEOUT_SECONDS", "15")))
+    except ValueError:
+        return 15
+
+
+def zendesk_config_errors(env: dict[str, str]) -> list[str]:
+    if not zendesk_enabled(env):
+        return []
+    errors: list[str] = []
+    base_url = zendesk_base_url(env)
+    auth_mode = env.get("ZENDESK_AUTH_MODE", "oauth").strip().lower()
+    if not base_url or "your-subdomain" in base_url:
+        errors.append("ZENDESK_BASE_URL must be set to the team's Zendesk account URL")
+    if auth_mode not in {"oauth", "api-token"}:
+        errors.append("ZENDESK_AUTH_MODE must be oauth or api-token")
+    if auth_mode == "oauth" and not env.get("ZENDESK_OAUTH_ACCESS_TOKEN", "").strip():
+        errors.append("ZENDESK_OAUTH_ACCESS_TOKEN is required for ZENDESK_AUTH_MODE=oauth")
+    if auth_mode == "api-token":
+        if not env.get("ZENDESK_EMAIL", "").strip():
+            errors.append("ZENDESK_EMAIL is required for ZENDESK_AUTH_MODE=api-token")
+        if not env.get("ZENDESK_API_TOKEN", "").strip():
+            errors.append("ZENDESK_API_TOKEN is required for ZENDESK_AUTH_MODE=api-token")
+    return errors
+
+
+def require_zendesk_config(env: dict[str, str]) -> None:
+    require_zendesk_enabled(env)
+    errors = zendesk_config_errors(env)
+    if errors:
+        raise SystemExit("Zendesk configuration is invalid:\n- " + "\n- ".join(errors))
+
+
+def zendesk_auth_headers(env: dict[str, str]) -> dict[str, str]:
+    auth_mode = env.get("ZENDESK_AUTH_MODE", "oauth").strip().lower()
+    if auth_mode == "oauth":
+        return {"Authorization": f"Bearer {env.get('ZENDESK_OAUTH_ACCESS_TOKEN', '').strip()}"}
+    raw = f"{env.get('ZENDESK_EMAIL', '').strip()}/token:{env.get('ZENDESK_API_TOKEN', '').strip()}"
+    token = base64.b64encode(raw.encode("utf-8")).decode("ascii")
+    return {"Authorization": f"Basic {token}"}
 
 
 def run(cmd: list[str], *, check: bool = True, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
@@ -211,6 +290,135 @@ def json_post(api_url_value: str, path: str, payload: dict[str, object], timeout
         raise SystemExit(f"{path} failed at {url}: {exc}") from exc
 
 
+def zendesk_get(env: dict[str, str], path: str, params: dict[str, str] | None = None) -> dict[str, object]:
+    require_zendesk_config(env)
+    query = urlencode(params or {})
+    url = zendesk_base_url(env) + path + (f"?{query}" if query else "")
+    req = request.Request(url, method="GET")
+    req.add_header("Accept", "application/json")
+    for key, value in zendesk_auth_headers(env).items():
+        req.add_header(key, value)
+    try:
+        with request.urlopen(req, timeout=zendesk_timeout(env)) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except error.HTTPError as exc:
+        retry_after = exc.headers.get("Retry-After")
+        suffix = f"; retry-after={retry_after}" if retry_after else ""
+        raise SystemExit(f"Zendesk GET {path} failed with HTTP {exc.code}{suffix}") from exc
+    except error.URLError as exc:
+        raise SystemExit(f"Zendesk GET {path} failed: {exc}") from exc
+
+
+def zendesk_search_tickets(env: dict[str, str], query: str, limit: int | None = None) -> dict[str, object]:
+    if not query.strip():
+        raise SystemExit("Zendesk query must not be empty")
+    requested = limit if limit is not None else zendesk_page_size(env)
+    page_size = max(1, min(requested, zendesk_page_size(env)))
+    payload = zendesk_get(env, "/api/v2/search.json", {"query": query, "per_page": str(page_size)})
+    results = payload.get("results", [])
+    if not isinstance(results, list):
+        results = []
+    tickets = [
+        item
+        for item in results
+        if isinstance(item, dict) and item.get("id") is not None and item.get("result_type", "ticket") == "ticket"
+    ][:page_size]
+    return {
+        "count": payload.get("count"),
+        "next_page": payload.get("next_page"),
+        "results": tickets,
+    }
+
+
+def zendesk_ticket(env: dict[str, str], ticket_id: str) -> dict[str, object]:
+    payload = zendesk_get(env, f"/api/v2/tickets/{quote(ticket_id)}.json")
+    ticket = payload.get("ticket")
+    if not isinstance(ticket, dict):
+        raise SystemExit(f"Zendesk ticket not found: {ticket_id}")
+    return ticket
+
+
+def zendesk_ticket_comments(env: dict[str, str], ticket_id: str) -> list[dict[str, object]]:
+    payload = zendesk_get(env, f"/api/v2/tickets/{quote(ticket_id)}/comments.json")
+    comments = payload.get("comments")
+    if not isinstance(comments, list):
+        return []
+    return [item for item in comments if isinstance(item, dict)]
+
+
+def zendesk_ticket_url(env: dict[str, str], ticket_id: object) -> str:
+    return f"{zendesk_base_url(env)}/agent/tickets/{ticket_id}"
+
+
+def zendesk_ticket_text(ticket: dict[str, object], comments: list[dict[str, object]]) -> str:
+    parts = [
+        f"Ticket {ticket.get('id')}: {ticket.get('subject') or ''}",
+        "",
+        "Description:",
+        str(ticket.get("description") or ""),
+        "",
+        "Comments:",
+    ]
+    for comment in comments:
+        body = str(comment.get("plain_body") or comment.get("body") or "").strip()
+        if not body:
+            continue
+        parts.append(
+            f"Comment {comment.get('id') or ''} by {comment.get('author_id') or 'unknown'} "
+            f"({comment.get('created_at') or 'unknown'}):"
+        )
+        parts.append(body)
+        parts.append("")
+    return "\n".join(parts).strip()
+
+
+def zendesk_ingest_ticket(env: dict[str, str], ticket_id: str, query: str = "") -> dict[str, object]:
+    ticket = zendesk_ticket(env, ticket_id)
+    comments = zendesk_ticket_comments(env, ticket_id)
+    text = zendesk_ticket_text(ticket, comments)
+    if not text:
+        raise SystemExit(f"Zendesk ticket has no indexable text: {ticket_id}")
+    payload = {
+        "source": f"zendesk/{zendesk_subdomain(env)}",
+        "path": f"tickets/{ticket.get('id')}",
+        "text": text,
+        "metadata": {
+            "kind": "zendesk-ticket",
+            "ticket_id": ticket.get("id"),
+            "url": zendesk_ticket_url(env, ticket.get("id")),
+            "status": ticket.get("status"),
+            "priority": ticket.get("priority"),
+            "tags": ticket.get("tags") if isinstance(ticket.get("tags"), list) else [],
+            "requester_id": ticket.get("requester_id"),
+            "organization_id": ticket.get("organization_id"),
+            "created_at": ticket.get("created_at"),
+            "updated_at": ticket.get("updated_at"),
+            "indexed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "query": query or None,
+            "comment_count": len(comments),
+        },
+        "chunk_size": 1200,
+        "chunk_overlap": 200,
+    }
+    response = json_post(api_url(env), "/ingest", payload, timeout=60)
+    return {
+        "ticket_id": ticket.get("id"),
+        "source": payload["source"],
+        "path": payload["path"],
+        "ingest_response": response,
+    }
+
+
+def zendesk_index_query(env: dict[str, str], query: str, limit: int | None = None) -> dict[str, object]:
+    search = zendesk_search_tickets(env, query, limit)
+    results = search.get("results", [])
+    ingested = []
+    for ticket in results if isinstance(results, list) else []:
+        if isinstance(ticket, dict) and ticket.get("id") is not None:
+            ingested.append(zendesk_ingest_ticket(env, str(ticket["id"]), query=query))
+    return {"query": query, "matched": len(results) if isinstance(results, list) else 0, "ingested": ingested}
+
+
 def git_output(repo: Path, args: list[str], check: bool = False) -> str:
     result = subprocess.run(
         ["git", "-C", str(repo), *args],
@@ -325,8 +533,17 @@ def toml_array(items: list[str]) -> str:
     return "[\n" + "".join(f'  "{item}",\n' for item in items) + "]"
 
 
-def codex_block() -> str:
+def codex_block(env: dict[str, str] | None = None) -> str:
     cmd = local_tooling_command()
+    zendesk_block = ""
+    if env is not None and zendesk_enabled(env):
+        zendesk_block = f"""
+
+[mcp_servers.zendesk]
+command = "{cmd}"
+args = ["mcp", "zendesk"]
+enabled = true
+""".rstrip()
     return f"""
 {CODEX_MARKER_START}
 
@@ -351,6 +568,7 @@ enabled = true
 command = "{cmd}"
 args = ["mcp", "kapa"]
 enabled = true
+{zendesk_block}
 
 [mcp_servers.vectordb.tools.rag_health]
 approval_mode = "approve"
@@ -376,16 +594,16 @@ def patch_codex(env: dict[str, str]) -> Path:
         re.DOTALL,
     )
     cleaned = pattern.sub("\n", existing).rstrip()
-    updated = (cleaned + "\n\n" if cleaned else "") + codex_block() + "\n"
+    updated = (cleaned + "\n\n" if cleaned else "") + codex_block(env) + "\n"
     if updated != existing:
         backup_file(path)
         atomic_write(path, updated)
     return path
 
 
-def mcp_json() -> dict[str, object]:
+def mcp_json(env: dict[str, str] | None = None) -> dict[str, object]:
     cmd = local_tooling_command()
-    return {
+    servers = {
         "vectordb": {"command": cmd, "args": ["mcp", "vectordb"]},
         "github-mcp-server": {
             "command": cmd,
@@ -399,9 +617,12 @@ def mcp_json() -> dict[str, object]:
         },
         "kapa": {"command": cmd, "args": ["mcp", "kapa"]},
     }
+    if env is not None and zendesk_enabled(env):
+        servers["zendesk"] = {"command": cmd, "args": ["mcp", "zendesk"]}
+    return servers
 
 
-def patch_json_mcp(path: Path) -> Path:
+def patch_json_mcp(path: Path, env: dict[str, str] | None = None) -> Path:
     if path.exists():
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
@@ -417,7 +638,9 @@ def patch_json_mcp(path: Path) -> Path:
     if not isinstance(servers, dict):
         raise SystemExit(f"Expected mcpServers object in {path}")
 
-    servers.update(mcp_json())
+    servers.update(mcp_json(env))
+    if env is not None and not zendesk_enabled(env):
+        servers.pop("zendesk", None)
     updated = json.dumps(payload, indent=2, sort_keys=True) + "\n"
     existing = path.read_text(encoding="utf-8") if path.exists() else ""
     if updated != existing:
@@ -431,9 +654,9 @@ def configure_agents(agents: list[str], env: dict[str, str]) -> None:
         if agent == "codex":
             path = patch_codex(env)
         elif agent == "cursor":
-            path = patch_json_mcp(cursor_config_path(env))
+            path = patch_json_mcp(cursor_config_path(env), env)
         elif agent == "claude":
-            path = patch_json_mcp(claude_config_path(env))
+            path = patch_json_mcp(claude_config_path(env), env)
         else:
             raise AssertionError(agent)
         print(f"Configured {agent}: {path}")
@@ -923,17 +1146,31 @@ def doctor(env: dict[str, str]) -> None:
         warnings.append("EMBEDDING_API_KEY is required for EMBEDDING_BACKEND=openai-compatible")
     if not env.get("GITHUB_PERSONAL_ACCESS_TOKEN"):
         warnings.append("GITHUB_PERSONAL_ACCESS_TOKEN is empty; GitHub MCP will not authenticate")
+    if not zendesk_enabled(env):
+        print("zendesk: disabled")
+    else:
+        print("zendesk: enabled")
+        zendesk_errors = zendesk_config_errors(env)
+        if zendesk_errors:
+            warnings.extend(zendesk_errors)
+        else:
+            me = zendesk_get(env, "/api/v2/users/me.json")
+            user = me.get("user") if isinstance(me, dict) else None
+            user_id = user.get("id") if isinstance(user, dict) else None
+            print(f"zendesk health: ok user_id={user_id}")
     if warnings:
         print("Warnings:")
         for warning in warnings:
             print(f"- {warning}")
+        if zendesk_enabled(env) and zendesk_config_errors(env):
+            raise SystemExit(1)
 
 
-def print_config(agent: str) -> None:
+def print_config(agent: str, env: dict[str, str]) -> None:
     if agent == "codex":
-        print(codex_block())
+        print(codex_block(env))
     elif agent in {"cursor", "claude"}:
-        print(json.dumps({"mcpServers": mcp_json()}, indent=2, sort_keys=True))
+        print(json.dumps({"mcpServers": mcp_json(env)}, indent=2, sort_keys=True))
     else:
         raise SystemExit(f"Unsupported agent: {agent}")
 
@@ -969,6 +1206,9 @@ def exec_mcp(name: str, env: dict[str, str]) -> None:
         cmd = ["npx", "-y", "mcp-remote", url]
         if header:
             cmd.extend(["--header", header])
+    elif name == "zendesk":
+        require_zendesk_config(env)
+        cmd = compose_cmd("run", "--rm", "-T", "zendesk-mcp-adapter")
     else:
         raise SystemExit(f"Unknown MCP server: {name}")
 
@@ -989,6 +1229,15 @@ def setup(args: argparse.Namespace, env: dict[str, str]) -> None:
 
     if args.bootstrap:
         index_repo(repo, profile, env)
+        if zendesk_enabled(env):
+            query = env.get("ZENDESK_INDEX_DEFAULT_QUERY", "").strip()
+            if not query:
+                raise SystemExit("ZENDESK_INDEX_DEFAULT_QUERY is required when ZENDESK_ENABLED=true and --bootstrap is used")
+            print(f"Indexing Zendesk tickets with query: {query}")
+            result = zendesk_index_query(env, query)
+            print(json.dumps(result, indent=2))
+        else:
+            print("Zendesk bootstrap skipped: ZENDESK_ENABLED=false")
 
     if not args.skip_doctor:
         doctor(env)
@@ -1044,7 +1293,17 @@ def build_parser() -> argparse.ArgumentParser:
     print_parser.add_argument("--agent", required=True, choices=["codex", "cursor", "claude"])
 
     mcp_parser = sub.add_parser("mcp")
-    mcp_parser.add_argument("name", choices=["vectordb", "github", "atlassian", "kapa"])
+    mcp_parser.add_argument("name", choices=["vectordb", "github", "atlassian", "kapa", "zendesk"])
+
+    zendesk_search_parser = sub.add_parser("zendesk-search")
+    zendesk_search_parser.add_argument("--query", required=True)
+    zendesk_search_parser.add_argument("--limit", type=int)
+
+    zendesk_index_parser = sub.add_parser("zendesk-index")
+    zendesk_index_group = zendesk_index_parser.add_mutually_exclusive_group(required=True)
+    zendesk_index_group.add_argument("--query")
+    zendesk_index_group.add_argument("--ticket-id")
+    zendesk_index_parser.add_argument("--limit", type=int)
 
     return parser
 
@@ -1088,9 +1347,18 @@ def main() -> int:
         repo = Path(args.repo).expanduser().resolve()
         install_agent_rules(repo, parse_agents(args.agents))
     elif args.command == "print-config":
-        print_config(args.agent)
+        print_config(args.agent, env)
     elif args.command == "mcp":
         exec_mcp(args.name, env)
+    elif args.command == "zendesk-search":
+        require_zendesk_config(env)
+        print(json.dumps(zendesk_search_tickets(env, args.query, args.limit), indent=2))
+    elif args.command == "zendesk-index":
+        require_zendesk_config(env)
+        if args.ticket_id:
+            print(json.dumps(zendesk_ingest_ticket(env, str(args.ticket_id)), indent=2))
+        else:
+            print(json.dumps(zendesk_index_query(env, args.query, args.limit), indent=2))
     else:
         raise AssertionError(args.command)
     return 0
