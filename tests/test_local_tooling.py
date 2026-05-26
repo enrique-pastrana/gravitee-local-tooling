@@ -6,6 +6,9 @@ import json
 import subprocess
 import tempfile
 import unittest
+import local_tooling.docker_runtime as docker_runtime_module
+import local_tooling.manifest as manifest_module
+import local_tooling.workflow as workflow_module
 from subprocess import CompletedProcess, TimeoutExpired
 from unittest import mock
 from pathlib import Path
@@ -82,7 +85,8 @@ class LocalToolingTest(unittest.TestCase):
         cli = load_cli()
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
-            cli.GENERATED_MANIFESTS = tmp_path / "generated"
+            original_generated_manifests = manifest_module.GENERATED_MANIFESTS
+            manifest_module.GENERATED_MANIFESTS = tmp_path / "generated"
 
             repo = tmp_path / "sample-repo"
             (repo / "src" / "main" / "java").mkdir(parents=True)
@@ -90,8 +94,11 @@ class LocalToolingTest(unittest.TestCase):
             (repo / "README.md").write_text("# Readme\n", encoding="utf-8")
             (repo / "src" / "main" / "java" / "App.java").write_text("class App {}\n", encoding="utf-8")
 
-            manifest_path = cli.generate_manifest(repo, "default")
-            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+            try:
+                manifest_path = cli.generate_manifest(repo, "default")
+                payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+            finally:
+                manifest_module.GENERATED_MANIFESTS = original_generated_manifests
 
             self.assertEqual(payload["contexts"][0]["root"], repo.resolve().as_posix())
             self.assertEqual(payload["contexts"][0]["metadata"]["profile"], "default")
@@ -105,8 +112,8 @@ class LocalToolingTest(unittest.TestCase):
             stdout="",
             stderr="Cannot connect to the Docker daemon",
         )
-        with mock.patch.object(cli, "command_exists", return_value=True), mock.patch.object(
-            cli.subprocess, "run", return_value=result
+        with mock.patch.object(docker_runtime_module, "command_exists", return_value=True), mock.patch.object(
+            docker_runtime_module.subprocess, "run", return_value=result
         ):
             running, message = cli.docker_daemon_running()
 
@@ -115,8 +122,8 @@ class LocalToolingTest(unittest.TestCase):
 
     def test_docker_daemon_running_reports_timeout(self) -> None:
         cli = load_cli()
-        with mock.patch.object(cli, "command_exists", return_value=True), mock.patch.object(
-            cli.subprocess, "run", side_effect=TimeoutExpired(["docker", "info"], timeout=10)
+        with mock.patch.object(docker_runtime_module, "command_exists", return_value=True), mock.patch.object(
+            docker_runtime_module.subprocess, "run", side_effect=TimeoutExpired(["docker", "info"], timeout=10)
         ):
             running, message = cli.docker_daemon_running()
 
@@ -313,7 +320,7 @@ class LocalToolingTest(unittest.TestCase):
             subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
 
             with mock.patch.object(
-                cli,
+                workflow_module,
                 "json_post",
                 return_value={"count": 1, "results": [{"source": "repo/test", "path": "README.md", "score": 1.0}]},
             ):
