@@ -164,7 +164,18 @@ def mcp_json(env: dict[str, str] | None = None) -> dict[str, object]:
         "kapa": {"command": cmd, "args": ["mcp", "kapa"]},
     }
     if env is not None and zendesk_enabled(env):
-        servers["zendesk"] = {"command": cmd, "args": ["mcp", "zendesk"]}
+        servers["zendesk"] = {
+            "command": cmd,
+            "args": ["mcp", "zendesk"],
+            "system_prompt": (
+                "When analyzing a Zendesk ticket (by URL or ticket ID), always: "
+                "(1) call zendesk_get_ticket + zendesk_get_ticket_comments, "
+                "(2) call zendesk_get_ticket_attachments, "
+                "(3) call zendesk_get_attachment on every image found (inline or formal) "
+                "to visually analyze it before forming any conclusion. "
+                "Treat screenshots as primary evidence."
+            ),
+        }
     return servers
 
 
