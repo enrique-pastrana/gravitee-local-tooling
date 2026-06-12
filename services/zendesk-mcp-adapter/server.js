@@ -102,6 +102,28 @@ async function zendeskGet(path, params = {}) {
   }
 }
 
+async function zendeskDownloadAttachment(contentUrl) {
+  requireConfig();
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), TIMEOUT_SECONDS * 1000);
+  try {
+    const res = await fetch(contentUrl, {
+      method: "GET",
+      headers: authHeaders(),
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      throw new Error(`Zendesk attachment download failed with HTTP ${res.status}`);
+    }
+    const contentType = res.headers.get("content-type") || "application/octet-stream";
+    const buffer = await res.arrayBuffer();
+    const base64 = Buffer.from(buffer).toString("base64");
+    return { base64, contentType };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 async function vdbPost(path, payload) {
   const res = await fetch(`${VDB_API_URL}${path}`, {
     method: "POST",
@@ -129,6 +151,68 @@ async function getTicket(ticketId) {
 async function getTicketComments(ticketId) {
   const payload = await zendeskGet(`/api/v2/tickets/${encodeURIComponent(ticketId)}/comments.json`);
   return payload.comments || [];
+}
+
+// Extract formal attachments (uploaded files) from comments
+function extractFormalAttachments(comments) {
+  const attachments = [];
+  for (const comment of comments) {
+    for (const att of comment.attachments || []) {
+      if (att.content_url && att.content_type) {
+        attachments.push({
+          source: "attachment",
+          comment_id: comment.id,
+          attachment_id: att.id,
+          file_name: att.file_name,
+          content_type: att.content_type,
+          content_url: att.content_url,
+          size: att.size,
+          inline: att.inline || false,
+        });
+      }
+    }
+  }
+  return attachments;
+}
+
+// Extract inline images pasted directly in comment body (markdown ![](url) or html <img src="url">)
+function extractInlineImages(comments) {
+  const images = [];
+  const seen = new Set();
+
+  // Matches markdown: ![alt](url) and html: src="url" or src='url'
+  const mdRegex = /!\[[^\]]*\]\((https?:\/\/[^)]+)\)/g;
+  const htmlRegex = /(?:src)=["'](https?:\/\/[^"']+\/attachments\/[^"']+)["']/gi;
+
+  for (const comment of comments) {
+    const body = comment.body || "";
+
+    for (const regex of [mdRegex, htmlRegex]) {
+      regex.lastIndex = 0;
+      let match;
+      while ((match = regex.exec(body)) !== null) {
+        const url = match[1];
+        if (!seen.has(url)) {
+          seen.add(url);
+          // Guess content type from URL filename extension
+          const ext = url.split("?")[0].split(".").pop().toLowerCase();
+          const extMap = { png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", webp: "image/webp" };
+          const content_type = extMap[ext] || "image/png";
+          images.push({
+            source: "inline",
+            comment_id: comment.id,
+            attachment_id: null,
+            file_name: `image.${ext || "png"}`,
+            content_type,
+            content_url: url,
+            size: null,
+            inline: true,
+          });
+        }
+      }
+    }
+  }
+  return images;
 }
 
 function ticketUrl(ticket) {
@@ -300,6 +384,64 @@ server.tool(
     withToolLogging("zendesk_get_organization", { organization_id: String(organization_id) }, async () => {
       const payload = await zendeskGet(`/api/v2/organizations/${encodeURIComponent(String(organization_id))}.json`);
       return textResult(payload.organization || payload);
+    }),
+);
+
+server.tool(
+  "zendesk_get_ticket_attachments",
+  "Read-only list of all attachments (images, files) found in a Zendesk ticket's comments. Returns both formal attachments (uploaded files) and inline images pasted directly in comment bodies.",
+  { ticket_id: z.union([z.string(), z.number()]) },
+  async ({ ticket_id }) =>
+    withToolLogging("zendesk_get_ticket_attachments", { ticket_id: String(ticket_id) }, async () => {
+      const comments = await getTicketComments(String(ticket_id));
+      const formal = extractFormalAttachments(comments);
+      const inline = extractInlineImages(comments);
+      const all = [...formal, ...inline];
+      return textResult({
+        ticket_id: String(ticket_id),
+        count: all.length,
+        formal_count: formal.length,
+        inline_count: inline.length,
+        attachments: all,
+      });
+    }),
+);
+
+server.tool(
+  "zendesk_get_attachment",
+  "Download a single Zendesk ticket attachment and return it as base64-encoded content. Use zendesk_get_ticket_attachments first to list available attachments and get their content_url. Supports images (PNG, JPEG, GIF, WEBP) and other file types (PDF, text logs, etc.). For images, the caller (Claude) can decode and display them natively.",
+  {
+    content_url: z.string().url(),
+    file_name: z.string().optional(),
+    content_type: z.string().optional(),
+  },
+  async ({ content_url, file_name = "", content_type = "" }) =>
+    withToolLogging("zendesk_get_attachment", { content_url, file_name }, async () => {
+      const { base64, contentType: resolvedContentType } = await zendeskDownloadAttachment(content_url);
+      const finalContentType = content_type || resolvedContentType;
+      const isImage = finalContentType.startsWith("image/");
+
+      if (isImage) {
+        return {
+          content: [
+            { type: "image", data: base64, mimeType: finalContentType },
+            { type: "text", text: `Attachment: ${file_name || content_url} (${finalContentType}, ${Math.round(base64.length * 0.75 / 1024)} KB)` },
+          ],
+        };
+      }
+
+      const isText = finalContentType.startsWith("text/") || finalContentType.includes("json") || finalContentType.includes("xml");
+      if (isText) {
+        const decoded = Buffer.from(base64, "base64").toString("utf-8");
+        return textResult({ file_name, content_type: finalContentType, text: decoded });
+      }
+
+      return textResult({
+        file_name,
+        content_type: finalContentType,
+        size_kb: Math.round(base64.length * 0.75 / 1024),
+        note: "Binary file — not a text or image type. Download manually if needed.",
+      });
     }),
 );
 
