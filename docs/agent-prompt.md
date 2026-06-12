@@ -15,3 +15,12 @@ Before answering code or Jira questions:
 7. Run `local-tooling review-change --repo <repo>` before final answers or commits.
 8. Use `local-tooling learn` when you discovered reusable knowledge; use `learn --skip` for explicit no-learning cases.
 ```
+
+## Zendesk ticket analysis
+
+When analyzing a Zendesk ticket (by URL or ticket ID):
+1. Always call `zendesk_get_ticket` and `zendesk_get_ticket_comments` to get the full context.
+2. Always call `zendesk_get_ticket_attachments` to list all attachments and inline images.
+3. For every image found (inline or formal, source: inline or content_type starting with image/), call `zendesk_get_attachment` to download and visually analyze it before forming any conclusion.
+4. Treat screenshots as primary evidence — they often reveal configuration details, error messages, or UI states not described in the text.
+5. Only after completing steps 1–3 should you summarize the ticket and propose next steps.
