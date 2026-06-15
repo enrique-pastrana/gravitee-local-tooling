@@ -430,9 +430,17 @@ server.tool(
         };
       }
 
-      const isText = finalContentType.startsWith("text/") || finalContentType.includes("json") || finalContentType.includes("xml");
-      if (isText) {
-        const decoded = Buffer.from(base64, "base64").toString("utf-8");
+      let decoded;
+      try {
+        const text = Buffer.from(base64, "base64").toString("utf-8");
+        const replacementRatio = (text.match(/\ufffd/g) || []).length / (text.length || 1);
+        if (replacementRatio > 0.05) throw new Error("Not valid UTF-8");
+        decoded = text;
+      } catch (_err) {
+        decoded = null;
+      }
+
+      if (decoded !== null) {
         return textResult({ file_name, content_type: finalContentType, text: decoded });
       }
 
@@ -440,7 +448,7 @@ server.tool(
         file_name,
         content_type: finalContentType,
         size_kb: Math.round(base64.length * 0.75 / 1024),
-        note: "Binary file — not a text or image type. Download manually if needed.",
+        note: "Binary file (not valid UTF-8) — download manually if needed.",
       });
     }),
 );
