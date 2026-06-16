@@ -89,8 +89,46 @@ export async function zendeskGet(path, params = {}) {
   }
 }
 
+/**
+ * Validate that a URL is safe to fetch with Zendesk auth headers.
+ *
+ * Only permits:
+ *  - The configured Zendesk base domain (ZENDESK_BASE_URL)
+ *  - *.zendesk.com  (Zendesk-hosted attachments / CDN)
+ *  - *.zdassets.com (Zendesk static asset CDN)
+ *
+ * This prevents SSRF: a malicious ticket body cannot trick the adapter into
+ * forwarding the Zendesk API token to an attacker-controlled host.
+ */
+function validateAttachmentUrl(url) {
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch (_err) {
+    throw new Error(`Invalid attachment URL: ${url}`);
+  }
+
+  const configuredHost = BASE_URL ? new URL(BASE_URL).hostname : null;
+  const host = parsed.hostname;
+
+  const allowed =
+    (configuredHost && host === configuredHost) ||
+    host === "zendesk.com" ||
+    host.endsWith(".zendesk.com") ||
+    host === "zdassets.com" ||
+    host.endsWith(".zdassets.com");
+
+  if (!allowed) {
+    throw new Error(
+      `Attachment URL host "${host}" is not permitted. Only the configured Zendesk domain and ` +
+        "known Zendesk CDN hosts (*.zendesk.com, *.zdassets.com) are allowed.",
+    );
+  }
+}
+
 export async function zendeskDownloadAttachment(contentUrl) {
   requireConfig();
+  validateAttachmentUrl(contentUrl);
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), TIMEOUT_SECONDS * 1000);
   try {
