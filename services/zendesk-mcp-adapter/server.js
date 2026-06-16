@@ -1,127 +1,28 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
+import {
+  ENABLED,
+  BASE_URL,
+  log,
+  requireConfig,
+  subdomain,
+  zendeskGet,
+  zendeskDownloadAttachment,
+} from "./zendeskClient.js";
+import { extractFormalAttachments, extractInlineImages, decodeAsText } from "./attachments.js";
 
-const ENABLED = String(process.env.ZENDESK_ENABLED || "false").toLowerCase() === "true";
-const BASE_URL = (process.env.ZENDESK_BASE_URL || "").replace(/\/+$/, "");
-const AUTH_MODE = (process.env.ZENDESK_AUTH_MODE || "oauth").toLowerCase();
-const OAUTH_ACCESS_TOKEN = process.env.ZENDESK_OAUTH_ACCESS_TOKEN || "";
-const EMAIL = process.env.ZENDESK_EMAIL || "";
-const API_TOKEN = process.env.ZENDESK_API_TOKEN || "";
 const PAGE_SIZE = Number.parseInt(process.env.ZENDESK_PAGE_SIZE || "50", 10);
-const TIMEOUT_SECONDS = Number.parseInt(process.env.ZENDESK_TIMEOUT_SECONDS || "15", 10);
 const VDB_API_URL = (process.env.VDB_API_URL || "http://vectordb-api:8000").replace(/\/+$/, "");
 
-function log(level, message, fields = {}) {
-  process.stderr.write(
-    `${JSON.stringify({
-      ts: new Date().toISOString(),
-      level,
-      service: "zendesk-mcp-adapter",
-      message,
-      ...fields,
-    })}\n`,
-  );
-}
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
 function textResult(value) {
   return {
     content: [{ type: "text", text: typeof value === "string" ? value : JSON.stringify(value, null, 2) }],
   };
-}
-
-function requireEnabled() {
-  if (!ENABLED) {
-    throw new Error("Zendesk is disabled. Set ZENDESK_ENABLED=true in .env and configure ZENDESK_* secrets.");
-  }
-}
-
-function requireConfig() {
-  requireEnabled();
-  if (!BASE_URL) {
-    throw new Error("ZENDESK_BASE_URL is required when ZENDESK_ENABLED=true");
-  }
-  if (AUTH_MODE === "oauth" && !OAUTH_ACCESS_TOKEN) {
-    throw new Error("ZENDESK_OAUTH_ACCESS_TOKEN is required for ZENDESK_AUTH_MODE=oauth");
-  }
-  if (AUTH_MODE === "api-token" && (!EMAIL || !API_TOKEN)) {
-    throw new Error("ZENDESK_EMAIL and ZENDESK_API_TOKEN are required for ZENDESK_AUTH_MODE=api-token");
-  }
-  if (!["oauth", "api-token"].includes(AUTH_MODE)) {
-    throw new Error("ZENDESK_AUTH_MODE must be oauth or api-token");
-  }
-}
-
-function authHeaders() {
-  if (AUTH_MODE === "oauth") {
-    return { Authorization: `Bearer ${OAUTH_ACCESS_TOKEN}` };
-  }
-  const raw = Buffer.from(`${EMAIL}/token:${API_TOKEN}`).toString("base64");
-  return { Authorization: `Basic ${raw}` };
-}
-
-function subdomain() {
-  try {
-    const host = new URL(BASE_URL).hostname;
-    return host.split(".")[0] || "unknown";
-  } catch (_err) {
-    return "unknown";
-  }
-}
-
-async function zendeskGet(path, params = {}) {
-  requireConfig();
-  const query = new URLSearchParams(params);
-  const url = `${BASE_URL}${path}${query.size ? `?${query.toString()}` : ""}`;
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), TIMEOUT_SECONDS * 1000);
-  try {
-    const res = await fetch(url, {
-      method: "GET",
-      headers: {
-        Accept: "application/json",
-        ...authHeaders(),
-      },
-      signal: controller.signal,
-    });
-    const bodyText = await res.text();
-    let body = {};
-    try {
-      body = bodyText ? JSON.parse(bodyText) : {};
-    } catch (_err) {
-      body = { raw: bodyText };
-    }
-    if (!res.ok) {
-      const retryAfter = res.headers.get("retry-after");
-      const suffix = retryAfter ? `; retry-after=${retryAfter}` : "";
-      throw new Error(`Zendesk GET failed with HTTP ${res.status}${suffix}`);
-    }
-    return body;
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
-async function zendeskDownloadAttachment(contentUrl) {
-  requireConfig();
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), TIMEOUT_SECONDS * 1000);
-  try {
-    const res = await fetch(contentUrl, {
-      method: "GET",
-      headers: authHeaders(),
-      signal: controller.signal,
-    });
-    if (!res.ok) {
-      throw new Error(`Zendesk attachment download failed with HTTP ${res.status}`);
-    }
-    const contentType = res.headers.get("content-type") || "application/octet-stream";
-    const buffer = await res.arrayBuffer();
-    const base64 = Buffer.from(buffer).toString("base64");
-    return { base64, contentType };
-  } finally {
-    clearTimeout(timeout);
-  }
 }
 
 async function vdbPost(path, payload) {
@@ -153,72 +54,8 @@ async function getTicketComments(ticketId) {
   return payload.comments || [];
 }
 
-// Extract formal attachments (uploaded files) from comments
-function extractFormalAttachments(comments) {
-  const attachments = [];
-  for (const comment of comments) {
-    for (const att of comment.attachments || []) {
-      if (att.content_url && att.content_type) {
-        attachments.push({
-          source: "attachment",
-          comment_id: comment.id,
-          attachment_id: att.id,
-          file_name: att.file_name,
-          content_type: att.content_type,
-          content_url: att.content_url,
-          size: att.size,
-          inline: att.inline || false,
-        });
-      }
-    }
-  }
-  return attachments;
-}
-
-// Extract inline images pasted directly in comment body (markdown ![](url) or html <img src="url">)
-function extractInlineImages(comments) {
-  const images = [];
-  const seen = new Set();
-
-  // Matches markdown: ![alt](url) and html: src="url" or src='url'
-  const mdRegex = /!\[[^\]]*\]\((https?:\/\/[^)]+)\)/g;
-  const htmlRegex = /(?:src)=["'](https?:\/\/[^"']+\/attachments\/[^"']+)["']/gi;
-
-  for (const comment of comments) {
-    const body = comment.body || "";
-
-    for (const regex of [mdRegex, htmlRegex]) {
-      regex.lastIndex = 0;
-      let match;
-      while ((match = regex.exec(body)) !== null) {
-        const url = match[1];
-        if (!seen.has(url)) {
-          seen.add(url);
-          // Guess content type from URL filename extension
-          const ext = url.split("?")[0].split(".").pop().toLowerCase();
-          const extMap = { png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", webp: "image/webp" };
-          const content_type = extMap[ext] || "image/png";
-          images.push({
-            source: "inline",
-            comment_id: comment.id,
-            attachment_id: null,
-            file_name: `image.${ext || "png"}`,
-            content_type,
-            content_url: url,
-            size: null,
-            inline: true,
-          });
-        }
-      }
-    }
-  }
-  return images;
-}
-
 function ticketUrl(ticket) {
-  if (!ticket || !ticket.id) {
-    return "";
-  }
+  if (!ticket || !ticket.id) return "";
   return `${BASE_URL}/agent/tickets/${ticket.id}`;
 }
 
@@ -233,9 +70,7 @@ function ticketText(ticket, comments) {
   ];
   for (const comment of comments) {
     const body = comment.plain_body || comment.body || "";
-    if (!body.trim()) {
-      continue;
-    }
+    if (!body.trim()) continue;
     parts.push(`Comment ${comment.id || ""} by ${comment.author_id || "unknown"} (${comment.created_at || "unknown"}):`);
     parts.push(body);
     parts.push("");
@@ -263,14 +98,10 @@ function ticketMetadata(ticket, query, comments) {
 
 async function ingestTicket(ticketId, query = "") {
   const ticket = await getTicket(ticketId);
-  if (!ticket) {
-    throw new Error(`Zendesk ticket not found: ${ticketId}`);
-  }
+  if (!ticket) throw new Error(`Zendesk ticket not found: ${ticketId}`);
   const comments = await getTicketComments(ticketId);
   const text = ticketText(ticket, comments);
-  if (!text) {
-    throw new Error(`Zendesk ticket has no indexable text: ${ticketId}`);
-  }
+  if (!text) throw new Error(`Zendesk ticket has no indexable text: ${ticketId}`);
   const payload = {
     source: `zendesk/${subdomain()}`,
     path: `tickets/${ticket.id}`,
@@ -289,11 +120,7 @@ async function searchTickets(query, limit = PAGE_SIZE) {
     per_page: String(Math.min(Math.max(limit, 1), PAGE_SIZE)),
   });
   const results = (payload.results || []).filter((item) => item.id && (item.result_type || "ticket") === "ticket");
-  return {
-    count: payload.count,
-    next_page: payload.next_page,
-    results: results.slice(0, limit),
-  };
+  return { count: payload.count, next_page: payload.next_page, results: results.slice(0, limit) };
 }
 
 async function withToolLogging(tool, fields, fn) {
@@ -313,6 +140,10 @@ async function withToolLogging(tool, fields, fn) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// MCP server + tool registration
+// ---------------------------------------------------------------------------
+
 const server = new McpServer({
   name: "zendesk-mcp-adapter",
   version: "0.1.0",
@@ -326,7 +157,6 @@ server.tool("zendesk_health", "Read-only Zendesk health/config check.", {}, asyn
       status: "ok",
       enabled: ENABLED,
       base_url: BASE_URL,
-      auth_mode: AUTH_MODE,
       user_id: me.user ? me.user.id : null,
     });
   }),
@@ -389,7 +219,8 @@ server.tool(
 
 server.tool(
   "zendesk_get_ticket_attachments",
-  "Read-only list of all attachments (images, files) found in a Zendesk ticket's comments. Returns both formal attachments (uploaded files) and inline images pasted directly in comment bodies.",
+  "Read-only list of all attachments (images, files) found in a Zendesk ticket's comments. " +
+    "Returns both formal attachments (uploaded files) and inline images pasted directly in comment bodies.",
   { ticket_id: z.union([z.string(), z.number()]) },
   async ({ ticket_id }) =>
     withToolLogging("zendesk_get_ticket_attachments", { ticket_id: String(ticket_id) }, async () => {
@@ -409,7 +240,10 @@ server.tool(
 
 server.tool(
   "zendesk_get_attachment",
-  "Download a single Zendesk ticket attachment and return it as base64-encoded content. Use zendesk_get_ticket_attachments first to list available attachments and get their content_url. Supports images (PNG, JPEG, GIF, WEBP) and other file types (PDF, text logs, etc.). For images, the caller (Claude) can decode and display them natively.",
+  "Download a single Zendesk ticket attachment and return it as base64-encoded content. " +
+    "Use zendesk_get_ticket_attachments first to list available attachments and get their content_url. " +
+    "Images (PNG, JPEG, GIF, WEBP) are returned as MCP image blocks for native visual analysis. " +
+    "Text files (JSON, YAML, logs) are returned as decoded text.",
   {
     content_url: z.string().url(),
     file_name: z.string().optional(),
@@ -425,21 +259,15 @@ server.tool(
         return {
           content: [
             { type: "image", data: base64, mimeType: finalContentType },
-            { type: "text", text: `Attachment: ${file_name || content_url} (${finalContentType}, ${Math.round(base64.length * 0.75 / 1024)} KB)` },
+            {
+              type: "text",
+              text: `Attachment: ${file_name || content_url} (${finalContentType}, ${Math.round((base64.length * 0.75) / 1024)} KB)`,
+            },
           ],
         };
       }
 
-      let decoded;
-      try {
-        const text = Buffer.from(base64, "base64").toString("utf-8");
-        const replacementRatio = (text.match(/\ufffd/g) || []).length / (text.length || 1);
-        if (replacementRatio > 0.05) throw new Error("Not valid UTF-8");
-        decoded = text;
-      } catch (_err) {
-        decoded = null;
-      }
-
+      const decoded = decodeAsText(base64);
       if (decoded !== null) {
         return textResult({ file_name, content_type: finalContentType, text: decoded });
       }
@@ -447,7 +275,7 @@ server.tool(
       return textResult({
         file_name,
         content_type: finalContentType,
-        size_kb: Math.round(base64.length * 0.75 / 1024),
+        size_kb: Math.round((base64.length * 0.75) / 1024),
         note: "Binary file (not valid UTF-8) — download manually if needed.",
       });
     }),
@@ -484,6 +312,10 @@ server.tool(
     }),
 );
 
+// ---------------------------------------------------------------------------
+// Startup
+// ---------------------------------------------------------------------------
+
 async function main() {
   log("info", "Starting MCP adapter", { enabled: ENABLED, base_url: BASE_URL || null });
   const transport = new StdioServerTransport();
@@ -492,9 +324,6 @@ async function main() {
 }
 
 main().catch((err) => {
-  log("error", "MCP adapter failed to start", {
-    error: err.message,
-    stack: err.stack,
-  });
+  log("error", "MCP adapter failed to start", { error: err.message, stack: err.stack });
   process.exit(1);
 });
