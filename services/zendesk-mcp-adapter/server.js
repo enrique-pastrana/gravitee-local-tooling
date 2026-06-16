@@ -312,6 +312,34 @@ server.tool(
     }),
 );
 
+server.tool(
+  "zendesk_get_ticket_with_attachments",
+  "Read-only fetch of a Zendesk ticket, its comments, and the full list of attachments " +
+    "(formal uploads and inline images) in a single call. " +
+    "Use this as the primary entry point when analyzing a ticket — it gives you everything " +
+    "you need to decide which images to download with zendesk_get_attachment.",
+  { ticket_id: z.union([z.string(), z.number()]) },
+  async ({ ticket_id }) =>
+    withToolLogging("zendesk_get_ticket_with_attachments", { ticket_id: String(ticket_id) }, async () => {
+      const id = String(ticket_id);
+      const [ticket, comments] = await Promise.all([getTicket(id), getTicketComments(id)]);
+      const formal = extractFormalAttachments(comments);
+      const inline = extractInlineImages(comments);
+      const all = [...formal, ...inline];
+      return textResult({
+        ticket_id: id,
+        ticket,
+        comments,
+        attachments: {
+          count: all.length,
+          formal_count: formal.length,
+          inline_count: inline.length,
+          items: all,
+        },
+      });
+    }),
+);
+
 // ---------------------------------------------------------------------------
 // Startup
 // ---------------------------------------------------------------------------
