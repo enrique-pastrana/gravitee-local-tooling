@@ -100,7 +100,7 @@ export async function zendeskGet(path, params = {}) {
  * This prevents SSRF: a malicious ticket body cannot trick the adapter into
  * forwarding the Zendesk API token to an attacker-controlled host.
  */
-function validateAttachmentUrl(url) {
+export function validateAttachmentUrl(url, baseUrl = BASE_URL) {
   let parsed;
   try {
     parsed = new URL(url);
@@ -108,7 +108,7 @@ function validateAttachmentUrl(url) {
     throw new Error(`Invalid attachment URL: ${url}`);
   }
 
-  const configuredHost = BASE_URL ? new URL(BASE_URL).hostname : null;
+  const configuredHost = baseUrl ? new URL(baseUrl).hostname : null;
   const host = parsed.hostname;
 
   const allowed =
@@ -128,7 +128,7 @@ function validateAttachmentUrl(url) {
 
 export async function zendeskDownloadAttachment(contentUrl) {
   requireConfig();
-  validateAttachmentUrl(contentUrl);
+  validateAttachmentUrl(contentUrl, BASE_URL);
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), TIMEOUT_SECONDS * 1000);
   try {
