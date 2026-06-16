@@ -125,7 +125,7 @@ test("extractInlineImages: deduplicates identical URLs within the same comment",
   assert.equal(result.length, 1);
 });
 
-test("extractInlineImages: infers content type from file extension", () => {
+test("extractInlineImages: infers content type from file extension in path", () => {
   const comments = [
     { id: 1, body: "![a](https://acme.zendesk.com/attachments/token/a/img.jpeg)" },
     { id: 2, body: "![b](https://acme.zendesk.com/attachments/token/b/img.gif)" },
@@ -137,6 +137,22 @@ test("extractInlineImages: infers content type from file extension", () => {
   assert.equal(result[0].content_type, "image/jpeg");
   assert.equal(result[1].content_type, "image/gif");
   assert.equal(result[2].content_type, "image/webp");
+});
+
+test("extractInlineImages: uses ?name= query param for file_name and extension (Zendesk token URLs)", () => {
+  // Real Zendesk inline image URLs use a token path with ?name=image.png
+  const comments = [
+    {
+      id: 1,
+      body: '![screenshot](https://acme.zendesk.com/attachments/token/G2YrPxM6xp1Ao26q2ay/?name=screenshot.png)',
+    },
+  ];
+
+  const result = extractInlineImages(comments);
+
+  assert.equal(result.length, 1);
+  assert.equal(result[0].file_name, "screenshot.png", "file_name should come from ?name= param");
+  assert.equal(result[0].content_type, "image/png");
 });
 
 test("extractInlineImages: returns empty array when no inline images", () => {

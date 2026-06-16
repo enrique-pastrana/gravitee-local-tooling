@@ -45,14 +45,20 @@ export function extractInlineImages(comments) {
         const url = match[1];
         if (!seen.has(url)) {
           seen.add(url);
-          const ext = url.split("?")[0].split(".").pop().toLowerCase();
+          // Prefer the ?name= query param (Zendesk token URLs use this pattern),
+          // fall back to the last path segment's extension.
+          const nameParam = new URL(url).searchParams.get("name") || "";
+          const extFromName = nameParam.includes(".") ? nameParam.split(".").pop().toLowerCase() : "";
+          const extFromPath = url.split("?")[0].split("/").pop().split(".").pop().toLowerCase();
+          const ext = extFromName || extFromPath;
           const extMap = { png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", webp: "image/webp" };
           const content_type = extMap[ext] || "image/png";
+          const file_name = nameParam || `image.${ext || "png"}`;
           images.push({
             source: "inline",
             comment_id: comment.id,
             attachment_id: null,
-            file_name: `image.${ext || "png"}`,
+            file_name,
             content_type,
             content_url: url,
             size: null,
