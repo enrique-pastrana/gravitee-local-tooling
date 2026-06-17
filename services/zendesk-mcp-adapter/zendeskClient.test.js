@@ -75,6 +75,17 @@ test("validateAttachmentUrl: rejects internal IP addresses", () => {
   );
 });
 
+test("validateAttachmentUrl: rejects HTTP URLs even on allowed hosts (no plaintext auth)", () => {
+  assert.throws(
+    () => validateAttachmentUrl("http://acme.zendesk.com/attachments/token/abc/file.png", BASE),
+    /HTTPS/,
+  );
+  assert.throws(
+    () => validateAttachmentUrl("http://static.zdassets.com/image.png", BASE),
+    /HTTPS/,
+  );
+});
+
 test("validateAttachmentUrl: rejects completely invalid URL string", () => {
   assert.throws(
     () => validateAttachmentUrl("not-a-url", BASE),

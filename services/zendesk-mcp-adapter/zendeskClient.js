@@ -108,6 +108,12 @@ export function validateAttachmentUrl(url, baseUrl = BASE_URL) {
     throw new Error(`Invalid attachment URL: ${url}`);
   }
 
+  if (parsed.protocol !== "https:") {
+    throw new Error(
+      `Attachment URL must use HTTPS (got "${parsed.protocol}"). Sending auth headers over plaintext HTTP is not permitted.`,
+    );
+  }
+
   const configuredHost = baseUrl ? new URL(baseUrl).hostname : null;
   const host = parsed.hostname;
 
