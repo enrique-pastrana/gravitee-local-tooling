@@ -2,6 +2,17 @@
 
 Local developer AI stack for Codex, Cursor, and Claude.
 
+It does not replace the AI coding assistant or introduce a separate daily
+workflow. Developers continue working in Codex, Cursor, or Claude as before.
+The stack gives those agents better repository-specific and
+organisation-specific context through MCP tools, improving the quality of
+their investigation and implementation.
+
+The CLI is primarily for setup, indexing, upgrades, and diagnostics. During
+everyday work, agents use the configured MCP tools, especially
+`rag_prepare_task`, to gather relevant context before investigating or changing
+code.
+
 It packages:
 
 - local `pgvector` vectordb
@@ -60,6 +71,18 @@ Ask your agent:
 Configure yourself using the local-tooling repo and run doctor.
 ```
 
+## Daily use
+
+After setup, use Codex, Cursor, or Claude normally.
+
+For a non-trivial task, describe the work to your agent as usual. The agent
+should first gather relevant context with `rag_prepare_task`, then verify useful
+results in the current repository before relying on them.
+
+You do not need to manually run `local-tooling context` for every task. It
+remains available as an optional CLI alternative when you want to inspect or
+record a context search yourself.
+
 Optional, recommended for Cursor users:
 
 ```bash
@@ -112,7 +135,9 @@ new tools such as `rag_prepare_task`.
 Do not run `docker compose down -v` unless you intentionally want to delete the
 local vectordb data.
 
-## Common commands
+## CLI commands
+
+Use the CLI for setup and maintenance:
 
 ```bash
 CODE_REPO=/path/to/the/code-repo-you-work-on
@@ -122,11 +147,18 @@ CODE_REPO=/path/to/the/code-repo-you-work-on
 ./bin/local-tooling doctor
 ./bin/local-tooling manifest --repo "$CODE_REPO" --profile default
 ./bin/local-tooling index --repo "$CODE_REPO" --profile default
+./bin/local-tooling install-agent-rules --repo "$CODE_REPO" --agents cursor
+./bin/local-tooling print-config --agent codex
+```
+
+Optional task-session commands:
+
+```bash
+CODE_REPO=/path/to/the/code-repo-you-work-on
+
 ./bin/local-tooling context --repo "$CODE_REPO" --task "APIM-12345 ..."
 ./bin/local-tooling review-change --repo "$CODE_REPO"
 ./bin/local-tooling learn --repo "$CODE_REPO" --task "APIM-12345 ..." --summary-file learning.md
-./bin/local-tooling install-agent-rules --repo "$CODE_REPO" --agents cursor
-./bin/local-tooling print-config --agent codex
 ```
 
 ## Bootstrap indexing
@@ -178,19 +210,28 @@ Zendesk commands:
 Indexed tickets are stored in vectordb with sources such as
 `zendesk/your-subdomain` and paths such as `tickets/12345`.
 
-## Task workflow
+## Context-aware task workflow
+
+The normal entry point is your AI coding assistant: Codex, Cursor, or Claude.
+For non-trivial Jira, debugging, or code-change tasks, the agent should use the
+`rag_prepare_task` MCP tool first. RAG results provide orientation only; the
+agent must verify relevant hits against current repository files and applicable
+repository instructions before proposing or editing code.
 
 The workflow is intentionally advisory by default. It improves context gathering
 without blocking simple local development.
 
-Start a non-trivial task with:
+### Optional manual CLI workflow
+
+Use this when you want to inspect the retrieved context or deliberately create
+a local session receipt. It is not required for normal agent-driven work.
 
 ```bash
 CODE_REPO=/path/to/the/code-repo-you-work-on
 ./bin/local-tooling context --repo "$CODE_REPO" --task "APIM-12345 short task summary"
 ```
 
-This queries vectordb, writes a context receipt under:
+This queries vectordb and writes a context receipt under:
 
 ```text
 <repo>/.local-tooling/sessions/<session-id>/context.json
@@ -199,7 +240,7 @@ This queries vectordb, writes a context receipt under:
 When the target repo is a Git repository, `.local-tooling/` is added to its
 local `.git/info/exclude` so session receipts do not pollute commits.
 
-Before a final answer or commit, run:
+Before a final answer or commit, you can also run:
 
 ```bash
 CODE_REPO=/path/to/the/code-repo-you-work-on
@@ -209,7 +250,7 @@ CODE_REPO=/path/to/the/code-repo-you-work-on
 By default this is warning-only. Use `--strict` only when you want it to fail on
 missing context, missing test changes for production edits, or missing learning.
 
-When the task produced reusable knowledge, save it:
+When the task produced reusable knowledge, you can save it:
 
 ```bash
 CODE_REPO=/path/to/the/code-repo-you-work-on
@@ -223,7 +264,7 @@ CODE_REPO=/path/to/the/code-repo-you-work-on
 ./bin/local-tooling learn --repo "$CODE_REPO" --task "APIM-12345" --skip "mechanical rename, no reusable learning"
 ```
 
-To make this workflow visible to agents in the target repo:
+To make this context-aware workflow visible to agents in the target repo:
 
 ```bash
 CODE_REPO=/path/to/the/code-repo-you-work-on
