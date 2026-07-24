@@ -5,6 +5,7 @@ import importlib.util
 import json
 import subprocess
 import tempfile
+import tomllib
 import unittest
 import local_tooling.docker_runtime as docker_runtime_module
 import local_tooling.manifest as manifest_module
@@ -80,6 +81,23 @@ class LocalToolingTest(unittest.TestCase):
             self.assertEqual(text.count(cli.CODEX_MARKER_START), 1)
             self.assertIn("[mcp_servers.vectordb]", text)
             self.assertIn("rag_search", text)
+
+    def test_patch_codex_replaces_legacy_managed_servers_without_duplicates(self) -> None:
+        cli = load_cli()
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "config.toml"
+            config.write_text(
+                """model = \"gpt-5\"\n\n[mcp_servers.vectordb]\ncommand = \"docker\"\n\n[mcp_servers.vectordb.tools.rag_search]\napproval_mode = \"ask\"\n\n[mcp_servers.github-mcp-server]\ncommand = \"docker\"\n\n[mcp_servers.unrelated]\ncommand = \"keep\"\n""",
+                encoding="utf-8",
+            )
+
+            cli.patch_codex({"CODEX_CONFIG": str(config)})
+            text = config.read_text(encoding="utf-8")
+            parsed = tomllib.loads(text)
+
+        self.assertEqual(text.count("[mcp_servers.vectordb]"), 1)
+        self.assertEqual(parsed["mcp_servers"]["unrelated"]["command"], "keep")
+        self.assertIn("# >>> local-tooling managed", text)
 
     def test_generate_manifest_default_profile(self) -> None:
         cli = load_cli()

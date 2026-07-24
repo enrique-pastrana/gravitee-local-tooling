@@ -3,14 +3,16 @@ from __future__ import annotations
 import json
 import re
 import sys
+import tomllib
 from pathlib import Path
 
 from .files import atomic_write, backup_file
-from .paths import ROOT
+from .paths import ENV_FILE, ROOT
 from .zendesk import zendesk_enabled
 
 CODEX_MARKER_START = "# >>> local-tooling managed"
 CODEX_MARKER_END = "# <<< local-tooling managed"
+MANAGED_CODEX_SERVERS = {"vectordb", "github-mcp-server", "atlassian", "kapa", "zendesk"}
 
 GITHUB_DISABLED_TOOLS = [
     "create_branch",
@@ -132,6 +134,21 @@ approval_mode = "approve"
 """.strip()
 
 
+def remove_managed_codex_sections(text: str) -> str:
+    """Remove legacy and previously managed MCP tables without touching other Codex settings."""
+    header = re.compile(r"^\s*\[mcp_servers\.([^\]]+)\]\s*(?:#.*)?$")
+    kept: list[str] = []
+    skip = False
+    for line in text.splitlines(keepends=True):
+        match = header.match(line)
+        if match:
+            server = match.group(1).split(".", 1)[0]
+            skip = server in MANAGED_CODEX_SERVERS
+        if not skip:
+            kept.append(line)
+    return "".join(kept)
+
+
 def patch_codex(env: dict[str, str]) -> Path:
     path = codex_config_path(env)
     existing = path.read_text(encoding="utf-8") if path.exists() else ""
@@ -139,12 +156,102 @@ def patch_codex(env: dict[str, str]) -> Path:
         rf"\n?{re.escape(CODEX_MARKER_START)}.*?{re.escape(CODEX_MARKER_END)}\n?",
         re.DOTALL,
     )
-    cleaned = pattern.sub("\n", existing).rstrip()
+    cleaned = remove_managed_codex_sections(pattern.sub("\n", existing)).rstrip()
     updated = (cleaned + "\n\n" if cleaned else "") + codex_block(env) + "\n"
     if updated != existing:
         backup_file(path)
         atomic_write(path, updated)
     return path
+
+
+def _mcp_server(payload: dict[str, object], name: str) -> dict[str, object]:
+    servers = payload.get("mcp_servers")
+    if not isinstance(servers, dict):
+        return {}
+    server = servers.get(name)
+    return server if isinstance(server, dict) else {}
+
+
+def _remote_url(args: object) -> str:
+    if not isinstance(args, list):
+        return ""
+    for item in args:
+        if isinstance(item, str) and item.startswith(("https://", "http://")):
+            return item
+    return ""
+
+
+def _option_value(args: object, option: str) -> str:
+    if not isinstance(args, list):
+        return ""
+    for index, item in enumerate(args[:-1]):
+        if item == option and isinstance(args[index + 1], str):
+            return args[index + 1]
+    return ""
+
+
+def legacy_codex_env(path: Path) -> dict[str, str]:
+    """Extract supported connection settings from legacy Codex MCP tables."""
+    if not path.exists():
+        return {}
+    try:
+        payload = tomllib.loads(path.read_text(encoding="utf-8"))
+    except tomllib.TOMLDecodeError as exc:
+        raise SystemExit(f"Cannot parse Codex config {path}: {exc}") from exc
+    if not isinstance(payload, dict):
+        return {}
+
+    updates: dict[str, str] = {}
+    github_env = _mcp_server(payload, "github-mcp-server").get("env")
+    if isinstance(github_env, dict):
+        token = github_env.get("GITHUB_PERSONAL_ACCESS_TOKEN")
+        if isinstance(token, str) and token:
+            updates["GITHUB_PERSONAL_ACCESS_TOKEN"] = token
+
+    atlassian = _mcp_server(payload, "atlassian")
+    atlassian_url = _remote_url(atlassian.get("args"))
+    if atlassian_url:
+        updates["ATLASSIAN_MCP_URL"] = atlassian_url
+    atlassian_site = _option_value(atlassian.get("args"), "--resource")
+    if atlassian_site:
+        updates["ATLASSIAN_SITE_URL"] = atlassian_site
+
+    kapa = _mcp_server(payload, "kapa")
+    kapa_url = _remote_url(kapa.get("args"))
+    if kapa_url:
+        updates["KAPA_REMOTE_MCP_URL"] = kapa_url
+    kapa_header = _option_value(kapa.get("args"), "--header")
+    if kapa_header:
+        updates["KAPA_REMOTE_MCP_AUTH_HEADER"] = kapa_header
+    return updates
+
+
+def merge_env_file(updates: dict[str, str]) -> list[str]:
+    """Add missing MCP settings to .env while preserving existing user choices and comments."""
+    existing = ENV_FILE.read_text(encoding="utf-8") if ENV_FILE.exists() else ""
+    lines = existing.splitlines()
+    present: set[str] = set()
+    for line in lines:
+        match = re.match(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$", line)
+        if match and match.group(2).strip():
+            present.add(match.group(1))
+
+    missing = [key for key, value in updates.items() if value and key not in present]
+    if not missing:
+        return []
+    suffix = "" if not existing or existing.endswith("\n") else "\n"
+    updated = existing + suffix + "\n".join(f"{key}={updates[key]}" for key in missing) + "\n"
+    if ENV_FILE.exists():
+        backup_file(ENV_FILE)
+    atomic_write(ENV_FILE, updated)
+    return missing
+
+
+def migrate_codex_mcp(env: dict[str, str]) -> tuple[Path, list[str]]:
+    """Move legacy MCP connection settings to .env and replace their Codex tables."""
+    path = codex_config_path(env)
+    migrated_keys = merge_env_file(legacy_codex_env(path))
+    return patch_codex(env), migrated_keys
 
 
 def mcp_json(env: dict[str, str] | None = None) -> dict[str, object]:

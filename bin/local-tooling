@@ -16,6 +16,7 @@ from local_tooling.agent_config import (
     codex_block,
     configure_agents,
     mcp_json,
+    migrate_codex_mcp,
     parse_agents,
     patch_codex,
     patch_json_mcp,
@@ -211,6 +212,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("start")
     sub.add_parser("stop")
     sub.add_parser("doctor")
+    sub.add_parser("migrate-codex-mcp", help="Migrate legacy Codex MCP settings into .env and managed configuration")
 
     manifest_parser = sub.add_parser("manifest")
     manifest_parser.add_argument("--repo", required=True)
@@ -273,6 +275,11 @@ def main() -> int:
         stop_stack(env)
     elif args.command == "doctor":
         doctor(env)
+    elif args.command == "migrate-codex-mcp":
+        path, migrated_keys = migrate_codex_mcp(env)
+        print(f"Migrated Codex MCP configuration: {path}")
+        if migrated_keys:
+            print("Migrated settings to .env: " + ", ".join(migrated_keys))
     elif args.command == "manifest":
         repo = Path(args.repo).expanduser().resolve()
         generate_manifest(repo, default_profile(repo, args.profile))
