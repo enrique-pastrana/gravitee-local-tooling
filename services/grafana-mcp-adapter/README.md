@@ -29,8 +29,93 @@ not chained to one another.
 | --- | --- |
 | `grafana_health` | Config/connectivity check (makes one authenticated call). |
 | `grafana_list_datasources` | List configured datasources (uid, name, type). |
-| `grafana_query` | Run a PromQL/LogQL/etc. query against a datasource uid over a time range. Returns a per-series digest by default. |
+| `grafana_query` | Run a read-only query against a datasource uid over a time range. Pass `expr` for Prometheus/Loki, or `query` (the datasource's own fields) for Elasticsearch/Tempo/Graphite/Pyroscope. Returns a compact digest by default. |
+| `grafana_logs_trend` | "When did this start?" — counts matching lines into fixed time buckets and reports total, onset, last seen and peak. Counts only, no log lines. |
+| `grafana_logs_patterns` | "What is dominating this log volume?" — Loki's detected line shapes, ranked by volume. **Does not surface rare lines** (see below). |
 | `grafana_logs_link` | Build a shareable Grafana logs link for a customer's logs. Discovers matching streams via Loki's `/series` (label sets only, no log lines) to scope the link. Defaults to Logs Drilldown links (per-namespace); pass `link_style="explore"` for a raw LogQL Explore link. |
+
+### Which datasources `grafana_query` will touch
+
+The read-only guarantee comes from the **query language**, not from token
+permissions, so each datasource type is allowed individually:
+
+| Allowed | Why |
+| --- | --- |
+| `prometheus`, `loki` | PromQL/LogQL have no write statements |
+| `elasticsearch` | Grafana's backend only issues `_msearch` |
+| `graphite`, `grafana-pyroscope-datasource`, `grafanacloud-cardinality-datasource` | read-only query paths |
+| `cloudwatch` | **billable, metrics only** — Logs Insights refused; every result carries a `billing_notice` (see below) |
+
+Deliberately blocked, because these can **act**, not just read:
+
+| Blocked | Why |
+| --- | --- |
+| `alertmanager` | the Alertmanager API can create silences |
+| `grafana-incident-datasource` | can create and modify incidents |
+| `k6-datasource` | can trigger load test runs against real targets |
+| `grafana-knowledgegraph-datasource` | unreviewed plugin surface |
+| `tempo` | read-only, but unused here — unused surface is surface nobody verifies |
+
+#### CloudWatch is metrics-only
+
+CloudWatch is the one type where the datasource type alone is not a sufficient
+guard. Metrics mode reads published metrics; **Logs Insights bills per GB
+scanned**, an unbounded cost a single careless query can run up. The query
+payload is therefore inspected, and anything that is not plainly a Metrics query
+is refused *before the request is sent* — `queryMode: "Logs"`, `logGroups`,
+`logGroupNames`, `queryLanguage`, or `subtype: "StartQuery"`.
+
+This blocks the unbounded cost, not literally every cost: `GetMetricData` is
+itself metered by AWS at a small per-request rate. There is no way to query
+CloudWatch for free; the guard removes the failure mode that can produce a large
+bill.
+
+Because of that, **every** CloudWatch result carries a `billing_notice` alongside
+`results` (on the raw response too), and each CloudWatch query emits a `warn`
+log line. Results from other datasources carry no such notice — a warning
+attached to free datasources would just train the reader to ignore it.
+
+```jsonc
+{
+  "billing_notice": "BILLABLE: this query was run against CloudWatch, which AWS meters per request ...",
+  "results": { "A": { ... } }
+}
+```
+
+#### Drilldown links and multiple services
+
+Verified against the live Logs Drilldown app, because both obvious approaches
+fail silently:
+
+- A `=~` regex alternation does **not** work. The app treats a filter value as a
+  literal and regex-escapes it, so `a|b` reaches Loki as `service_name=~"a\|b"`
+  and matches **nothing**.
+- The app's own multi-value operator (`=|`) keeps only the **first two** values.
+  Observed 1→1, 2→2, 3→2, 5→2, consistently and regardless of settle time.
+
+So a link pins `service_name` only when exactly one service matched. With several
+it is scoped to the namespace — broader, but never silently wrong — and the
+response carries `scope: "namespace"` plus a `scope_note`. The exact set is always
+available in `service_names` and in the `explore_url`, which honours the full
+LogQL.
+
+`expr` works **only** for Prometheus and Loki — Elasticsearch rejects it with
+HTTP 400 (Tempo, when it was briefly enabled, rejected it with HTTP 500). Use
+`query` for the others, e.g.
+
+```jsonc
+// Elasticsearch: count over time
+{"query": "*", "timeField": "@timestamp",
+ "metrics": [{"id": "1", "type": "count"}],
+ "bucketAggs": [{"id": "2", "type": "date_histogram", "field": "@timestamp",
+                 "settings": {"interval": "auto"}}]}
+
+// Graphite
+{"target": "some.metric"}
+```
+
+The datasource is always pinned from `datasource_uid` after `query` is merged, so
+a caller cannot redirect a query to an unverified (or blocked) datasource.
 
 ### `grafana_query` response shape
 
@@ -103,7 +188,7 @@ Each entry in `links` is `{ url }` (explore) or `{ namespace, service_names, url
 `matched_streams` regardless of `link_style` — no log lines are fetched.
 
 > **Multitenant note.** On the multitenant Cockpit instance the customer name is
-> *not* in `service_name`/`namespace` (it uses a tenant id, e.g. `ba813`), so a
+> *not* in `service_name`/`namespace` (it uses a tenant id, e.g. `cp2222`), so a
 > free-text `client` won't find those tenants. Resolving customer → tenant id is
 > a planned improvement; for now pass the tenant's namespace/id you were given.
 
@@ -161,8 +246,97 @@ automatically — it is added to your agent config (`.mcp.json` / Codex) just li
 `zendesk` / `vectordb` / `github`, with no manual wiring. It only needs HTTPS
 egress to the Grafana instance.
 
-`GRAFANA_LOGS_DATASOURCE_UID` is optional; it defaults to `grafanacloud-logs`,
-which is the Loki datasource uid on the Gravitee Grafana instance.
+`GRAFANA_LOGS_DATASOURCE_UID` is **required** — it has no default. A uid that is
+correct for one Grafana org is a silent, plausible failure in every other one, so
+the adapter refuses to guess: `doctor` reports it as a config error and the logs
+tools fail with a clear message rather than returning an empty result.
+
+Find it under Connections > Data sources > (Loki). **The uid is not always the
+same as the display name.** On the Gravitee instance the datasource is displayed
+as `grafanacloud-gravitee-logs` but its uid is `grafanacloud-logs`.
+
+### Rotating the token (or any `GRAFANA_*` value)
+
+`GRAFANA_*` reaches the container through the compose `environment:` block, which
+is captured when the container is **created**. So the container's own copy of the
+token goes stale the moment `.env` changes.
+
+`bin/local-tooling exec-mcp grafana` therefore forwards the resolved `GRAFANA_*`
+values into each exec session (`docker exec -e GRAFANA_TOKEN ...`, by name — never
+`-e VAR=value`, which would put the token on the command line where `ps` exposes
+it). `.env` is authoritative at **connect** time, so:
+
+```bash
+# edit .env, then simply reconnect the MCP client. No container recreate.
+```
+
+An **already-connected** MCP session keeps the values it started with, because its
+`docker exec` is still running. Reconnect that client to pick up a new token —
+`doctor` reads `.env` and so describes what the *next* connection will use.
+
+Only variables that are actually set are forwarded: `docker exec -e VAR` for an
+unset VAR does not leave the container's baked value in place, it removes it.
+
+### The customer snapshot is never committed
+
+`customers-snapshot.json` is a **local fallback cache** and is deliberately
+gitignored. It is generated from `gravitee-io/cloud-deployments-configuration`,
+which is **private**, and it contains the customer list with their control-plane
+and data-plane ids. **This repository is public** — committing that file would
+publish who Gravitee's customers are and how their infrastructure is addressed.
+
+Generate it locally when you want an offline fallback:
+
+```bash
+cd services/grafana-mcp-adapter
+GITHUB_PERSONAL_ACCESS_TOKEN=... npm run refresh-customers
+```
+
+Nothing breaks without it. The Dockerfile's `COPY customers-snapshot.jso[n]` is a
+no-op when the file is absent, so a fresh clone builds; the adapter fetches the
+map from GitHub at runtime and, if GitHub is unreachable AND no snapshot exists,
+reports that Gravitee Cloud customers cannot be resolved rather than failing or
+guessing. Hosted customers are unaffected either way — they resolve from Loki.
+
+### Why hosted customers are NOT in the bundled map
+
+The map covers Gravitee Cloud (Cockpit) tenants only. Hosted/standalone customers
+are resolved by matching Loki's `namespace` label, and that is deliberate — the
+question was measured, not assumed.
+
+`gravitee-techops-hosted-customers` lists 93 standalone customers as directory
+names, but those directories are **not** namespaces, and the namespace string does
+not appear in that repo at all (verified: GitHub code search finds
+`adminPassword` 30 times and `arcelor-prod` zero times — namespaces are generated
+at deploy time). Checked against a 30-day window of live namespaces:
+
+| | |
+| --- | --- |
+| 71 of 93 | resolve today via the namespace matcher |
+| 8 of 93 | directory name differs from the real namespace |
+| 14 of 93 | no live namespace at all (dormant/decommissioned) |
+
+The 8 are the reason not to bundle: `arcelor-mittal` -> `arcelor-prod`,
+`falcon-air` -> `falcon-prod`, `nimbusco` -> `nimbus-prod`, `zenithfr` ->
+`zenith-prod`, `blueyonder-apac` -> `blueyonder-plt-live`. Bundling the
+directory names would add eight customer names that match no namespace, while the
+existing matcher already resolves all eight from the name a human would type
+(`arcelor`, `falcon`, `nimbus`). Loki is the authority for this population.
+
+### `grafana_logs_patterns` has a volume floor
+
+Loki's pattern detection only reports patterns above a volume threshold. Rare
+lines are **absent entirely**, not ranked last. Measured on this instance over a
+48h window: the smallest reported pattern was **34 lines**, while a 10-line
+`DeserializationException` in the same window did not appear at all.
+
+So an error missing from the pattern list is **not** evidence it did not happen.
+Every response carries `smallest_pattern_count` and a `coverage_note` saying so.
+To find or count a specific or rare error, use `grafana_logs_trend` (which counts
+a `line_filter` over time) or `grafana_query`.
+
+`lines_in_patterns` counts only the lines Loki assigned to some pattern — it is
+not a total line count for the range.
 
 ## Testing
 
