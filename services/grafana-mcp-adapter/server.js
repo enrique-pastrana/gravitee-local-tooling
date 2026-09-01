@@ -570,7 +570,10 @@ registerTool(
     "By default returns a compact " +
     "digest: for metrics, one entry per series (labels + count/first/last/min/max/avg); " +
     "for Loki log queries, the line count, time window, the streams the lines came from " +
-    "and a small sample of lines; for anything else (e.g. Elasticsearch raw documents) " +
+    "and the DISTINCT KINDS of line present — near-identical lines are collapsed into one " +
+    "entry with an `occurrences` count, so a repeated message is reported once rather than " +
+    "filling the sample, and rarer kinds stay visible; for anything else (e.g. Elasticsearch " +
+    "raw documents) " +
     "the row count, the columns and a few sample rows. Pass raw=true for the " +
     "full (potentially very large) " +
     "frames. Log queries are capped at max_lines lines (Grafana defaults to 100 when " +

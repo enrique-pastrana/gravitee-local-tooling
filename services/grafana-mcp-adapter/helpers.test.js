@@ -228,19 +228,45 @@ test("summarizeQueryResult: log digest reports time range, streams and a sample"
   assert.deepEqual(r.streams[1], { labels: other, lines: 1 });
   assert.equal(r.streams_truncated, 0);
   // Sample keeps frame order (Loki returns newest first).
+  // Three distinct kinds, so three entries, each seen once.
   assert.deepEqual(r.sample_lines.map((s) => s.line), ["newest", "middle", "oldest"]);
+  assert.deepEqual(r.sample_lines.map((s) => s.occurrences), [1, 1, 1]);
+  assert.equal(r.distinct_line_kinds, 3);
   // Each sample carries its instant, so a caller can hand one straight to
   // grafana_logs_context to read what surrounded it.
   assert.equal(r.sample_lines[0].time, "2023-11-14T22:13:22.000Z");
-  assert.equal(r.sample_truncated, 0);
+  assert.equal(r.sample_kinds_truncated, 0);
 });
 
-test("summarizeQueryResult: log sample is capped and reports how many were dropped", () => {
+test("summarizeQueryResult: repeated lines collapse to one entry with a count", () => {
+  // The reason for deduplicating: twenty lines differing only by a number are
+  // ONE kind of event. Showing twenty (or the first three) says no more than
+  // showing one, while costing twenty times the customer log content.
   const rows = Array.from({ length: 20 }, (_, i) => ({ labels: NS, time: 1700000000000 + i, line: `line ${i}` }));
   const out = summarizeQueryResult({ results: { A: { frames: [logFrame(rows)] } } }, { maxSampleLines: 3 });
-  assert.equal(out.results.A.line_count, 20);
-  assert.equal(out.results.A.sample_lines.length, 3);
-  assert.equal(out.results.A.sample_truncated, 17);
+  const r = out.results.A;
+  assert.equal(r.line_count, 20, "the true line count is unaffected");
+  assert.equal(r.distinct_line_kinds, 1);
+  assert.equal(r.sample_lines.length, 1);
+  assert.equal(r.sample_lines[0].occurrences, 20);
+  assert.equal(r.sample_kinds_truncated, 0);
+});
+
+test("summarizeQueryResult: distinct kinds are ranked, and the list is capped", () => {
+  // Genuinely different messages must not be collapsed into each other, and the
+  // commonest kind should lead.
+  const rows = [
+    ...Array.from({ length: 5 }, () => ({ labels: NS, time: 1700000000000, line: "connection refused" })),
+    ...Array.from({ length: 2 }, () => ({ labels: NS, time: 1700000000000, line: "timeout waiting for upstream" })),
+    { labels: NS, time: 1700000000000, line: "a rare and interesting failure" },
+  ];
+  const out = summarizeQueryResult({ results: { A: { frames: [logFrame(rows)] } } }, { maxSampleLines: 2 });
+  const r = out.results.A;
+  assert.equal(r.line_count, 8);
+  assert.equal(r.distinct_line_kinds, 3);
+  assert.deepEqual(r.sample_lines.map((s) => s.occurrences), [5, 2]);
+  assert.equal(r.sample_lines[0].line, "connection refused");
+  assert.equal(r.sample_kinds_truncated, 1, "the rare kind was dropped by the cap - and said so");
 });
 
 test("summarizeQueryResult: an over-long log line is clipped, not passed through whole", () => {

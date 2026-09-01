@@ -63,7 +63,9 @@ export function coverageVerdict({ lineCount, bytesProcessed, limitReached }) {
 
 function summarizeLogFrames(frames, { maxStreams, maxSampleLines, maxLineChars, limit, window }) {
   const streams = new Map();
-  const samples = [];
+  // shape -> { time, line, occurrences }, insertion-ordered, so the example kept
+  // is the first (most recent) occurrence of each kind.
+  const sampleShapes = new Map();
   const stats = {};
   let lineCount = 0;
   let earliest = null;
@@ -94,21 +96,32 @@ function summarizeLogFrames(frames, { maxStreams, maxSampleLines, maxLineChars, 
       if (entry) entry.lines++;
       else streams.set(key, { labels, lines: 1 });
 
-      // Loki returns newest first, so the head of the frame is the most recent
-      // and therefore the most useful sample. Each sample carries its timestamp:
-      // the point of a sample is often to locate a moment worth reading around
-      // with grafana_logs_context, which needs an instant to anchor on.
-      if (samples.length < maxSampleLines && typeof lines[i] === "string") {
-        const line = lines[i];
-        samples.push({
-          time: Number.isFinite(t) ? new Date(t).toISOString() : null,
-          line: line.length > maxLineChars ? `${line.slice(0, maxLineChars)}…[truncated]` : line,
-        });
+      // Sample by DISTINCT KIND, not by position. Taking the first N lines
+      // routinely returned N byte-identical copies of one message — five copies
+      // of the same exception says no more than one, while costing five times
+      // the customer log content. Grouping by shape shows what KINDS of line are
+      // present with a count each, which is strictly more information in less
+      // text. The example keeps its own timestamp so it can be handed to
+      // grafana_logs_context.
+      if (typeof lines[i] === "string") {
+        const shape = normaliseLogLine(lines[i]);
+        const seen = sampleShapes.get(shape);
+        if (seen) {
+          seen.occurrences++;
+        } else {
+          const line = lines[i];
+          sampleShapes.set(shape, {
+            time: Number.isFinite(t) ? new Date(t).toISOString() : null,
+            line: line.length > maxLineChars ? `${line.slice(0, maxLineChars)}…[truncated]` : line,
+            occurrences: 1,
+          });
+        }
       }
     }
   }
 
   const all = [...streams.values()].sort((a, b) => b.lines - a.lines);
+  const kinds = [...sampleShapes.values()].sort((a, b) => b.occurrences - a.occurrences);
   const digest = {
     frame_type: "logs",
     line_count: lineCount,
@@ -116,8 +129,11 @@ function summarizeLogFrames(frames, { maxStreams, maxSampleLines, maxLineChars, 
     stream_count: all.length,
     streams: all.slice(0, maxStreams),
     streams_truncated: all.length > maxStreams ? all.length - maxStreams : 0,
-    sample_lines: samples,
-    sample_truncated: lineCount > samples.length ? lineCount - samples.length : 0,
+    // Distinct kinds of line, commonest first, each with how many times it
+    // occurred among the lines returned.
+    sample_lines: kinds.slice(0, maxSampleLines),
+    distinct_line_kinds: kinds.length,
+    sample_kinds_truncated: kinds.length > maxSampleLines ? kinds.length - maxSampleLines : 0,
   };
   if (Object.keys(stats).length) digest.stats = stats;
 
