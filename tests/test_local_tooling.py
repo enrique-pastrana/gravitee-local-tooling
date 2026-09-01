@@ -286,6 +286,7 @@ class LocalToolingTest(unittest.TestCase):
                 "grafana_logs_patterns",
                 "grafana_find_customer",
                 "grafana_logs_context",
+                "grafana_logs_noise",
             },
             "a tool was added or renamed - confirm it is read-only before updating this set",
         )

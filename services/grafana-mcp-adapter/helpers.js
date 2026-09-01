@@ -817,6 +817,96 @@ export function mergeContextStreams(result = [], { maxLines = 200, maxLineChars 
   };
 }
 
+// --------------------------------------------------------------------------
+// Noise profiling
+// --------------------------------------------------------------------------
+
+// Reduce a log line to its SHAPE, so lines that differ only in their variable
+// parts count as one thing. Rules are ordered: the specific ones must run before
+// the general ones, or a timestamp gets eaten by the number rule and two
+// different shapes collapse into one.
+//
+// Designed against real lines from this instance — Java stack frames, "... 193
+// common frames omitted", thread names carrying a counter, and Foo.java:5377.
+const NOISE_RULES = [
+  // A stack frame is pure noise: every frame differs by class, and keeping them
+  // apart turns one exception into fifty "distinct" shapes.
+  [/^\s*at [\w$.]+\(.*\)\s*$/, "at <stack frame>"],
+  [/\.\.\.\s+\d+\s+common frames omitted/g, "... <n> common frames omitted"],
+  // Timestamps, in the forms this instance actually emits.
+  [/\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:Z|[+-]\d{2}:?\d{2})?/g, "<ts>"],
+  [/\d{1,2}\/[A-Za-z]{3}\/\d{4}(?::\d{2}:\d{2}:\d{2})?/g, "<ts>"],
+  [/\b\d{2}:\d{2}:\d{2}(?:[.,]\d+)?\b/g, "<ts>"],
+  [/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi, "<uuid>"],
+  [/(?:::ffff:)?\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b/g, "<ip>"],
+  [/\b[0-9a-f]{8,}\b/gi, "<hex>"],
+  [/\b\d+\b/g, "<n>"],
+];
+
+export function normaliseLogLine(line = "") {
+  let s = String(line);
+  for (const [re, replacement] of NOISE_RULES) {
+    if (re.source.startsWith("^")) {
+      if (re.test(s)) return replacement;
+    } else {
+      s = s.replace(re, replacement);
+    }
+  }
+  return s.replace(/\s+/g, " ").trim();
+}
+
+// A ready-to-paste LogQL fragment that removes a shape from a query. The longest
+// run of text carrying no placeholder is the most specific thing stable across
+// every occurrence of that shape.
+//
+// Stack frames are special-cased: their only literal is "at", which is far too
+// short to exclude on, yet they are the commonest thing anyone wants gone — so
+// they get a line-start regex instead.
+export function suggestExclusion(shape = "") {
+  if (shape === "at <stack frame>") return '!~ `^\\s+at `';
+  const literals = String(shape)
+    .split(/<[a-z ]+>/)
+    .map((s) => s.trim())
+    .filter((s) => s.length >= 8);
+  if (!literals.length) return null;
+  const longest = literals.sort((a, b) => b.length - a.length)[0];
+  // Backticks would terminate the LogQL string literal.
+  return `!= \`${longest.replace(/`/g, "")}\``;
+}
+
+// Count shapes across a sample. Percentages describe THE SAMPLE, never the whole
+// window: Loki fills a limit backwards from the window end, so a sample is both
+// capped and time-biased. The caller is told what the sample actually covered so
+// the numbers are not read as a property of the range asked for.
+export function profileNoise(lines = [], { maxShapes = 10, dominantPct = 40 } = {}) {
+  const counts = new Map();
+  for (const line of lines) {
+    if (typeof line !== "string") continue;
+    const shape = normaliseLogLine(line);
+    if (!shape) continue;
+    const seen = counts.get(shape);
+    if (seen) seen.count++;
+    else counts.set(shape, { shape, count: 1, example: line.length > 300 ? `${line.slice(0, 300)}…` : line });
+  }
+  const sampled = [...counts.values()].reduce((n, s) => n + s.count, 0);
+  const ranked = [...counts.values()].sort((a, b) => b.count - a.count);
+  const shapes = ranked.slice(0, maxShapes).map((s) => ({
+    shape: s.shape,
+    count: s.count,
+    percent_of_sample: sampled ? Math.round((s.count / sampled) * 1000) / 10 : 0,
+    example: s.example,
+    ...(sampled && (s.count / sampled) * 100 >= dominantPct
+      ? { dominant: true, suggested_exclusion: suggestExclusion(s.shape) }
+      : {}),
+  }));
+  return {
+    sampled_lines: sampled,
+    distinct_shapes: ranked.length,
+    shapes,
+    shapes_truncated: ranked.length > maxShapes ? ranked.length - maxShapes : 0,
+  };
+}
+
 // Classic Levenshtein edit distance (small strings; fine for label matching).
 export function editDistance(a, b) {
   const m = a.length;

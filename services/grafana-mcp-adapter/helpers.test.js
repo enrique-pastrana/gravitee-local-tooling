@@ -27,6 +27,9 @@ const {
   resolvedWindow,
   coverageVerdict,
   mergeContextStreams,
+  normaliseLogLine,
+  profileNoise,
+  suggestExclusion,
   editDistance,
   rankClientSuggestions,
   splitClientEnv,
@@ -616,6 +619,81 @@ test("toLokiNs: a nanosecond instant from a previous result passes through", () 
   assert.equal(toLokiNs("1700000000000000000", 0, NOW), "1700000000000000000");
   // ...while epoch ms (~13 digits) is still scaled up.
   assert.equal(toLokiNs("1700000000000", 0, NOW), `${1700000000000 * 1e6}`);
+});
+
+// ---------------------------------------------------------------------------
+// noise profiling
+// ---------------------------------------------------------------------------
+
+test("normaliseLogLine: collapses the variable parts, keeping the message", () => {
+  // Shapes taken from real lines on this instance.
+  assert.equal(
+    normaliseLogLine("15:18:23.213 [vert.x-eventloop-thread-1] [] WARN Error parsing"),
+    "<ts> [vert.x-eventloop-thread-<n>] [] WARN Error parsing",
+  );
+  assert.equal(
+    normaliseLogLine("::ffff:10.0.0.62 - - [01/Sep/2026:15:12:57 +0000] \"GET / HTTP/1.1\" 200 6597"),
+    '<ip> - - [<ts> +<n>] "GET / HTTP/<n>.<n>" <n> <n>',
+  );
+  assert.equal(normaliseLogLine("channel 'a3f1c8de-1234-4bcd-9012-abcdef012345' closed"), "channel '<uuid>' closed");
+});
+
+test("normaliseLogLine: every stack frame is one shape", () => {
+  // Otherwise a single exception fragments into fifty distinct 'shapes' and
+  // hides whatever else is in the stream.
+  const a = normaliseLogLine("\tat io.reactivex.rxjava3.core.Maybe.subscribe(Maybe.java:5377)");
+  const b = normaliseLogLine("  at io.netty.handler.ssl.SslHandler.decode(SslHandler.java:1428)");
+  assert.equal(a, "at <stack frame>");
+  assert.equal(a, b);
+  assert.equal(normaliseLogLine("... 193 common frames omitted"), "... <n> common frames omitted");
+});
+
+test("normaliseLogLine: specific rules run before general ones", () => {
+  // A timestamp must not be eaten by the number rule, or two different shapes
+  // collapse into one and the profile lies about what dominates.
+  assert.equal(normaliseLogLine("2026-08-20T15:00:00.123Z done"), "<ts> done");
+  assert.ok(!normaliseLogLine("2026-08-20T15:00:00Z done").includes("<n>"));
+});
+
+test("profileNoise: ranks shapes and flags a dominant one", () => {
+  // The case from the field notes: one repeating message is most of the volume.
+  const lines = [
+    ...Array.from({ length: 90 }, (_, i) => `Ignoring ChannelEvent for channel '${i}' without any target`),
+    "something genuinely interesting happened",
+    "another one-off",
+  ];
+  const p = profileNoise(lines, { maxShapes: 3 });
+  assert.equal(p.sampled_lines, 92);
+  assert.equal(p.distinct_shapes, 3);
+  assert.equal(p.shapes[0].count, 90);
+  assert.equal(p.shapes[0].percent_of_sample, 97.8);
+  assert.equal(p.shapes[0].dominant, true);
+  assert.match(p.shapes[0].suggested_exclusion, /Ignoring ChannelEvent/);
+  // The rare line survives next to the noise — the reason for profiling at all.
+  assert.ok(p.shapes.some((s) => s.shape === "something genuinely interesting happened"));
+});
+
+test("profileNoise: a quiet stream has no dominant shape", () => {
+  const p = profileNoise(["alpha message here", "beta message here", "gamma message here"]);
+  assert.equal(p.shapes.every((s) => !s.dominant), true);
+  assert.equal(p.shapes.every((s) => s.suggested_exclusion === undefined), true);
+});
+
+test("profileNoise: caps the list and tolerates junk", () => {
+  const p = profileNoise(["a message", null, 42, undefined, "a message"], { maxShapes: 1 });
+  assert.equal(p.sampled_lines, 2, "non-strings are skipped, not counted");
+  assert.equal(p.shapes.length, 1);
+  assert.deepEqual(profileNoise([]).shapes, []);
+});
+
+test("suggestExclusion: produces a pasteable LogQL fragment", () => {
+  assert.equal(suggestExclusion("at <stack frame>"), "!~ `^\\s+at `");
+  assert.equal(
+    suggestExclusion("Ignoring ChannelEvent for channel '<n>'"),
+    "!= `Ignoring ChannelEvent for channel '`",
+  );
+  // Nothing stable and long enough to exclude on.
+  assert.equal(suggestExclusion("<ts> <n> <ip>"), null);
 });
 
 // ---------------------------------------------------------------------------

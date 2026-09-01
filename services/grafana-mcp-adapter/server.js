@@ -30,6 +30,7 @@ import {
   summarizePatterns,
   resolvedWindow,
   mergeContextStreams,
+  profileNoise,
 } from "./helpers.js";
 import { loadCustomerMap, warmCustomerMap, resolveCustomerNamespaces, matchCustomers, groupByCustomer, lookupById, dataPlaneNamespace, controlPlaneNamespace } from "./customerMap.js";
 
@@ -1203,6 +1204,91 @@ registerTool(
         result.note =
           "No lines in this window. Check the instant is right (it is echoed above in UTC) and that the " +
           "selector matches — grafana_logs_trend will show whether this stream has any data nearby.";
+      }
+      return textResult(result);
+    }),
+);
+
+registerTool(
+  "grafana_logs_noise",
+  "Read-only: what is actually filling this log stream. Samples recent lines, reduces each " +
+    "to its SHAPE by replacing the variable parts (timestamps, uuids, ips, numbers, stack " +
+    "frames) with placeholders, and ranks the shapes by how much of the sample they account " +
+    "for — with a ready-to-paste LogQL exclusion for each. One repeating message is routinely " +
+    "most of a stream's volume, and it crowds out whatever you were looking for. " +
+    "Unlike grafana_logs_patterns, which uses Loki's own detection and therefore cannot see " +
+    "below a volume floor, this profiles the lines it actually fetched, so a shape occurring " +
+    "twice in the sample still appears. " +
+    "Percentages describe THE SAMPLE, not the time range: Loki fills a limit backwards from " +
+    "the end of the window, so the sample is both capped and biased towards the most recent " +
+    "moment. The window the sample actually covered is reported — read the percentages " +
+    "against that, not against from/to.",
+  {
+    client: z.string().optional().describe("Customer name fragment. Omit if giving an exact namespace."),
+    component: z.string().optional().describe("Component fragment, e.g. 'gateway'."),
+    namespace: z.string().optional().describe("Exact namespace, if you already know it."),
+    from: z.string().default("now-1h").describe("Range start, e.g. 'now-1h'."),
+    to: z.string().default("now").describe("Range end."),
+    sample_size: z.number().int().min(50).max(5000).default(500).optional().describe("Lines to sample. Larger is more representative and slower."),
+    max_shapes: z.number().int().min(1).max(50).default(10).optional(),
+    control_plane_id: z.string().optional().describe("Narrow to one Cockpit organization (see grafana_find_customer)."),
+  },
+  async ({ client, component, namespace, from = "now-1h", to = "now", sample_size = 500, max_shapes = 10, control_plane_id }) =>
+    withToolLogging("grafana_logs_noise", { client, namespace, from, to, sample_size }, async () => {
+      const uid = requireDatasourceUid(LOGS_DATASOURCE_UID);
+      if (!client && !namespace) throw new Error("either client or namespace is required");
+
+      let selector;
+      let resolution = null;
+      if (namespace) {
+        selector = `{namespace="${namespace}"}`;
+      } else {
+        const resolved = await resolveCustomerSelector({ client, component, from, controlPlaneId: control_plane_id });
+        selector = resolved.selector;
+        resolution = resolved.resolution;
+      }
+
+      const { start, end } = rangeSeconds(from, to);
+      const data = await grafanaDatasourceProxyGet(uid, "loki/api/v1/query_range", {
+        query: selector,
+        start: `${start * 1e9}`,
+        end: `${end * 1e9}`,
+        direction: "backward",
+        limit: String(sample_size),
+      });
+
+      const streams = data?.data?.result || [];
+      const rows = streams.flatMap((st) => (st.values || []).map((v) => [Number(v[0]), v[1]]));
+      const profile = profileNoise(rows.map((r) => r[1]), { maxShapes: max_shapes });
+
+      const result = {
+        query: selector,
+        ...(resolution ? resolutionReport(resolution) : {}),
+        range: { from, to },
+        ...profile,
+      };
+
+      // A sample that hit its cap describes a slice, not the range. Say which
+      // slice, or the percentages get read as a property of from/to.
+      if (rows.length) {
+        const times = rows.map((r) => r[0]).filter(Number.isFinite);
+        const earliest = Math.min(...times) / 1e6;
+        const latest = Math.max(...times) / 1e6;
+        result.sample_window = {
+          from_utc: new Date(earliest).toISOString(),
+          to_utc: new Date(latest).toISOString(),
+          covered_seconds: Math.max(0, Math.round((latest - earliest) / 1000)),
+          requested_seconds: Math.max(0, end - start),
+        };
+        if (rows.length >= sample_size) {
+          result.sample_window.warning =
+            `The sample hit its ${sample_size}-line cap and covers ` +
+            `${result.sample_window.covered_seconds}s of the ${result.sample_window.requested_seconds}s requested. ` +
+            "Loki fills the cap backwards from the end of the window, so these proportions describe the most " +
+            "recent slice only — a shape that stopped earlier in the range will not appear at all.";
+        }
+      } else {
+        result.note = "No lines sampled. Check the selector and range — grafana_logs_trend shows whether this stream has data.";
       }
       return textResult(result);
     }),
