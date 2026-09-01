@@ -29,6 +29,7 @@ import {
   summarizeTrend,
   summarizePatterns,
   resolvedWindow,
+  mergeContextStreams,
 } from "./helpers.js";
 import { loadCustomerMap, warmCustomerMap, resolveCustomerNamespaces, matchCustomers, groupByCustomer, lookupById, dataPlaneNamespace, controlPlaneNamespace } from "./customerMap.js";
 
@@ -1093,6 +1094,115 @@ registerTool(
           byId && byId.kind === "unknown"
             ? `No Gravitee Cloud customer, hosted namespace, or known id matched "${query}".`
             : `No Gravitee Cloud customer or hosted namespace matched "${query}".`;
+      }
+      return textResult(result);
+    }),
+);
+
+registerTool(
+  "grafana_logs_context",
+  "Read-only: every log line around a moment in time, UNFILTERED — the 'what else was " +
+    "happening right then' tool. Give it a timestamp (from a grafana_query sample, or an " +
+    "ISO 8601 instant with an explicit offset) and it returns all lines in a tight window " +
+    "on either side, in time order, merged across services. " +
+    "Why unfiltered matters: a logger formatting with a newline emits SEPARATE Loki " +
+    "entries. The first carries the text you searched for, the second carries the actual " +
+    "reason and contains none of your keywords — the same for stack traces and 'Caused " +
+    "by:' chains. A filtered query finds the header and hides the answer, one line away at " +
+    "the same millisecond. This tool therefore REFUSES a line filter rather than warning " +
+    "about one. " +
+    "Scope it by client (resolved exactly like grafana_logs_link) or by exact namespace/" +
+    "service_name from a previous result. Typical use: grafana_logs_trend to find when, " +
+    "grafana_query to find the line and its timestamp, then this to read what surrounded it.",
+  {
+    at: z
+      .string()
+      .describe(
+        "The instant to read around: an ISO 8601 timestamp WITH an explicit offset " +
+          "(2026-08-20T15:00:00Z), epoch milliseconds, or the nanosecond value from a prior result.",
+      ),
+    client: z.string().optional().describe("Customer name fragment. Omit if giving an exact namespace."),
+    component: z.string().optional().describe("Component fragment, e.g. 'gateway'."),
+    namespace: z.string().optional().describe("Exact namespace, e.g. from a previous result's streams."),
+    service_name: z.string().optional().describe("Exact service_name, to read one service rather than the whole namespace."),
+    window_seconds: z
+      .number().int().min(1).max(300).default(2).optional()
+      .describe("Seconds either side of `at`. Default 2 — wide enough for a multi-line entry, narrow enough to read."),
+    max_lines: z.number().int().min(1).max(1000).default(200).optional(),
+    control_plane_id: z.string().optional().describe("Narrow to one Cockpit organization (see grafana_find_customer)."),
+    line_filter: z
+      .string()
+      .optional()
+      .describe("NOT SUPPORTED — this tool refuses a line filter. Filtering is what hides the answer it exists to find."),
+  },
+  async ({ at, client, component, namespace, service_name, window_seconds = 2, max_lines = 200, control_plane_id, line_filter }) =>
+    withToolLogging("grafana_logs_context", { client, namespace, at, window_seconds }, async () => {
+      const uid = requireDatasourceUid(LOGS_DATASOURCE_UID);
+
+      // Refused, not warned about: a filter here re-creates the exact failure
+      // this tool exists to solve, and a warning is easy to read past.
+      if (line_filter) {
+        throw new Error(
+          "grafana_logs_context does not accept a line filter. Its purpose is to show the lines a filter " +
+            "would hide — a continuation line carries the reason but none of the filter's keywords. " +
+            "Use grafana_query to find the moment, then read around it here unfiltered.",
+        );
+      }
+      if (!client && !namespace) throw new Error("either client or namespace is required");
+
+      // Resolve the instant first: a bad timestamp must fail loudly here rather
+      // than silently reading a different moment.
+      const atNs = BigInt(toLokiNs(at, 0));
+      const halfWindowNs = BigInt(Math.round(window_seconds * 1e9));
+      const startNs = atNs - halfWindowNs;
+      const endNs = atNs + halfWindowNs;
+
+      let selector;
+      let resolution = null;
+      if (namespace) {
+        const matchers = [`namespace="${namespace}"`];
+        if (service_name) matchers.push(`service_name="${service_name}"`);
+        selector = `{${matchers.join(", ")}}`;
+      } else {
+        const resolved = await resolveCustomerSelector({ client, component, from: at, controlPlaneId: control_plane_id });
+        selector = resolved.selector;
+        resolution = resolved.resolution;
+      }
+
+      const data = await grafanaDatasourceProxyGet(uid, "loki/api/v1/query_range", {
+        query: selector,
+        start: startNs.toString(),
+        end: endNs.toString(),
+        // Forward: oldest first, so a continuation line follows the line it
+        // continues. Backward would present the reason before the message.
+        direction: "forward",
+        limit: String(max_lines),
+      });
+
+      const merged = mergeContextStreams(data?.data?.result || [], { maxLines: max_lines });
+      const result = {
+        query: selector,
+        ...(resolution ? resolutionReport(resolution) : {}),
+        at: new Date(Number(atNs / 1000000n)).toISOString(),
+        window: {
+          from_utc: new Date(Number(startNs / 1000000n)).toISOString(),
+          to_utc: new Date(Number(endNs / 1000000n)).toISOString(),
+          seconds_either_side: window_seconds,
+        },
+        line_count: merged.total,
+        lines: merged.lines,
+        filtered: false,
+      };
+      if (merged.truncated) {
+        result.truncated = merged.truncated;
+        result.note =
+          `${merged.total} lines fell in this window and ${merged.truncated} were dropped at max_lines. ` +
+          "Narrow window_seconds or pin service_name to see the sequence around the moment itself.";
+      }
+      if (merged.total === 0) {
+        result.note =
+          "No lines in this window. Check the instant is right (it is echoed above in UTC) and that the " +
+          "selector matches — grafana_logs_trend will show whether this stream has any data nearby.";
       }
       return textResult(result);
     }),

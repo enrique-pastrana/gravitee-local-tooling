@@ -95,10 +95,15 @@ function summarizeLogFrames(frames, { maxStreams, maxSampleLines, maxLineChars, 
       else streams.set(key, { labels, lines: 1 });
 
       // Loki returns newest first, so the head of the frame is the most recent
-      // and therefore the most useful sample.
+      // and therefore the most useful sample. Each sample carries its timestamp:
+      // the point of a sample is often to locate a moment worth reading around
+      // with grafana_logs_context, which needs an instant to anchor on.
       if (samples.length < maxSampleLines && typeof lines[i] === "string") {
         const line = lines[i];
-        samples.push(line.length > maxLineChars ? `${line.slice(0, maxLineChars)}…[truncated]` : line);
+        samples.push({
+          time: Number.isFinite(t) ? new Date(t).toISOString() : null,
+          line: line.length > maxLineChars ? `${line.slice(0, maxLineChars)}…[truncated]` : line,
+        });
       }
     }
   }
@@ -626,7 +631,12 @@ export function toLokiNs(value, fallbackSecondsAgo, now = Date.now()) {
     return `${(now - n * unit) * 1e6}`;
   }
 
-  if (/^\d+$/.test(raw)) return `${Number(raw) * 1e6}`;
+  if (/^\d+$/.test(raw)) {
+    // Loki reports per-line timestamps in NANOseconds (~19 digits). Epoch ms is
+    // ~13. Treating a ns value as ms lands in the year 58000 and silently
+    // queries an empty future window, so the two are distinguished by width.
+    return raw.length >= 16 ? raw : `${Number(raw) * 1e6}`;
+  }
 
   if (LOOKS_LIKE_DATE.test(raw)) {
     if (!EXPLICIT_OFFSET.test(raw)) {
@@ -771,6 +781,39 @@ export function summarizePatterns(data = [], { maxPatterns = 20 } = {}) {
     smallest_pattern_count: rows.length ? rows[rows.length - 1].count : null,
     patterns: rows.slice(0, maxPatterns),
     patterns_truncated: rows.length > maxPatterns ? rows.length - maxPatterns : 0,
+  };
+}
+
+// Flatten Loki's per-stream query_range response into ONE time-ordered sequence.
+//
+// Order is the whole point. A logger formatting with `\n` emits SEPARATE Loki
+// entries: the first carries the searchable text, the second carries the actual
+// reason and contains none of the filter's keywords. Stack traces and
+// `Caused by:` chains behave the same way. Reading them in order, unfiltered, is
+// the only way to see the detail a filtered query structurally hides.
+export function mergeContextStreams(result = [], { maxLines = 200, maxLineChars = 2000 } = {}) {
+  const rows = [];
+  for (const stream of result) {
+    const labels = stream?.stream || {};
+    for (const [ts, line] of stream?.values || []) {
+      const ns = Number(ts);
+      if (!Number.isFinite(ns)) continue;
+      rows.push({
+        time: new Date(ns / 1e6).toISOString(),
+        ts_ns: String(ts),
+        service_name: labels.service_name ?? null,
+        pod: labels.pod ?? null,
+        line: typeof line === "string" && line.length > maxLineChars ? `${line.slice(0, maxLineChars)}…[truncated]` : line,
+        _sort: ns,
+      });
+    }
+  }
+  rows.sort((a, b) => a._sort - b._sort);
+  const total = rows.length;
+  return {
+    lines: rows.slice(0, maxLines).map(({ _sort, ...r }) => r),
+    total,
+    truncated: total > maxLines ? total - maxLines : 0,
   };
 }
 

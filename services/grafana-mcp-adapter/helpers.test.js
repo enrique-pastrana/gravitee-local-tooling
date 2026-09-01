@@ -26,6 +26,7 @@ const {
   toLokiNs,
   resolvedWindow,
   coverageVerdict,
+  mergeContextStreams,
   editDistance,
   rankClientSuggestions,
   splitClientEnv,
@@ -224,7 +225,10 @@ test("summarizeQueryResult: log digest reports time range, streams and a sample"
   assert.deepEqual(r.streams[1], { labels: other, lines: 1 });
   assert.equal(r.streams_truncated, 0);
   // Sample keeps frame order (Loki returns newest first).
-  assert.deepEqual(r.sample_lines, ["newest", "middle", "oldest"]);
+  assert.deepEqual(r.sample_lines.map((s) => s.line), ["newest", "middle", "oldest"]);
+  // Each sample carries its instant, so a caller can hand one straight to
+  // grafana_logs_context to read what surrounded it.
+  assert.equal(r.sample_lines[0].time, "2023-11-14T22:13:22.000Z");
   assert.equal(r.sample_truncated, 0);
 });
 
@@ -239,7 +243,7 @@ test("summarizeQueryResult: log sample is capped and reports how many were dropp
 test("summarizeQueryResult: an over-long log line is clipped, not passed through whole", () => {
   const rows = [{ labels: NS, time: 1700000000000, line: "x".repeat(1000) }];
   const out = summarizeQueryResult({ results: { A: { frames: [logFrame(rows)] } } }, { maxLineChars: 10 });
-  assert.equal(out.results.A.sample_lines[0], "xxxxxxxxxx\u2026[truncated]");
+  assert.equal(out.results.A.sample_lines[0].line, "xxxxxxxxxx\u2026[truncated]");
 });
 
 test("summarizeQueryResult: reaching the requested line cap is reported as partial", () => {
@@ -560,6 +564,58 @@ test("summarizePatterns: caps the list and reports how many were dropped", () =>
   assert.equal(out.patterns.length, 5);
   assert.equal(out.patterns_truncated, 25);
   assert.equal(out.patterns[0].count, 30, "capped list keeps the BIGGEST patterns");
+});
+
+// ---------------------------------------------------------------------------
+// mergeContextStreams
+// ---------------------------------------------------------------------------
+
+test("mergeContextStreams: interleaves streams into one time-ordered sequence", () => {
+  // The reason for reading context at all: a logger formatting with a newline
+  // emits two SEPARATE entries. The second carries the reason and none of the
+  // filter's keywords, so it is only visible unfiltered and in order.
+  const result = [
+    { stream: { service_name: "api", pod: "api-1" }, values: [["1700000000000000000", "Problem while sending request."]] },
+    { stream: { service_name: "gw", pod: "gw-1" }, values: [["1700000000500000000", "unrelated gateway line"]] },
+    { stream: { service_name: "api", pod: "api-1" }, values: [["1700000000000900000", "  Caused by: connection refused"]] },
+  ];
+  const out = mergeContextStreams(result);
+  assert.equal(out.total, 3);
+  assert.deepEqual(out.lines.map((l) => l.line), [
+    "Problem while sending request.",
+    "  Caused by: connection refused",
+    "unrelated gateway line",
+  ]);
+  assert.equal(out.lines[0].service_name, "api");
+  assert.equal(out.lines[0].ts_ns, "1700000000000000000");
+  assert.equal(out.lines[0].time, "2023-11-14T22:13:20.000Z");
+});
+
+test("mergeContextStreams: caps output and reports what was dropped", () => {
+  const values = Array.from({ length: 10 }, (_, i) => [String(1700000000000000000 + i * 1000000), `l${i}`]);
+  const out = mergeContextStreams([{ stream: { service_name: "api" }, values }], { maxLines: 4 });
+  assert.equal(out.total, 10);
+  assert.equal(out.lines.length, 4);
+  assert.equal(out.truncated, 6);
+  assert.equal(out.lines[0].line, "l0", "the cap keeps the EARLIEST lines, so the sequence still reads forward");
+});
+
+test("mergeContextStreams: clips an enormous line and tolerates junk", () => {
+  const out = mergeContextStreams(
+    [{ stream: {}, values: [["1700000000000000000", "y".repeat(50)], ["not-a-number", "dropped"]] }],
+    { maxLineChars: 10 },
+  );
+  assert.equal(out.total, 1, "a row with an unparseable timestamp is dropped, not sorted randomly");
+  assert.equal(out.lines[0].line, "yyyyyyyyyy\u2026[truncated]");
+  assert.equal(out.lines[0].service_name, null);
+});
+
+test("toLokiNs: a nanosecond instant from a previous result passes through", () => {
+  // Loki reports per-line timestamps in ns (~19 digits). Read as ms it would
+  // land in the year 58000 and query an empty future window.
+  assert.equal(toLokiNs("1700000000000000000", 0, NOW), "1700000000000000000");
+  // ...while epoch ms (~13 digits) is still scaled up.
+  assert.equal(toLokiNs("1700000000000", 0, NOW), `${1700000000000 * 1e6}`);
 });
 
 // ---------------------------------------------------------------------------
