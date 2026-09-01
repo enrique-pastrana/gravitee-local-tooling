@@ -352,6 +352,8 @@ async function resolveNamespaces(client, { from, control_plane_id } = {}) {
   // several customers together. The label route is unaffected — a hosted
   // customer that matched by name is still searched — but the caller is told
   // which Cockpit customers were withheld and why.
+  // A customer that does not resolve may simply be missing from a stale map, and
+  // that is a different answer from "no such customer".
   if (resolved.ambiguous) {
     return {
       namespaces: byLabel,
@@ -364,7 +366,16 @@ async function resolveNamespaces(client, { from, control_plane_id } = {}) {
     };
   }
 
-  if (!namespaces.length) return { namespaces: [], via: "none", map_source: map.source, map_warning: map.warning };
+  if (!namespaces.length) {
+    return {
+      namespaces: [],
+      via: "none",
+      map_source: map.source,
+      map_generated_at: map.generated_at,
+      map_generated_days_ago: map.generated_days_ago,
+      map_warning: map.warning,
+    };
+  }
 
   const via =
     byLabel.length && resolved.namespaces.length
@@ -387,7 +398,12 @@ async function resolveNamespaces(client, { from, control_plane_id } = {}) {
     via,
     ...(absent.length ? { mapped_namespaces_absent_in_range: absent } : {}),
     ...(resolved.namespaces.length
-      ? { map_source: map.source, map_generated_at: map.generated_at, map_warning: map.warning }
+      ? {
+          map_source: map.source,
+          map_generated_at: map.generated_at,
+          map_generated_days_ago: map.generated_days_ago,
+          map_warning: map.warning,
+        }
       : {}),
     label_namespaces: byLabel,
     matched_deployments: resolved.matched.map((r) => ({
@@ -446,6 +462,7 @@ function resolutionReport(resolution = {}) {
   for (const key of [
     "map_source",
     "map_generated_at",
+    "map_generated_days_ago",
     "label_namespaces",
     "matched_deployments",
     "env_filter_applied",
@@ -1068,6 +1085,7 @@ registerTool(
         ...(byId && byId.kind !== "unknown" ? { matched_by_id: byId } : {}),
         map_source: map.source,
         ...(map.generated_at ? { map_generated_at: map.generated_at } : {}),
+        ...(map.generated_days_ago !== undefined ? { map_generated_days_ago: map.generated_days_ago } : {}),
         ...(map.warning ? { map_warning: map.warning } : {}),
         gravitee_cloud_customers: cockpit.slice(0, max_results),
         gravitee_cloud_truncated: cockpit.length > max_results ? cockpit.length - max_results : 0,

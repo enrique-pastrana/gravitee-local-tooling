@@ -318,11 +318,59 @@ export function resolveCustomerNamespaces(rows = [], { core, envs = [], includeC
 // Loading: GitHub first, bundled snapshot as the fallback
 // ---------------------------------------------------------------------------
 
+// A map fetched live can still be months out of date. Report the age rather than
+// letting `source: "github"` imply currency.
+function staleness(generatedAt) {
+  if (!generatedAt) return {};
+  const days = Math.floor((Date.now() - Date.parse(generatedAt)) / 86400000);
+  if (!Number.isFinite(days)) return {};
+  if (days < STALE_AFTER_DAYS) return { generated_days_ago: days };
+  return {
+    generated_days_ago: days,
+    warning:
+      `The customer map was last regenerated ${days} days ago (${String(generatedAt).slice(0, 10)}). It is a ` +
+      "GENERATED file, so fetching it live does not make it current: deployments created since then are absent " +
+      "entirely, and a customer that does not resolve may simply be missing rather than nonexistent. " +
+      "Regenerate it by running docs/summary/generate_summary.py in the source repository.",
+  };
+}
+
 let cache = null;
 let cachedAt = 0;
 // Concurrent tool calls on a cold cache must not each fetch: they await the same
 // request. Without this, a burst of calls at connect time all pay the round trip.
 let inFlight = null;
+
+// How old the map may be before it is called out. The summary is a GENERATED
+// artifact committed to its repo, so "fetched from GitHub" says nothing about
+// when it was last regenerated — and a stale map fails by omission, which is the
+// hardest kind of wrong to notice.
+const STALE_AFTER_DAYS = Number(process.env.GRAFANA_CUSTOMER_MAP_STALE_DAYS || 30);
+
+// The date the source file was last COMMITTED, i.e. last regenerated. Best-effort:
+// a failure here must not stop the map loading.
+async function fetchGeneratedAt(token) {
+  try {
+    const url =
+      `https://api.github.com/repos/${REPO}/commits?path=${encodeURIComponent(PATH)}` +
+      `&sha=${encodeURIComponent(REF)}&per_page=1`;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+    try {
+      const res = await fetch(url, {
+        headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "User-Agent": "grafana-mcp-adapter" },
+        signal: controller.signal,
+      });
+      if (!res.ok) return null;
+      const commits = await res.json();
+      return commits?.[0]?.commit?.committer?.date || commits?.[0]?.commit?.author?.date || null;
+    } finally {
+      clearTimeout(timer);
+    }
+  } catch {
+    return null;
+  }
+}
 
 async function fetchFromGitHub() {
   const token = (process.env.GITHUB_PERSONAL_ACCESS_TOKEN || "").trim();
@@ -368,7 +416,8 @@ async function loadCustomerMapUncached() {
   try {
     const rows = parseCustomerCsv(await fetchFromGitHub());
     if (!rows.length) throw new Error("fetched customer CSV parsed to zero rows");
-    cache = { rows, source: "github", generated_at: null };
+    const generatedAt = await fetchGeneratedAt((process.env.GITHUB_PERSONAL_ACCESS_TOKEN || "").trim());
+    cache = { rows, source: "github", generated_at: generatedAt, ...staleness(generatedAt) };
     cachedAt = Date.now();
     return cache;
   } catch (err) {
