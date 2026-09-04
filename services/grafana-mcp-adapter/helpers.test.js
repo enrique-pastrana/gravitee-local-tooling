@@ -8,13 +8,34 @@ process.env.GRAFANA_BASE_URL = "https://g.example.com";
 
 const {
   summarizeQueryResult,
+  isLogFrame,
+  classifyFrame,
+  requireDatasourceUid,
+  durationSeconds,
+  chooseInterval,
+  buildTrendBuckets,
+  summarizeTrend,
+  summarizePatterns,
   escapeRegex,
   buildLogsQuery,
   buildExactLogsQuery,
   buildExploreUrl,
   buildDrilldownUrl,
   buildLineFilterToken,
+  lineFilterExpr,
   toLokiNs,
+  resolvedWindow,
+  coverageVerdict,
+  statusFilterExpr,
+  buildIngressQuery,
+  detectSampling,
+  scopeNote,
+  INGRESS_JOB,
+  NGINX_PATTERN,
+  mergeContextStreams,
+  normaliseLogLine,
+  profileNoise,
+  suggestExclusion,
   editDistance,
   rankClientSuggestions,
   splitClientEnv,
@@ -122,6 +143,610 @@ test("summarizeQueryResult: tolerates missing results / frames", () => {
 });
 
 // ---------------------------------------------------------------------------
+// summarizeQueryResult — Loki log frames
+// ---------------------------------------------------------------------------
+
+// A Loki log frame exactly as Grafana's /ds/query returns it: frameType
+// `LabeledTimeValues`, and fields labels/Time/Line/tsNs/labelTypes/id. The
+// point of this fixture is that NOT ONE of those fields has type "number" —
+// the numeric digest path skips all of them, so without log handling this
+// frame reports `series_count: 0` for a query that matched every line.
+function logFrame(rows, { stats } = {}) {
+  return {
+    schema: {
+      refId: "A",
+      meta: {
+        custom: { frameType: "LabeledTimeValues" },
+        ...(stats ? { stats } : {}),
+      },
+      fields: [
+        { name: "labels", type: "other" },
+        { name: "Time", type: "time" },
+        { name: "Line", type: "string" },
+        { name: "tsNs", type: "string" },
+        { name: "labelTypes", type: "other" },
+        { name: "id", type: "string" },
+      ],
+    },
+    data: {
+      values: [
+        rows.map((r) => r.labels),
+        rows.map((r) => r.time),
+        rows.map((r) => r.line),
+        rows.map((r) => String(r.time * 1e6)),
+        rows.map(() => ({})),
+        rows.map((r) => `${r.time}_x`),
+      ],
+    },
+  };
+}
+
+const NS = { namespace: "demo-qa", service_name: "apim-api" };
+
+test("summarizeQueryResult: log frames are counted, not silently dropped", () => {
+  // Regression: log fields are string/time/other, never number. The numeric
+  // path skips every field, so this used to report series_count 0 — a false
+  // "no matches" for a query that matched three lines.
+  const payload = {
+    results: {
+      A: {
+        status: 200,
+        frames: [
+          logFrame([
+            { labels: NS, time: 1700000002000, line: "boom c" },
+            { labels: NS, time: 1700000001000, line: "boom b" },
+            { labels: NS, time: 1700000000000, line: "boom a" },
+          ]),
+        ],
+      },
+    },
+  };
+  const out = summarizeQueryResult(payload);
+  assert.equal(out.results.A.frame_type, "logs");
+  assert.equal(out.results.A.line_count, 3);
+  assert.notEqual(out.results.A.line_count, 0);
+});
+
+test("summarizeQueryResult: log digest reports time range, streams and a sample", () => {
+  const other = { namespace: "demo-qa", service_name: "apim-gateway" };
+  const out = summarizeQueryResult({
+    results: {
+      A: {
+        status: 200,
+        frames: [
+          logFrame([
+            { labels: NS, time: 1700000002000, line: "newest" },
+            { labels: other, time: 1700000001000, line: "middle" },
+            { labels: NS, time: 1700000000000, line: "oldest" },
+          ]),
+        ],
+      },
+    },
+  });
+  const r = out.results.A;
+  assert.equal(r.line_count, 3);
+  // Range spans oldest..newest regardless of the order rows arrive in.
+  assert.equal(r.time_range.from, "2023-11-14T22:13:20.000Z");
+  assert.equal(r.time_range.to, "2023-11-14T22:13:22.000Z");
+  // Two distinct label sets, ordered by line count (busiest stream first).
+  assert.equal(r.stream_count, 2);
+  assert.deepEqual(r.streams[0], { labels: NS, lines: 2 });
+  assert.deepEqual(r.streams[1], { labels: other, lines: 1 });
+  assert.equal(r.streams_truncated, 0);
+  // Sample keeps frame order (Loki returns newest first).
+  // Three distinct kinds, so three entries, each seen once.
+  assert.deepEqual(r.sample_lines.map((s) => s.line), ["newest", "middle", "oldest"]);
+  assert.deepEqual(r.sample_lines.map((s) => s.occurrences), [1, 1, 1]);
+  assert.equal(r.distinct_line_kinds, 3);
+  // Each sample carries its instant, so a caller can hand one straight to
+  // grafana_logs_context to read what surrounded it.
+  assert.equal(r.sample_lines[0].time, "2023-11-14T22:13:22.000Z");
+  assert.equal(r.sample_kinds_truncated, 0);
+});
+
+test("summarizeQueryResult: repeated lines collapse to one entry with a count", () => {
+  // The reason for deduplicating: twenty lines differing only by a number are
+  // ONE kind of event. Showing twenty (or the first three) says no more than
+  // showing one, while costing twenty times the customer log content.
+  const rows = Array.from({ length: 20 }, (_, i) => ({ labels: NS, time: 1700000000000 + i, line: `line ${i}` }));
+  const out = summarizeQueryResult({ results: { A: { frames: [logFrame(rows)] } } }, { maxSampleLines: 3 });
+  const r = out.results.A;
+  assert.equal(r.line_count, 20, "the true line count is unaffected");
+  assert.equal(r.distinct_line_kinds, 1);
+  assert.equal(r.sample_lines.length, 1);
+  assert.equal(r.sample_lines[0].occurrences, 20);
+  assert.equal(r.sample_kinds_truncated, 0);
+});
+
+test("summarizeQueryResult: distinct kinds are ranked, and the list is capped", () => {
+  // Genuinely different messages must not be collapsed into each other, and the
+  // commonest kind should lead.
+  const rows = [
+    ...Array.from({ length: 5 }, () => ({ labels: NS, time: 1700000000000, line: "connection refused" })),
+    ...Array.from({ length: 2 }, () => ({ labels: NS, time: 1700000000000, line: "timeout waiting for upstream" })),
+    { labels: NS, time: 1700000000000, line: "a rare and interesting failure" },
+  ];
+  const out = summarizeQueryResult({ results: { A: { frames: [logFrame(rows)] } } }, { maxSampleLines: 2 });
+  const r = out.results.A;
+  assert.equal(r.line_count, 8);
+  assert.equal(r.distinct_line_kinds, 3);
+  assert.deepEqual(r.sample_lines.map((s) => s.occurrences), [5, 2]);
+  assert.equal(r.sample_lines[0].line, "connection refused");
+  assert.equal(r.sample_kinds_truncated, 1, "the rare kind was dropped by the cap - and said so");
+});
+
+test("summarizeQueryResult: an over-long log line is clipped, not passed through whole", () => {
+  const rows = [{ labels: NS, time: 1700000000000, line: "x".repeat(1000) }];
+  const out = summarizeQueryResult({ results: { A: { frames: [logFrame(rows)] } } }, { maxLineChars: 10 });
+  assert.equal(out.results.A.sample_lines[0].line, "xxxxxxxxxx\u2026[truncated]");
+});
+
+test("summarizeQueryResult: reaching the requested line cap is reported as partial", () => {
+  // The cap is the whole reason a caller can be misled: 100 lines back from a
+  // 100-line limit means "at least 100", never "exactly 100".
+  const rows = Array.from({ length: 5 }, (_, i) => ({ labels: NS, time: 1700000000000 + i, line: `l${i}` }));
+  const out = summarizeQueryResult({ results: { A: { frames: [logFrame(rows)] } } }, { limit: 5 });
+  assert.equal(out.results.A.limit_reached, true);
+  assert.match(out.results.A.note, /max_lines/);
+});
+
+test("summarizeQueryResult: staying under the line cap is not flagged as partial", () => {
+  const rows = Array.from({ length: 4 }, (_, i) => ({ labels: NS, time: 1700000000000 + i, line: `l${i}` }));
+  const out = summarizeQueryResult({ results: { A: { frames: [logFrame(rows)] } } }, { limit: 5 });
+  assert.equal(out.results.A.limit_reached, undefined);
+  assert.equal(out.results.A.note, undefined);
+});
+
+test("summarizeQueryResult: surfaces Loki stats without passing them off as a match count", () => {
+  const out = summarizeQueryResult({
+    results: {
+      A: {
+        frames: [
+          logFrame([{ labels: NS, time: 1700000000000, line: "one" }], {
+            stats: [
+              { displayName: "Summary: total lines processed", value: 70986 },
+              { displayName: "Summary: total bytes processed", value: 14584743 },
+              { displayName: "Summary: exec time", value: 0.021639 },
+            ],
+          }),
+        ],
+      },
+    },
+  });
+  // lines_processed is how much Loki READ, not how much matched. The match
+  // count stays line_count; conflating the two would overstate results ~70000x.
+  assert.equal(out.results.A.stats.lines_processed, 70986);
+  assert.equal(out.results.A.line_count, 1);
+});
+
+test("summarizeQueryResult: a pure log result omits the numeric keys entirely", () => {
+  // `series_count: 0` next to a real line_count reads as "nothing found" — the
+  // same misleading zero the log digest exists to remove.
+  const out = summarizeQueryResult({
+    results: { A: { frames: [logFrame([{ labels: NS, time: 1700000000000, line: "a" }])] } },
+  });
+  assert.equal(out.results.A.line_count, 1);
+  assert.equal(out.results.A.series_count, undefined);
+  assert.equal(out.results.A.series, undefined);
+  assert.equal(out.results.A.truncated, undefined);
+});
+
+test("summarizeQueryResult: a result with both frame kinds keeps both digests", () => {
+  const out = summarizeQueryResult({
+    results: {
+      A: {
+        frames: [logFrame([{ labels: NS, time: 1700000000000, line: "a" }]), frame({ job: "api" }, [1, 3])],
+      },
+    },
+  });
+  assert.equal(out.results.A.line_count, 1);
+  assert.equal(out.results.A.series_count, 1);
+});
+
+test("summarizeQueryResult: metric frames keep the numeric digest and gain no log keys", () => {
+  const out = summarizeQueryResult({ results: { A: { status: 200, frames: [frame({ job: "api" }, [1, 3])] } } });
+  assert.equal(out.results.A.series_count, 1);
+  assert.equal(out.results.A.frame_type, undefined);
+  assert.equal(out.results.A.line_count, undefined);
+});
+
+test("isLogFrame: detects by frameType, and falls back to the Line field", () => {
+  assert.equal(isLogFrame(logFrame([])), true);
+  // No frameType meta, but a Line string field -> still a log frame.
+  assert.equal(
+    isLogFrame({ schema: { fields: [{ name: "Time", type: "time" }, { name: "Line", type: "string" }] } }),
+    true,
+  );
+  assert.equal(isLogFrame(frame({}, [1])), false);
+  assert.equal(isLogFrame(undefined), false);
+});
+
+// ---------------------------------------------------------------------------
+// classifyFrame / table digest (Tempo traces, Elasticsearch raw documents)
+// ---------------------------------------------------------------------------
+
+// Shapes captured from the live instance.
+const PROM_FRAME = { schema: { meta: { type: "timeseries-multi" }, fields: [{ name: "Time", type: "time" }, { name: "up", type: "number", labels: { job: "api" } }] }, data: { values: [[0], [1]] } };
+const ES_AGG_FRAME = { schema: { meta: { type: "timeseries-multi" }, fields: [{ name: "Time", type: "time" }, { name: "Value", type: "number" }] }, data: { values: [[0], [7]] } };
+
+function tempoFrame(rows) {
+  return {
+    schema: {
+      meta: { preferredVisualisationType: "table" },
+      fields: [
+        { name: "traceID", type: "string" },
+        { name: "startTime", type: "time" },
+        { name: "traceName", type: "string" },
+        { name: "traceDuration", type: "number" },
+        { name: "nested", type: "other" },
+      ],
+    },
+    data: {
+      values: [
+        rows.map((r) => r.id),
+        rows.map((r) => r.start),
+        rows.map((r) => r.name),
+        rows.map((r) => r.duration),
+        rows.map(() => ({ deep: true })),
+      ],
+    },
+  };
+}
+
+test("classifyFrame: a numeric table with no time axis is a table, not a series", () => {
+  // Elasticsearch terms aggregations return `status` + `Count`, both numeric and
+  // no time field. Treated as a series this yields the min/max/avg of HTTP status
+  // codes — arithmetic over identifiers, reported as if it were a measurement.
+  const termsFrame = {
+    schema: { fields: [{ name: "status", type: "number" }, { name: "Count", type: "number" }] },
+    data: { values: [[200, 401, 500], [3691597, 3019, 13]] },
+  };
+  assert.equal(classifyFrame(termsFrame), "table");
+
+  const out = summarizeQueryResult({ results: { A: { status: 200, frames: [termsFrame] } } });
+  assert.equal(out.results.A.frame_type, "table");
+  assert.equal(out.results.A.row_count, 3);
+  assert.equal(out.results.A.series_count, undefined, "status codes must not be digested as a series");
+  // The term and its count stay paired, which is the entire content of the result.
+  assert.deepEqual(out.results.A.sample_rows[0], { status: 200, Count: 3691597 });
+  assert.deepEqual(out.results.A.columns.map((c) => c.name), ["status", "Count"]);
+});
+
+test("classifyFrame: recognises each shape this Grafana actually returns", () => {
+  assert.equal(classifyFrame(PROM_FRAME), "timeseries");
+  assert.equal(classifyFrame(ES_AGG_FRAME), "timeseries");
+  assert.equal(classifyFrame(tempoFrame([])), "table");
+  assert.equal(classifyFrame(logFrame([])), "logs");
+  // A bare Time+number frame with no meta is still a timeseries (back-compat).
+  assert.equal(classifyFrame(frame({}, [1, 2])), "timeseries");
+});
+
+test("summarizeQueryResult: Elasticsearch aggregations digest as an ordinary timeseries", () => {
+  // ES returns meta.type timeseries-multi, so it needs no special handling —
+  // this pins that, so a future change cannot quietly break it.
+  const out = summarizeQueryResult({ results: { A: { status: 200, frames: [ES_AGG_FRAME] } } });
+  assert.equal(out.results.A.series_count, 1);
+  assert.equal(out.results.A.series[0].count, 1);
+});
+
+test("summarizeQueryResult: Tempo traces digest as a table, not as a bogus series", () => {
+  // Regression: traceDuration is a `number` field, so the numeric path would
+  // digest trace durations into a "series" with no labels — silently
+  // meaningless output rather than an obvious failure.
+  const out = summarizeQueryResult({
+    results: {
+      A: {
+        status: 200,
+        frames: [
+          tempoFrame([
+            { id: "abc", start: 1700000000000, name: "GET /x", duration: 12 },
+            { id: "def", start: 1700000001000, name: "GET /y", duration: 34 },
+          ]),
+        ],
+      },
+    },
+  });
+  const r = out.results.A;
+  assert.equal(r.frame_type, "table");
+  assert.equal(r.row_count, 2);
+  assert.equal(r.series_count, undefined, "trace durations must not be reported as a series");
+  assert.deepEqual(
+    r.columns.map((c) => c.name),
+    ["traceID", "startTime", "traceName", "traceDuration", "nested"],
+  );
+  assert.equal(r.sample_rows[0].traceID, "abc");
+  // Object columns are summarised, never inlined - they can be arbitrarily large.
+  assert.equal(r.sample_rows[0].nested, "{object}");
+});
+
+test("summarizeQueryResult: table sample is capped and over-long cells clipped", () => {
+  const rows = Array.from({ length: 9 }, (_, i) => ({ id: "x".repeat(50), start: i, name: `n${i}`, duration: i }));
+  const out = summarizeQueryResult({ results: { A: { frames: [tempoFrame(rows)] } } }, { maxSampleRows: 2, maxCellChars: 10 });
+  assert.equal(out.results.A.row_count, 9);
+  assert.equal(out.results.A.sample_rows.length, 2);
+  assert.equal(out.results.A.sample_rows_truncated, 7);
+  assert.equal(out.results.A.sample_rows[0].traceID, "xxxxxxxxxx\u2026[truncated]");
+});
+
+test("summarizeQueryResult: an unrecognised frame is reported, never silently empty", () => {
+  // The whole point: a shape nobody anticipated must still produce a visible
+  // row count and column list rather than a confident zero.
+  const odd = {
+    schema: { fields: [{ name: "thing", type: "string" }, { name: "other", type: "other" }] },
+    data: { values: [["a", "b", "c"], [1, 2, 3]] },
+  };
+  const out = summarizeQueryResult({ results: { A: { frames: [odd] } } });
+  assert.equal(out.results.A.frame_type, "table");
+  assert.equal(out.results.A.row_count, 3);
+});
+
+// ---------------------------------------------------------------------------
+// trend helpers
+// ---------------------------------------------------------------------------
+
+test("durationSeconds: parses Loki-style durations and rejects junk", () => {
+  assert.equal(durationSeconds("30s"), 30);
+  assert.equal(durationSeconds("5m"), 300);
+  assert.equal(durationSeconds("1h"), 3600);
+  assert.equal(durationSeconds("2d"), 172800);
+  for (const bad of ["", "5", "5x", "m", "-1m", "1.5h", undefined]) {
+    assert.throws(() => durationSeconds(bad), /invalid interval/);
+  }
+});
+
+test("chooseInterval: keeps the bucket count readable across ranges", () => {
+  // A day of one-minute buckets is 1440 numbers - unreadable and expensive.
+  assert.equal(chooseInterval(3600), "5m", "1h at 1m would be 60 buckets, over the cap");
+  assert.equal(chooseInterval(6 * 3600), "15m");
+  assert.equal(chooseInterval(24 * 3600), "30m");
+  assert.equal(chooseInterval(7 * 24 * 3600), "6h");
+  for (const range of [600, 3600, 6 * 3600, 24 * 3600, 7 * 24 * 3600, 30 * 24 * 3600]) {
+    assert.ok(range / durationSeconds(chooseInterval(range)) <= 48, `too many buckets for ${range}s`);
+  }
+});
+
+test("buildTrendBuckets: fills empty steps so a gap is not mistaken for a shape", () => {
+  // Loki omits empty steps entirely. Without filling, a quiet hour and a missing
+  // hour look identical, and the onset cannot be read off the series.
+  const start = 1000, end = 1000 + 5 * 60;
+  const points = [[1060, "3"], [1240, "7"]];
+  const buckets = buildTrendBuckets(points, { startSeconds: start, endSeconds: end, stepSeconds: 60 });
+  assert.deepEqual(buckets.map((b) => b.count), [0, 3, 0, 0, 7, 0]);
+  assert.equal(buckets[0].time, new Date(960 * 1000).toISOString());
+});
+
+test("buildTrendBuckets: snaps off-grid points instead of dropping them", () => {
+  // Loki's step alignment need not match ours; a point landing mid-bucket must
+  // still be counted.
+  const buckets = buildTrendBuckets([[1037, "2"], [1059, "1"]], {
+    startSeconds: 1000,
+    endSeconds: 1120,
+    stepSeconds: 60,
+  });
+  assert.equal(buckets.reduce((n, b) => n + b.count, 0), 3);
+});
+
+test("buildTrendBuckets: is bounded so a tiny interval cannot flood the response", () => {
+  const buckets = buildTrendBuckets([], { startSeconds: 0, endSeconds: 10_000_000, stepSeconds: 1, maxBuckets: 50 });
+  assert.equal(buckets.length, 50);
+});
+
+test("summarizeTrend: reports total, onset, last and peak", () => {
+  const buckets = [
+    { time: "t0", count: 0 },
+    { time: "t1", count: 2 },
+    { time: "t2", count: 9 },
+    { time: "t3", count: 1 },
+    { time: "t4", count: 0 },
+  ];
+  const s = summarizeTrend(buckets);
+  assert.equal(s.total, 12);
+  assert.equal(s.onset, "t1", "onset is the FIRST non-empty bucket - the 'when did this start' answer");
+  assert.equal(s.last_seen, "t3");
+  assert.deepEqual(s.peak, { time: "t2", count: 9 });
+});
+
+test("summarizeTrend: an all-zero series has no onset rather than a false one", () => {
+  const s = summarizeTrend([{ time: "t0", count: 0 }, { time: "t1", count: 0 }]);
+  assert.equal(s.total, 0);
+  assert.equal(s.onset, null);
+  assert.equal(s.peak, null);
+});
+
+// ---------------------------------------------------------------------------
+// summarizePatterns
+// ---------------------------------------------------------------------------
+
+// Shape captured from Loki: {pattern, level, samples: [[unixSeconds, count]]}.
+const PATTERNS = [
+  { pattern: "<_> INFO destroying service <_>", level: "info", samples: [[1000, 400], [1060, 172]] },
+  { pattern: "GET / HTTP/1.1 200 <_>", level: "unknown", samples: [[1000, 408]] },
+  { pattern: "rare deserialization failure <_>", level: "error", samples: [[1120, 1]] },
+  { pattern: "never seen", level: "info", samples: [] },
+];
+
+test("summarizePatterns: ranks patterns by volume and keeps the rare one visible", () => {
+  const out = summarizePatterns(PATTERNS);
+  assert.equal(out.pattern_count, 3, "a pattern with no samples is not a pattern");
+  assert.deepEqual(out.patterns.map((p) => p.count), [572, 408, 1]);
+  // The point of the tool: the 1-line error survives next to the 572-line noise.
+  const rare = out.patterns.find((p) => p.level === "error");
+  assert.equal(rare.count, 1);
+  assert.equal(rare.first_seen, new Date(1120 * 1000).toISOString());
+});
+
+test("summarizePatterns: lines_in_patterns is named for what it is, not a line total", () => {
+  // Loki assigns only some lines to patterns, so this must never be presented as
+  // the number of lines in the range.
+  const out = summarizePatterns(PATTERNS);
+  assert.equal(out.lines_in_patterns, 981);
+  assert.equal(out.line_count, undefined);
+  assert.equal(out.total, undefined);
+});
+
+test("summarizePatterns: reports the volume floor so absence is not read as zero", () => {
+  // Loki does not rank rare lines last, it omits them. Surfacing the smallest
+  // pattern we DID get tells the caller what could be missing.
+  const out = summarizePatterns(PATTERNS);
+  assert.equal(out.smallest_pattern_count, 1);
+  assert.equal(summarizePatterns([]).smallest_pattern_count, null);
+});
+
+test("summarizePatterns: caps the list and reports how many were dropped", () => {
+  const many = Array.from({ length: 30 }, (_, i) => ({ pattern: `p${i}`, samples: [[1000, i + 1]] }));
+  const out = summarizePatterns(many, { maxPatterns: 5 });
+  assert.equal(out.pattern_count, 30);
+  assert.equal(out.patterns.length, 5);
+  assert.equal(out.patterns_truncated, 25);
+  assert.equal(out.patterns[0].count, 30, "capped list keeps the BIGGEST patterns");
+});
+
+// ---------------------------------------------------------------------------
+// mergeContextStreams
+// ---------------------------------------------------------------------------
+
+test("mergeContextStreams: interleaves streams into one time-ordered sequence", () => {
+  // The reason for reading context at all: a logger formatting with a newline
+  // emits two SEPARATE entries. The second carries the reason and none of the
+  // filter's keywords, so it is only visible unfiltered and in order.
+  const result = [
+    { stream: { service_name: "api", pod: "api-1" }, values: [["1700000000000000000", "Problem while sending request."]] },
+    { stream: { service_name: "gw", pod: "gw-1" }, values: [["1700000000500000000", "unrelated gateway line"]] },
+    { stream: { service_name: "api", pod: "api-1" }, values: [["1700000000000900000", "  Caused by: connection refused"]] },
+  ];
+  const out = mergeContextStreams(result);
+  assert.equal(out.total, 3);
+  assert.deepEqual(out.lines.map((l) => l.line), [
+    "Problem while sending request.",
+    "  Caused by: connection refused",
+    "unrelated gateway line",
+  ]);
+  assert.equal(out.lines[0].service_name, "api");
+  assert.equal(out.lines[0].ts_ns, "1700000000000000000");
+  assert.equal(out.lines[0].time, "2023-11-14T22:13:20.000Z");
+});
+
+test("mergeContextStreams: caps output and reports what was dropped", () => {
+  const values = Array.from({ length: 10 }, (_, i) => [String(1700000000000000000 + i * 1000000), `l${i}`]);
+  const out = mergeContextStreams([{ stream: { service_name: "api" }, values }], { maxLines: 4 });
+  assert.equal(out.total, 10);
+  assert.equal(out.lines.length, 4);
+  assert.equal(out.truncated, 6);
+  assert.equal(out.lines[0].line, "l0", "the cap keeps the EARLIEST lines, so the sequence still reads forward");
+});
+
+test("mergeContextStreams: clips an enormous line and tolerates junk", () => {
+  const out = mergeContextStreams(
+    [{ stream: {}, values: [["1700000000000000000", "y".repeat(50)], ["not-a-number", "dropped"]] }],
+    { maxLineChars: 10 },
+  );
+  assert.equal(out.total, 1, "a row with an unparseable timestamp is dropped, not sorted randomly");
+  assert.equal(out.lines[0].line, "yyyyyyyyyy\u2026[truncated]");
+  assert.equal(out.lines[0].service_name, null);
+});
+
+test("toLokiNs: a nanosecond instant from a previous result passes through", () => {
+  // Loki reports per-line timestamps in ns (~19 digits). Read as ms it would
+  // land in the year 58000 and query an empty future window.
+  assert.equal(toLokiNs("1700000000000000000", 0, NOW), "1700000000000000000");
+  // ...while epoch ms (~13 digits) is still scaled up.
+  assert.equal(toLokiNs("1700000000000", 0, NOW), `${1700000000000 * 1e6}`);
+});
+
+// ---------------------------------------------------------------------------
+// noise profiling
+// ---------------------------------------------------------------------------
+
+test("normaliseLogLine: collapses the variable parts, keeping the message", () => {
+  // Shapes taken from real lines on this instance.
+  assert.equal(
+    normaliseLogLine("15:18:23.213 [vert.x-eventloop-thread-1] [] WARN Error parsing"),
+    "<ts> [vert.x-eventloop-thread-<n>] [] WARN Error parsing",
+  );
+  assert.equal(
+    normaliseLogLine("::ffff:10.0.0.62 - - [01/Sep/2026:15:12:57 +0000] \"GET / HTTP/1.1\" 200 6597"),
+    '<ip> - - [<ts> +<n>] "GET / HTTP/<n>.<n>" <n> <n>',
+  );
+  assert.equal(normaliseLogLine("channel 'a3f1c8de-1234-4bcd-9012-abcdef012345' closed"), "channel '<uuid>' closed");
+});
+
+test("normaliseLogLine: every stack frame is one shape", () => {
+  // Otherwise a single exception fragments into fifty distinct 'shapes' and
+  // hides whatever else is in the stream.
+  const a = normaliseLogLine("\tat io.reactivex.rxjava3.core.Maybe.subscribe(Maybe.java:5377)");
+  const b = normaliseLogLine("  at io.netty.handler.ssl.SslHandler.decode(SslHandler.java:1428)");
+  assert.equal(a, "at <stack frame>");
+  assert.equal(a, b);
+  assert.equal(normaliseLogLine("... 193 common frames omitted"), "... <n> common frames omitted");
+});
+
+test("normaliseLogLine: specific rules run before general ones", () => {
+  // A timestamp must not be eaten by the number rule, or two different shapes
+  // collapse into one and the profile lies about what dominates.
+  assert.equal(normaliseLogLine("2026-08-20T15:00:00.123Z done"), "<ts> done");
+  assert.ok(!normaliseLogLine("2026-08-20T15:00:00Z done").includes("<n>"));
+});
+
+test("profileNoise: ranks shapes and flags a dominant one", () => {
+  // The case from the field notes: one repeating message is most of the volume.
+  const lines = [
+    ...Array.from({ length: 90 }, (_, i) => `Ignoring ChannelEvent for channel '${i}' without any target`),
+    "something genuinely interesting happened",
+    "another one-off",
+  ];
+  const p = profileNoise(lines, { maxShapes: 3 });
+  assert.equal(p.sampled_lines, 92);
+  assert.equal(p.distinct_shapes, 3);
+  assert.equal(p.shapes[0].count, 90);
+  assert.equal(p.shapes[0].percent_of_sample, 97.8);
+  assert.equal(p.shapes[0].dominant, true);
+  assert.match(p.shapes[0].suggested_exclusion, /Ignoring ChannelEvent/);
+  // The rare line survives next to the noise — the reason for profiling at all.
+  assert.ok(p.shapes.some((s) => s.shape === "something genuinely interesting happened"));
+});
+
+test("profileNoise: a quiet stream has no dominant shape", () => {
+  const p = profileNoise(["alpha message here", "beta message here", "gamma message here"]);
+  assert.equal(p.shapes.every((s) => !s.dominant), true);
+  assert.equal(p.shapes.every((s) => s.suggested_exclusion === undefined), true);
+});
+
+test("profileNoise: caps the list and tolerates junk", () => {
+  const p = profileNoise(["a message", null, 42, undefined, "a message"], { maxShapes: 1 });
+  assert.equal(p.sampled_lines, 2, "non-strings are skipped, not counted");
+  assert.equal(p.shapes.length, 1);
+  assert.deepEqual(profileNoise([]).shapes, []);
+});
+
+test("suggestExclusion: produces a pasteable LogQL fragment", () => {
+  assert.equal(suggestExclusion("at <stack frame>"), "!~ `^\\s+at `");
+  assert.equal(
+    suggestExclusion("Ignoring ChannelEvent for channel '<n>'"),
+    "!= `Ignoring ChannelEvent for channel '`",
+  );
+  // Nothing stable and long enough to exclude on.
+  assert.equal(suggestExclusion("<ts> <n> <ip>"), null);
+});
+
+// ---------------------------------------------------------------------------
+// requireDatasourceUid
+// ---------------------------------------------------------------------------
+
+test("requireDatasourceUid: returns the configured uid", () => {
+  assert.equal(requireDatasourceUid("grafanacloud-logs"), "grafanacloud-logs");
+  assert.equal(requireDatasourceUid("  padded-uid  "), "padded-uid");
+});
+
+test("requireDatasourceUid: unset/blank fails with an actionable message", () => {
+  for (const bad of [undefined, null, "", "   "]) {
+    assert.throws(() => requireDatasourceUid(bad), /GRAFANA_LOGS_DATASOURCE_UID is not set/);
+  }
+  // The message must say the uid can differ from the display name — the exact
+  // assumption that cost time on this instance.
+  assert.throws(() => requireDatasourceUid(""), /not always the same as the display name/);
+});
+
+// ---------------------------------------------------------------------------
 // escapeRegex
 // ---------------------------------------------------------------------------
 
@@ -183,8 +808,13 @@ test("buildLogsQuery: escapes regex metachars in client/component", () => {
 });
 
 test("buildLogsQuery: line_filter appends a backtick line filter, stripping backticks", () => {
+  // Case-insensitive by default, so the term is regex-escaped for `|~`.
   assert.equal(
     buildLogsQuery({ client: "april", lineFilter: "error `x`" }),
+    '{service_name=~"(?i).*april.*"} |~ `(?i)error x`',
+  );
+  assert.equal(
+    buildLogsQuery({ client: "april", lineFilter: "error `x`", caseSensitive: true }),
     '{service_name=~"(?i).*april.*"} |= `error x`',
   );
 });
@@ -238,12 +868,21 @@ test("buildExactLogsQuery: multiple service_names -> `=~` alternation, regex-esc
   );
 });
 
-test("buildExactLogsQuery: line_filter appends a backtick `|=` filter, stripping backticks", () => {
+test("buildExactLogsQuery: line_filter is case-insensitive by default", () => {
   assert.equal(
     buildExactLogsQuery({
       namespace: "ghd-prod",
       serviceNames: ["graviteeio-apim3-gateway"],
       lineFilter: "ConnectTimeoutException",
+    }),
+    '{namespace="ghd-prod", service_name="graviteeio-apim3-gateway"} |~ `(?i)ConnectTimeoutException`',
+  );
+  assert.equal(
+    buildExactLogsQuery({
+      namespace: "ghd-prod",
+      serviceNames: ["graviteeio-apim3-gateway"],
+      lineFilter: "ConnectTimeoutException",
+      caseSensitive: true,
     }),
     '{namespace="ghd-prod", service_name="graviteeio-apim3-gateway"} |= `ConnectTimeoutException`',
   );
@@ -286,7 +925,7 @@ const NAMESPACES = [
   "april-rec",
   "blueyonder-plt-live",
   "blueyonder-multitenant",
-  "lyonaeroports-prod",
+  "skyport-prod",
 ];
 
 test("matchNamespaces: returns the customer's own namespaces", () => {
@@ -329,16 +968,28 @@ test("buildExploreUrl: builds a Grafana 11+ panes deep link", () => {
 // buildDrilldownUrl
 // ---------------------------------------------------------------------------
 
+// Deliberately NOT the uid used by the Gravitee instance: if a default is ever
+// reintroduced, these assertions fail instead of passing by coincidence.
+const DS_UID = "loki-test-uid";
+
+test("buildDrilldownUrl: requires the datasource uid instead of assuming one", () => {
+  assert.throws(
+    () => buildDrilldownUrl({ namespace: "april-prod", from: "now-1h", to: "now" }),
+    /datasourceUid is required/,
+  );
+});
+
 test("buildDrilldownUrl: single service_name -> exact (=) filter", () => {
   const url = buildDrilldownUrl({
     namespace: "april-prod",
     serviceNames: ["graviteeio-apim-april-prod-gateway"],
+    datasourceUid: DS_UID,
     from: "now-1h",
     to: "now",
   });
   assert.ok(url.startsWith("https://g.example.com/a/grafana-lokiexplore-app/explore/namespace/april-prod/logs?"));
   const params = new URL(url).searchParams;
-  assert.equal(params.get("var-ds"), "grafanacloud-logs");
+  assert.equal(params.get("var-ds"), DS_UID);
   assert.equal(params.get("visualizationType"), '"logs"');
   // namespace pin + exact service_name match (NOT a raw LogQL regex, which the
   // app treats as a literal).
@@ -348,29 +999,68 @@ test("buildDrilldownUrl: single service_name -> exact (=) filter", () => {
   ]);
 });
 
-test("buildDrilldownUrl: multiple service_names -> escaped =~ alternation", () => {
+test("buildDrilldownUrl: several service_names -> namespace-only, never a regex alternation", () => {
+  // Regression (B3). Verified against the live Logs Drilldown app:
+  //   - it treats a filter value as a LITERAL and regex-escapes it, so a `=~`
+  //     alternation reaches Loki as service_name=~"a\\|b" and matches NOTHING;
+  //   - its own multi-value operator (`=|`) silently keeps only the first two
+  //     values (1->1, 2->2, 3->2, 5->2).
+  // Both roads mislead, so a multi-service link is scoped to the namespace:
+  // broader, but never silently wrong. The exact set travels in service_names
+  // and in the explore_url.
   const url = buildDrilldownUrl({
-    namespace: "apim-dp-ba813-a200c4",
-    serviceNames: ["prod-apim-dp-ba813-a200c4-gateway", "prod-apim-dp-ba813-8123e2-gateway"],
+    namespace: "demo-qa",
+    serviceNames: ["svc-a", "svc-b", "svc-c"],
+    datasourceUid: DS_UID,
     from: "now-1h",
     to: "now",
   });
-  // Hyphens aren't regex metachars (outside a char class), so they're left as-is.
+  const filters = new URL(url).searchParams.getAll("var-filters");
+  assert.deepEqual(filters, ["namespace|=|demo-qa"]);
+  assert.ok(!url.includes("=~"), "must not emit a regex alternation the app cannot honour");
+  assert.ok(!url.includes("__gfp__|svc"), "must not emit a multi-value filter the app truncates");
+});
+
+test("buildDrilldownUrl: every filter has exactly three parts, for any service count", () => {
+  for (const n of [0, 1, 2, 5]) {
+    const url = buildDrilldownUrl({
+      namespace: "demo-qa",
+      serviceNames: Array.from({ length: n }, (_, i) => `svc-${i}`),
+      datasourceUid: DS_UID,
+      from: "now-1h",
+      to: "now",
+    });
+    const filters = new URL(url).searchParams.getAll("var-filters");
+    // Exactly one service pins service_name; zero or several stay namespace-only.
+    assert.equal(filters.length, n === 1 ? 2 : 1, `n=${n}`);
+    for (const f of filters) assert.equal(f.split("|").length, 3, `n=${n} malformed: ${f}`);
+  }
+});
+
+test("buildDrilldownUrl: a delimiter inside a label value is escaped, not emitted raw", () => {
+  const url = buildDrilldownUrl({
+    namespace: "ns,with|delims",
+    serviceNames: ["svc,a"],
+    datasourceUid: DS_UID,
+    from: "now-1h",
+    to: "now",
+  });
   assert.deepEqual(new URL(url).searchParams.getAll("var-filters"), [
-    "namespace|=|apim-dp-ba813-a200c4",
-    "service_name|=~|prod-apim-dp-ba813-a200c4-gateway|prod-apim-dp-ba813-8123e2-gateway",
+    "namespace|=|ns__gfc__with__gfp__delims",
+    "service_name|=|svc__gfc__a",
   ]);
 });
 
 test("buildDrilldownUrl: omits the service_name filter when none given", () => {
-  const url = buildDrilldownUrl({ namespace: "apim-cp-ba813", from: "now-15m", to: "now" });
-  assert.deepEqual(new URL(url).searchParams.getAll("var-filters"), ["namespace|=|apim-cp-ba813"]);
+  const url = buildDrilldownUrl({ namespace: "apim-cp-cp2222", datasourceUid: DS_UID, from: "now-15m", to: "now" });
+  assert.deepEqual(new URL(url).searchParams.getAll("var-filters"), ["namespace|=|apim-cp-cp2222"]);
 });
 
 test("buildDrilldownUrl: de-duplicates service_names", () => {
   const url = buildDrilldownUrl({
     namespace: "april-prod",
     serviceNames: ["svc-a", "svc-a"],
+    datasourceUid: DS_UID,
     from: "now-1h",
     to: "now",
   });
@@ -378,22 +1068,24 @@ test("buildDrilldownUrl: de-duplicates service_names", () => {
 });
 
 test("buildDrilldownUrl: throws when namespace missing", () => {
-  assert.throws(() => buildDrilldownUrl({ from: "now-1h", to: "now" }), /namespace is required/);
+  assert.throws(() => buildDrilldownUrl({ datasourceUid: DS_UID, from: "now-1h", to: "now" }), /namespace is required/);
 });
 
 test("buildDrilldownUrl: line filter populates var-lineFilters, V2 stays empty", () => {
   const url = buildDrilldownUrl({
     namespace: "sedex-prod",
     serviceNames: ["sedex-prod-gateway"],
+    datasourceUid: DS_UID,
     from: "now-7d",
     to: "now",
     lineFilter: "An error occurs during user authentication",
   });
   const params = new URL(url).searchParams;
-  // key|operator|value, app's exact format: caseSensitive,0 + escaped `|=`.
+  // key|operator|value, app's exact format. Case-insensitive by default, so the
+  // key is caseInsensitive and the operator the escaped `|~`.
   assert.equal(
     params.get("var-lineFilters"),
-    "caseSensitive,0|__gfp__=|An error occurs during user authentication"
+    "caseInsensitive,0|__gfp__~|An error occurs during user authentication"
   );
   // The in-progress single-filter var stays empty (matches the app's own links).
   assert.equal(params.get("var-lineFilterV2"), "");
@@ -402,7 +1094,7 @@ test("buildDrilldownUrl: line filter populates var-lineFilters, V2 stays empty",
 });
 
 test("buildDrilldownUrl: no line filter leaves var-lineFilters empty", () => {
-  const url = buildDrilldownUrl({ namespace: "sedex-prod", from: "now-1h", to: "now" });
+  const url = buildDrilldownUrl({ namespace: "sedex-prod", datasourceUid: DS_UID, from: "now-1h", to: "now" });
   assert.equal(new URL(url).searchParams.get("var-lineFilters"), "");
 });
 
@@ -410,18 +1102,52 @@ test("buildDrilldownUrl: no line filter leaves var-lineFilters empty", () => {
 // buildLineFilterToken
 // ---------------------------------------------------------------------------
 
+test("lineFilterExpr: defaults to a case-insensitive regex, not a literal match", () => {
+  // `|=` is case-sensitive. Verified live on data containing "GET":
+  //   |= get      -> 0 lines (a clean, believable, WRONG negative)
+  //   |~ (?i)get  -> matches
+  // A wrong-case filter fails silently, so insensitive is the default.
+  assert.equal(lineFilterExpr("get"), " |~ `(?i)get`");
+  assert.equal(lineFilterExpr("get", { caseSensitive: true }), " |= `get`");
+  assert.equal(lineFilterExpr(""), "");
+});
+
+test("lineFilterExpr: escapes regex metacharacters in the insensitive form", () => {
+  // `|~` takes a pattern, so an unescaped term would be interpreted rather than
+  // matched — "a.b" must not match "axb".
+  assert.equal(lineFilterExpr("a.b(c)"), " |~ `(?i)a\\.b\\(c\\)`");
+  // ...while the case-sensitive form is a literal and must NOT be escaped.
+  assert.equal(lineFilterExpr("a.b(c)", { caseSensitive: true }), " |= `a.b(c)`");
+});
+
+test("buildLogsQuery: line filter is case-insensitive by default", () => {
+  assert.match(buildLogsQuery({ client: "april", lineFilter: "Timeout" }), /\|~ `\(\?i\)Timeout`/);
+  assert.match(buildLogsQuery({ client: "april", lineFilter: "Timeout", caseSensitive: true }), /\|= `Timeout`/);
+});
+
+test("buildLineFilterToken: case-insensitive by default, matching the app's own format", () => {
+  // Verified against the live Logs Drilldown app on data containing "GET":
+  //   caseInsensitive,0|__gfp__~|get -> 281 lines
+  //   caseSensitive,0|__gfp__=|get   -> 0 lines
+  // so the key drives matching, it does not merely label the input box.
+  assert.equal(buildLineFilterToken("get"), "caseInsensitive,0|__gfp__~|get");
+  assert.equal(buildLineFilterToken("get", { caseSensitive: true }), "caseSensitive,0|__gfp__=|get");
+});
+
 test("buildLineFilterToken: empty -> empty string", () => {
   assert.equal(buildLineFilterToken(""), "");
   assert.equal(buildLineFilterToken(undefined), "");
 });
 
 test("buildLineFilterToken: plain substring", () => {
-  assert.equal(buildLineFilterToken("boom"), "caseSensitive,0|__gfp__=|boom");
+  assert.equal(buildLineFilterToken("boom"), "caseInsensitive,0|__gfp__~|boom");
+  assert.equal(buildLineFilterToken("boom", { caseSensitive: true }), "caseSensitive,0|__gfp__=|boom");
 });
 
 test("buildLineFilterToken: escapes structural delimiters in the value", () => {
   // A `|` or `,` in the text would otherwise be read as a part/filter separator.
-  assert.equal(buildLineFilterToken("a|b,c"), "caseSensitive,0|__gfp__=|a__gfp__b__gfc__c");
+  assert.equal(buildLineFilterToken("a|b,c"), "caseInsensitive,0|__gfp__~|a__gfp__b__gfc__c");
+  assert.equal(buildLineFilterToken("a|b,c", { caseSensitive: true }), "caseSensitive,0|__gfp__=|a__gfp__b__gfc__c");
 });
 
 // ---------------------------------------------------------------------------
@@ -450,8 +1176,97 @@ test("toLokiNs: epoch ms passes through (converted to ns)", () => {
   assert.equal(toLokiNs(String(NOW), 0, NOW), `${NOW * 1e6}`);
 });
 
-test("toLokiNs: unparseable value falls back", () => {
-  assert.equal(toLokiNs("garbage", 60, NOW), `${(NOW - 60 * 1000) * 1e6}`);
+test("toLokiNs: an explicit ISO instant is honoured", () => {
+  assert.equal(toLokiNs("2026-08-20T15:00:00Z", 60, NOW), `${Date.parse("2026-08-20T15:00:00Z") * 1e6}`);
+  assert.equal(toLokiNs("2026-08-20T15:00:00+02:00", 60, NOW), `${Date.parse("2026-08-20T15:00:00+02:00") * 1e6}`);
+});
+
+test("toLokiNs: a timestamp without a timezone is REFUSED, not guessed", () => {
+  // Regression: this used to fall back to the default window, so asking about a
+  // specific incident window silently reported on the last hour instead. Grafana
+  // renders in the browser's timezone while log bodies are UTC, so a bare
+  // timestamp is genuinely ambiguous.
+  for (const naive of ["2026-08-20T15:00:00", "2026-08-20 15:00:00", "2026-08-20"]) {
+    assert.throws(() => toLokiNs(naive, 60, NOW), /has no timezone/, `should refuse ${naive}`);
+  }
+});
+
+test("toLokiNs: unparseable value is refused rather than silently defaulted", () => {
+  assert.throws(() => toLokiNs("garbage", 60, NOW), /unrecognised time/);
+  assert.throws(() => toLokiNs("yesterday", 60, NOW), /unrecognised time/);
+  // An absent value still means "unspecified" and keeps the caller's default.
+  assert.equal(toLokiNs("", 60, NOW), `${(NOW - 60 * 1000) * 1e6}`);
+});
+
+test("resolvedWindow: reports the UTC window a relative range resolved to", () => {
+  const w = resolvedWindow("now-1h", "now", 3600, NOW);
+  assert.equal(w.from_utc, new Date(NOW - 3_600_000).toISOString());
+  assert.equal(w.to_utc, new Date(NOW).toISOString());
+  assert.equal(w.duration_seconds, 3600);
+});
+
+// ---------------------------------------------------------------------------
+// coverageVerdict
+// ---------------------------------------------------------------------------
+
+test("coverageVerdict: zero bytes scanned is never a negative finding", () => {
+  // The whole point: "no logs" and "I looked nowhere" are different answers, and
+  // the raw API returns the same empty list for both.
+  assert.equal(coverageVerdict({ lineCount: 0, bytesProcessed: 0 }), "NO_DATA_SCANNED");
+  assert.equal(coverageVerdict({ lineCount: 0, bytesProcessed: 144752 }), "EMPTY_BUT_SCANNED");
+  assert.equal(coverageVerdict({ lineCount: 12, bytesProcessed: 144752 }), "OK");
+  assert.equal(coverageVerdict({ lineCount: 100, bytesProcessed: 1, limitReached: true }), "TRUNCATED");
+  // Truncation outranks everything: the answer is incomplete whatever else holds.
+  assert.equal(coverageVerdict({ lineCount: 100, bytesProcessed: 0, limitReached: true }), "TRUNCATED");
+  // No stats at all -> say so rather than implying a trustworthy negative.
+  assert.equal(coverageVerdict({ lineCount: 0, bytesProcessed: undefined }), "UNKNOWN");
+});
+
+test("summarizeQueryResult: a scanned-but-empty log result is marked trustworthy", () => {
+  const empty = logFrame([], {
+    stats: [{ displayName: "Summary: total bytes processed", value: 144752 }],
+  });
+  const out = summarizeQueryResult({ results: { A: { status: 200, frames: [empty] } } });
+  assert.equal(out.results.A.line_count, 0);
+  assert.equal(out.results.A.coverage, "EMPTY_BUT_SCANNED");
+  assert.match(out.results.A.coverage_note, /trustworthy negative/);
+});
+
+test("summarizeQueryResult: scanning nothing is flagged, not reported as absence", () => {
+  const nothing = logFrame([], { stats: [{ displayName: "Summary: total bytes processed", value: 0 }] });
+  const out = summarizeQueryResult({ results: { A: { status: 200, frames: [nothing] } } });
+  assert.equal(out.results.A.coverage, "NO_DATA_SCANNED");
+  assert.match(out.results.A.coverage_warning, /not a statement about whether the event happened/);
+});
+
+test("summarizeQueryResult: a truncated result reports how little of the window it covers", () => {
+  // Loki fills the cap walking backwards from the window END. 5 lines spanning
+  // 4 seconds of a 1-hour request means the other 59 minutes were never returned,
+  // and an absence there is an artifact, not a finding.
+  const base = 1700000000000;
+  const rows = Array.from({ length: 5 }, (_, i) => ({ labels: NS, time: base + i * 1000, line: `l${i}` }));
+  const out = summarizeQueryResult(
+    { results: { A: { frames: [logFrame(rows)] } } },
+    { limit: 5, window: { start_ms: base - 3_600_000, end_ms: base + 4000 } },
+  );
+  const r = out.results.A;
+  assert.equal(r.coverage, "TRUNCATED");
+  assert.equal(r.covered_window.covered_seconds, 4);
+  assert.equal(r.covered_window.requested_seconds, 3604);
+  assert.match(r.covered_window.warning, /never returned/);
+});
+
+test("summarizeQueryResult: no truncation warning when the lines span the window", () => {
+  const base = 1700000000000;
+  const rows = [
+    { labels: NS, time: base, line: "a" },
+    { labels: NS, time: base + 3_600_000, line: "b" },
+  ];
+  const out = summarizeQueryResult(
+    { results: { A: { frames: [logFrame(rows)] } } },
+    { limit: 2, window: { start_ms: base, end_ms: base + 3_600_000 } },
+  );
+  assert.equal(out.results.A.covered_window.warning, undefined);
 });
 
 // ---------------------------------------------------------------------------
@@ -496,4 +1311,164 @@ test("rankClientSuggestions: de-duplicates and caps at 10", () => {
   const out = rankClientSuggestions([...many, ...many], "april");
   assert.equal(out.length, 10);
   assert.equal(new Set(out).size, out.length);
+});
+
+// ---------------------------------------------------------------------------
+// HTTP request logs (ingress access logs)
+// ---------------------------------------------------------------------------
+
+test("statusFilterExpr: accepts a code, a class, and a list of both", () => {
+  assert.equal(statusFilterExpr("499"), " | status =~ `499`");
+  assert.equal(statusFilterExpr("5xx"), " | status =~ `5..`");
+  assert.equal(statusFilterExpr("499, 5xx"), " | status =~ `499|5..`");
+  assert.equal(statusFilterExpr(""), "");
+});
+
+test("statusFilterExpr: refuses junk rather than matching nothing", () => {
+  // A silently-unmatched filter is the failure this adapter keeps removing: the
+  // query runs, returns zero, and the zero is read as a finding.
+  assert.throws(() => statusFilterExpr("slow"), /Unrecognised status_filter/);
+  assert.throws(() => statusFilterExpr("99"), /Unrecognised status_filter/);
+  assert.throws(() => statusFilterExpr("6xx"), /Unrecognised status_filter/);
+});
+
+test("buildIngressQuery: a dedicated cluster needs no upstream filter", () => {
+  const q = buildIngressQuery({ cluster: "gravitee-acme-aks-cluster" });
+  assert.equal(q, "{cluster=`gravitee-acme-aks-cluster`, job=`" + INGRESS_JOB + "`} | pattern `" + NGINX_PATTERN + "`");
+  assert.ok(!q.includes("upstream =~"));
+});
+
+test("buildIngressQuery: a shared cluster is scoped to the customer's upstreams", () => {
+  // Cluster-wide ingress on a multi-tenant cluster is every tenant's traffic.
+  // The line filter is a prefilter; the `upstream` matcher is the authority.
+  const q = buildIngressQuery({
+    cluster: "shared-core-us-prod",
+    upstreamNamespaces: ["acme-prod", "acme-uat"],
+  });
+  assert.ok(q.includes("|~ `\\[(acme-prod|acme-uat)-`"), q);
+  assert.ok(q.includes("| upstream =~ `(acme-prod|acme-uat)-.*`"), q);
+  assert.ok(q.indexOf("|~ `\\[") < q.indexOf("| pattern"), "prefilter must precede the parser");
+});
+
+test("buildIngressQuery: filters compose in a parseable order", () => {
+  const q = buildIngressQuery({
+    cluster: "gravitee-acme-aks-cluster",
+    method: "post",
+    statusFilter: "5xx",
+    pathFilter: "_import/crd",
+    minDurationSeconds: 4.5,
+  });
+  // Every label filter must come AFTER the parser that creates those labels.
+  const parser = q.indexOf("| pattern");
+  for (const frag of ["| method =", "| status =~", "| path =~", "| request_time >"]) {
+    assert.ok(q.indexOf(frag) > parser, `${frag} must follow the parser`);
+  }
+  assert.ok(q.includes("| method = `POST`"), q);
+  assert.ok(q.includes("| request_time > 4.5"), q);
+  // Path is case-insensitive and regex-escaped: a wrong-case fragment returning
+  // a clean empty result is the exact trap this repeats elsewhere.
+  assert.ok(q.includes("| path =~ `(?i).*_import/crd.*`"), q);
+});
+
+test("buildIngressQuery: requires a cluster", () => {
+  assert.throws(() => buildIngressQuery({}), /cluster is required/);
+});
+
+// ---------------------------------------------------------------------------
+// Adaptive Logs sampling
+// ---------------------------------------------------------------------------
+
+test("detectSampling: silent when nothing is sampled", () => {
+  assert.equal(detectSampling([{ labels: { namespace: "acme-prod" } }]), null);
+  assert.equal(detectSampling([]), null);
+});
+
+test("detectSampling: reports sampled streams as a lower bound, not a total", () => {
+  const out = detectSampling([
+    { labels: { namespace: "acme-prod" } },
+    { labels: { namespace: "acme-prod", __adaptive_logs_sampled__: "99.00" } },
+    { labels: { namespace: "acme-prod", __adaptive_logs_sampled__: "91.00" } },
+  ]);
+  assert.equal(out.sampled_streams, 2);
+  assert.equal(out.total_streams, 3);
+  assert.deepEqual(out.label_values, ["91.00", "99.00"]);
+  assert.match(out.warning, /LOWER BOUNDS/);
+  // The actionable half: this is a retention rule someone can lift, not a hole
+  // in the query. Reading it as the latter cost weeks once.
+  assert.match(out.warning, /exemption/);
+});
+
+test("detectSampling: an empty label value is not sampling", () => {
+  assert.equal(detectSampling([{ labels: { __adaptive_logs_sampled__: "" } }]), null);
+});
+
+test("summarizeQueryResult: surfaces sampling from the log digest", () => {
+  // The label was on every stream all along; nothing read it, so a stream that
+  // was dropping lines looked exactly like a complete one.
+  const payload = {
+    results: {
+      A: {
+        frames: [
+          {
+            schema: {
+              meta: { custom: { frameType: "LabeledTimeValues" } },
+              fields: [
+                { name: "labels", type: "other" },
+                { name: "Time", type: "time" },
+                { name: "Line", type: "string" },
+              ],
+            },
+            data: {
+              values: [
+                [{ namespace: "acme-prod", __adaptive_logs_sampled__: "95.00" }],
+                [1755700000000],
+                ["boom"],
+              ],
+            },
+          },
+        ],
+      },
+    },
+  };
+  const out = summarizeQueryResult(payload, { limit: 100 });
+  assert.equal(out.results.A.adaptive_logs_sampling.sampled_streams, 1);
+});
+
+// ---------------------------------------------------------------------------
+// Scope notes
+// ---------------------------------------------------------------------------
+
+test("scopeNote: a namespace-scoped query says what it did NOT search", () => {
+  const note = scopeNote('{namespace=~"^acme-prod$", service_name=~"(?i).*gateway.*"}');
+  assert.match(note, /APPLICATION logs only/);
+  assert.match(note, /ingress-nginx/);
+  assert.match(note, /grafana_http_requests/);
+});
+
+test("scopeNote: a cluster-scoped query warns about other tenants instead", () => {
+  const note = scopeNote('{cluster=`shared-core-us-prod`, job=`' + INGRESS_JOB + '`}');
+  assert.match(note, /other customers' traffic/);
+  assert.ok(!/APPLICATION logs only/.test(note));
+});
+
+test("scopeNote: nothing to say about an unscoped query", () => {
+  assert.equal(scopeNote('{service_name=~"(?i).*gateway.*"}'), null);
+  assert.equal(scopeNote(""), null);
+});
+
+test("NGINX_PATTERN: captures where the time went, not just how long it took", () => {
+  // request_time alone cannot distinguish a slow backend from a slow ingress,
+  // and on a client timeout upstream_time is the only number saying how far the
+  // backend had got. upstream_status is `-` exactly when the client hung up.
+  for (const field of ["<method>", "<path>", "<status>", "<request_time>", "<upstream>", "<upstream_time>", "<upstream_status>"]) {
+    assert.ok(NGINX_PATTERN.includes(field), `pattern must capture ${field}`);
+  }
+  // The tail differs between clusters (some append scheme and forwarded
+  // addresses); anchoring past it matches nothing on half the estate.
+  assert.ok(NGINX_PATTERN.endsWith("<_>"), NGINX_PATTERN);
+  // The client address, referer and request id stay discarded — naming them
+  // would put them into every series key.
+  for (const field of ["<remote_addr>", "<referer>", "<req_id>"]) {
+    assert.ok(!NGINX_PATTERN.includes(field), `${field} must not become a label`);
+  }
 });

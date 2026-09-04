@@ -324,6 +324,460 @@ test("grafana_query: returns the per-series digest by default and raw frames wit
 
 
 // ---------------------------------------------------------------------------
+// Viewer-scoped token: /api/datasources is Admin-only, everything must degrade
+// ---------------------------------------------------------------------------
+
+// Grafana's built-in Viewer role can QUERY a datasource but cannot read its
+// configuration, so /api/datasources and /api/datasources/uid/:uid return 403.
+// We have no Viewer token to test with, so simulate one: refuse exactly those
+// two endpoints and serve /api/frontend/settings, which any authenticated user
+// can read. `privileged: true` restores an Admin-scoped token.
+function withTokenStub({ privileged, settings, onQuery }, fn) {
+  const origFetch = globalThis.fetch;
+  const seen = [];
+  globalThis.fetch = (url, init) => {
+    const u = String(url);
+    seen.push(u);
+    const reply = (body, status = 200) =>
+      Promise.resolve({
+        ok: status < 400,
+        status,
+        text: () => Promise.resolve(JSON.stringify(body)),
+        headers: { get: () => null },
+      });
+
+    if (u.includes("/api/frontend/settings")) return reply(settings);
+    if (u.includes("/api/datasources")) {
+      if (!privileged) return reply({ message: "Forbidden" }, 403);
+      return reply(
+        u.includes("/datasources/uid/")
+          ? { uid: "grafanacloud-logs", name: "gravitee-logs", type: "loki" }
+          : [{ uid: "grafanacloud-logs", name: "gravitee-logs", type: "loki", isDefault: true }],
+      );
+    }
+    if (u.includes("/ds/query")) return reply(onQuery ?? { results: {} }, 200);
+    return reply({}, 404);
+  };
+  return Promise.resolve(fn(seen)).finally(() => {
+    globalThis.fetch = origFetch;
+  });
+}
+
+// Shape mirrors the live instance: real entries carry uid/name/type; the UI
+// pseudo-datasources carry neither and must be skipped.
+const SETTINGS = {
+  defaultDatasource: "gravitee-prom",
+  datasources: {
+    "gravitee-logs": { uid: "grafanacloud-logs", name: "gravitee-logs", type: "loki" },
+    "gravitee-prom": { uid: "grafanacloud-prom", name: "gravitee-prom", type: "prometheus" },
+    // Action-capable: k6 can trigger load test runs, so it must never be queryable.
+    "grafanacloud-k6": { uid: "k6-uid", name: "grafanacloud-k6", type: "k6-datasource" },
+    "-- Mixed --": { type: "datasource" },
+    "-- Dashboard --": { type: "datasource" },
+  },
+};
+
+test("grafana_health: stays healthy on a Viewer token and reports the missing permission", async () => {
+  // Regression: health used to probe via /api/datasources, so a correctly
+  // Viewer-scoped token made the adapter report itself unhealthy — failing on
+  // privilege rather than reachability, and contradicting its own advice to run
+  // as a Viewer.
+  await withTokenStub({ privileged: false, settings: SETTINGS }, async () => {
+    const out = await callTool("grafana_health", {});
+    assert.equal(out.status, "ok");
+    assert.equal(out.reachable, true);
+    assert.equal(out.datasources_readable, false);
+    assert.match(out.note, /Viewer/);
+    // Counted from the catalogue, skipping the uid-less pseudo-datasources.
+    assert.equal(out.datasource_count, 3);
+  });
+});
+
+test("grafana_health: reports the permission as present on a privileged token", async () => {
+  await withTokenStub({ privileged: true, settings: SETTINGS }, async () => {
+    const out = await callTool("grafana_health", {});
+    assert.equal(out.datasources_readable, true);
+    assert.equal(out.note, undefined);
+    assert.equal(out.datasource_count, 1);
+  });
+});
+
+test("grafana_list_datasources: falls back to the catalogue and says so", async () => {
+  await withTokenStub({ privileged: false, settings: SETTINGS }, async () => {
+    const out = await callTool("grafana_list_datasources", {});
+    assert.equal(out.source, "frontend_settings");
+    assert.match(out.note, /Viewer-scoped token/);
+    assert.equal(out.count, 3);
+    const byUid = Object.fromEntries(out.datasources.map((d) => [d.uid, d]));
+    assert.equal(byUid["grafanacloud-logs"].type, "loki");
+    // is_default resolves against defaultDatasource, which is keyed by NAME.
+    assert.equal(byUid["grafanacloud-prom"].is_default, true);
+    assert.equal(byUid["grafanacloud-logs"].is_default, false);
+  });
+});
+
+test("grafana_query: the read-only guard still passes when datasource config is forbidden", async () => {
+  // The guard resolves the datasource TYPE. Reading it from /api/datasources
+  // needs Admin, so on a Viewer token the guard used to fail and take
+  // grafana_query down with it — a far worse failure than health reporting 403.
+  const payload = { results: { A: { status: 200, frames: [serverLogFrame(2)] } } };
+  await withTokenStub({ privileged: false, settings: SETTINGS, onQuery: payload }, async () => {
+    const out = await callTool("grafana_query", { datasource_uid: "grafanacloud-logs", expr: '{a="b"}' });
+    assert.equal(out.results.A.line_count, 2);
+  });
+});
+
+test("grafana_query: the fallback still refuses a datasource outside the allowlist", async () => {
+  // Degrading the permission requirement must not degrade the safety property:
+  // k6 resolved via the fallback is still refused.
+  await withTokenStub({ privileged: false, settings: SETTINGS }, async () => {
+    await assert.rejects(
+      () => tools.grafana_query({ datasource_uid: "k6-uid", expr: "x" }, {}),
+      /not in the read-only allowlist/,
+    );
+  });
+});
+
+test("grafana_query: fails closed when neither source can identify the datasource", async () => {
+  await withTokenStub({ privileged: false, settings: SETTINGS }, async () => {
+    await assert.rejects(
+      () => tools.grafana_query({ datasource_uid: "does-not-exist", expr: "x" }, {}),
+      /could not be verified read-only/,
+    );
+  });
+});
+
+test("grafana_query: fails closed when the catalogue itself is unreachable", async () => {
+  // Uses a uid no catalogue has, so the lookup cannot be answered from cache and
+  // must go to the network — which is refused. Both sources failing must reject.
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = () =>
+    Promise.resolve({ ok: false, status: 403, text: () => Promise.resolve("{}"), headers: { get: () => null } });
+  try {
+    await assert.rejects(
+      () => tools.grafana_query({ datasource_uid: "uid-in-no-catalogue", expr: "x" }, {}),
+      /could not be verified read-only.*fallback failed/,
+    );
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
+test("grafana_query: a cached datasource type survives a transient permission failure", async () => {
+  // Deliberate: once the type is known, a Viewer-token 403 on the privileged
+  // endpoint should not take querying down. The cache is TTL-bounded so this
+  // resilience cannot mask a lasting configuration change.
+  const payload = { results: { A: { status: 200, frames: [serverLogFrame(1)] } } };
+  await withTokenStub({ privileged: false, settings: SETTINGS, onQuery: payload }, async () => {
+    await callTool("grafana_query", { datasource_uid: "grafanacloud-logs", expr: "x" });
+  });
+  // Catalogue now warm; refuse every network call and query again.
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = (url) =>
+    Promise.resolve(
+      String(url).includes("/ds/query")
+        ? { ok: true, status: 200, text: () => Promise.resolve(JSON.stringify(payload)), headers: { get: () => null } }
+        : { ok: false, status: 403, text: () => Promise.resolve("{}"), headers: { get: () => null } },
+    );
+  try {
+    const out = await callTool("grafana_query", { datasource_uid: "grafanacloud-logs", expr: "x" });
+    assert.equal(out.results.A.line_count, 1);
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
+// ---------------------------------------------------------------------------
+// grafana_query: log-line cap (maxLines) and truncation signalling
+// ---------------------------------------------------------------------------
+
+// Stub that answers assertReadOnly with a loki datasource and /ds/query with
+// `payload`, recording the JSON body of every /ds/query request so we can assert
+// on what was actually sent to Grafana.
+function withDsQueryStub(payload, fn) {
+  const bodies = [];
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = (url, init) => {
+    const isQuery = String(url).includes("/ds/query");
+    if (isQuery) bodies.push(JSON.parse(init.body));
+    const body = isQuery ? payload : { uid: "ds", name: "loki", type: "loki" };
+    return Promise.resolve({
+      ok: true,
+      status: 200,
+      text: () => Promise.resolve(JSON.stringify(body)),
+      headers: { get: () => null },
+    });
+  };
+  return Promise.resolve(fn(bodies)).finally(() => {
+    globalThis.fetch = origFetch;
+  });
+}
+
+// Minimal Loki log frame (see helpers.test.js for the full field list).
+function serverLogFrame(count) {
+  const rows = Array.from({ length: count }, (_, i) => i);
+  return {
+    schema: {
+      meta: { custom: { frameType: "LabeledTimeValues" } },
+      fields: [
+        { name: "labels", type: "other" },
+        { name: "Time", type: "time" },
+        { name: "Line", type: "string" },
+      ],
+    },
+    data: {
+      values: [
+        rows.map(() => ({ namespace: "ns" })),
+        rows.map((i) => 1700000000000 + i),
+        rows.map((i) => `line ${i}`),
+      ],
+    },
+  };
+}
+
+test("grafana_query: sends maxLines so the log-line cap is explicit, not Grafana's hidden default", async () => {
+  // maxDataPoints only sets METRIC resolution — Grafana's Loki backend ignores
+  // it for log queries and caps them with maxLines (defaulting to 100 when
+  // nothing sets it). Without maxLines the cap is invisible and uncontrollable.
+  const payload = { results: { A: { status: 200, frames: [serverLogFrame(2)] } } };
+  await withDsQueryStub(payload, async (bodies) => {
+    await callTool("grafana_query", { datasource_uid: "ds", expr: '{namespace="ns"}', max_lines: 250 });
+    assert.equal(bodies[0].queries[0].maxLines, 250);
+
+    await callTool("grafana_query", { datasource_uid: "ds", expr: '{namespace="ns"}' });
+    assert.equal(bodies[1].queries[0].maxLines, 100);
+  });
+});
+
+test("grafana_query: digests a log query by line count instead of reporting no series", async () => {
+  const payload = { results: { A: { status: 200, frames: [serverLogFrame(3)] } } };
+  await withDsQueryStub(payload, async () => {
+    const digest = await callTool("grafana_query", { datasource_uid: "ds", expr: '{namespace="ns"}' });
+    assert.equal(digest.results.A.frame_type, "logs");
+    assert.equal(digest.results.A.line_count, 3);
+  });
+});
+
+test("grafana_query: flags a log result that hit the line cap as partial", async () => {
+  const payload = { results: { A: { status: 200, frames: [serverLogFrame(5)] } } };
+  await withDsQueryStub(payload, async () => {
+    const digest = await callTool("grafana_query", { datasource_uid: "ds", expr: '{namespace="ns"}', max_lines: 5 });
+    assert.equal(digest.results.A.limit_reached, true);
+  });
+});
+
+test("grafana_query: raw=true still flags the line cap rather than returning a silent partial page", async () => {
+  const payload = { results: { A: { status: 200, frames: [serverLogFrame(5)] } } };
+  await withDsQueryStub(payload, async () => {
+    const raw = await callTool("grafana_query", {
+      datasource_uid: "ds",
+      expr: '{namespace="ns"}',
+      max_lines: 5,
+      raw: true,
+    });
+    assert.equal(raw.results.A.limit_reached, true);
+    assert.match(raw.results.A.note, /max_lines/);
+    // The frames themselves stay verbatim — only a note is added.
+    assert.equal(raw.results.A.frames[0].data.values[2].length, 5);
+  });
+});
+
+test("grafana_query: raw=true adds no note when the result is under the cap", async () => {
+  const payload = { results: { A: { status: 200, frames: [serverLogFrame(2)] } } };
+  await withDsQueryStub(payload, async () => {
+    const raw = await callTool("grafana_query", {
+      datasource_uid: "ds",
+      expr: '{namespace="ns"}',
+      max_lines: 100,
+      raw: true,
+    });
+    assert.equal(raw.results.A.limit_reached, undefined);
+    assert.equal(raw.results.A.note, undefined);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// grafana_query: native `query` for non-Prometheus/Loki datasource types
+// ---------------------------------------------------------------------------
+
+test("grafana_query: forwards native query fields for types that do not use expr", async () => {
+  // Verified against the live instance: Elasticsearch rejects `expr` with HTTP
+  // 400 and Tempo with 500. Allowlisting a type without this would produce a
+  // datasource that is permitted but unusable.
+  const payload = { results: { A: { status: 200, frames: [] } } };
+  const origFetch = globalThis.fetch;
+  const bodies = [];
+  globalThis.fetch = (url, init) => {
+    const isQuery = String(url).includes("/ds/query");
+    if (isQuery) bodies.push(JSON.parse(init.body));
+    return Promise.resolve({
+      ok: true,
+      status: 200,
+      text: () =>
+        Promise.resolve(JSON.stringify(isQuery ? payload : { uid: "es", name: "es", type: "elasticsearch" })),
+      headers: { get: () => null },
+    });
+  };
+  try {
+    await callTool("grafana_query", {
+      datasource_uid: "es",
+      query: { query: "*", timeField: "@timestamp", metrics: [{ id: "1", type: "count" }] },
+    });
+    const q = bodies[0].queries[0];
+    assert.equal(q.query, "*");
+    assert.equal(q.timeField, "@timestamp");
+    assert.deepEqual(q.metrics, [{ id: "1", type: "count" }]);
+    // expr must be absent, not undefined-but-present.
+    assert.ok(!("expr" in q), "expr must not be sent when it was not supplied");
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
+test("grafana_query: a caller-supplied query cannot redirect to another datasource", async () => {
+  // Security: assertReadOnly verifies datasource_uid. If a field inside `query`
+  // could replace the datasource, the guard would be verifying one datasource
+  // while Grafana queried another - including a blocked, action-capable one.
+  const payload = { results: { A: { status: 200, frames: [] } } };
+  const origFetch = globalThis.fetch;
+  const bodies = [];
+  globalThis.fetch = (url, init) => {
+    const isQuery = String(url).includes("/ds/query");
+    if (isQuery) bodies.push(JSON.parse(init.body));
+    return Promise.resolve({
+      ok: true,
+      status: 200,
+      text: () =>
+        Promise.resolve(JSON.stringify(isQuery ? payload : { uid: "es", name: "es", type: "elasticsearch" })),
+      headers: { get: () => null },
+    });
+  };
+  try {
+    await callTool("grafana_query", {
+      datasource_uid: "es",
+      query: { query: "*", refId: "Z", datasource: { uid: "k6-datasource", type: "k6-datasource" } },
+    });
+    const q = bodies[0].queries[0];
+    assert.deepEqual(q.datasource, { uid: "es", type: "elasticsearch" }, "datasource must stay pinned to the verified uid");
+    assert.equal(q.refId, "A");
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
+test("grafana_query: requires either expr or query", async () => {
+  await assert.rejects(
+    () => tools.grafana_query({ datasource_uid: "ds" }, {}),
+    /either expr .* or query .* is required/,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// CloudWatch: allowed for metrics, refused for billable Logs Insights
+// ---------------------------------------------------------------------------
+
+function withCloudwatchStub(fn) {
+  const origFetch = globalThis.fetch;
+  const bodies = [];
+  globalThis.fetch = (url, init) => {
+    const isQuery = String(url).includes("/ds/query");
+    if (isQuery) bodies.push(JSON.parse(init.body));
+    return Promise.resolve({
+      ok: true,
+      status: 200,
+      text: () =>
+        Promise.resolve(
+          JSON.stringify(isQuery ? { results: { A: { status: 200, frames: [] } } } : { uid: "cw", name: "cw", type: "cloudwatch" }),
+        ),
+      headers: { get: () => null },
+    });
+  };
+  return Promise.resolve(fn(bodies)).finally(() => {
+    globalThis.fetch = origFetch;
+  });
+}
+
+test("grafana_query: every CloudWatch result carries a billable warning", async () => {
+  // The guard blocks the UNBOUNDED cost, but CloudWatch is never free: AWS meters
+  // GetMetricData per request. A caller used to free Loki/Prometheus reads must
+  // not have to know that, so the result says it.
+  await withCloudwatchStub(async () => {
+    const digest = await callTool("grafana_query", {
+      datasource_uid: "cw",
+      query: { queryMode: "Metrics", namespace: "AWS/S3" },
+    });
+    assert.match(digest.billing_notice, /BILLABLE/);
+    assert.match(digest.billing_notice, /not free/);
+    assert.ok(digest.results, "the notice must not displace the results");
+  });
+
+  // ...on the raw path too, which returns Grafana's payload almost verbatim.
+  await withCloudwatchStub(async () => {
+    const raw = await callTool("grafana_query", {
+      datasource_uid: "cw",
+      query: { queryMode: "Metrics", namespace: "AWS/S3" },
+      raw: true,
+    });
+    assert.match(raw.billing_notice, /BILLABLE/);
+  });
+});
+
+test("grafana_query: non-CloudWatch results carry no billing notice", async () => {
+  // The warning must mean something — attaching it to free datasources would
+  // train the reader to ignore it.
+  const payload = { results: { A: { status: 200, frames: [] } } };
+  await withDsQueryStub(payload, async () => {
+    const out = await callTool("grafana_query", { datasource_uid: "ds", expr: '{a="b"}' });
+    assert.equal(out.billing_notice, undefined);
+  });
+});
+
+test("grafana_query: CloudWatch metrics queries are allowed", async () => {
+  await withCloudwatchStub(async (bodies) => {
+    await callTool("grafana_query", {
+      datasource_uid: "cw",
+      query: { queryMode: "Metrics", region: "eu-west-1", namespace: "AWS/S3", metricName: "BucketSizeBytes", statistic: "Average" },
+    });
+    assert.equal(bodies[0].queries[0].metricName, "BucketSizeBytes");
+  });
+  // queryMode omitted defaults to Metrics and is likewise allowed.
+  await withCloudwatchStub(async (bodies) => {
+    await callTool("grafana_query", { datasource_uid: "cw", query: { region: "eu-west-1", namespace: "AWS/S3" } });
+    assert.equal(bodies.length, 1);
+  });
+});
+
+test("grafana_query: CloudWatch Logs Insights is refused before any request is sent", async () => {
+  // Logs Insights bills per GB SCANNED — an unbounded cost a single query can run
+  // up. The refusal must happen before the request leaves, not after.
+  for (const bad of [
+    { queryMode: "Logs", expression: "fields @message" },
+    { queryMode: "Metrics", logGroups: ["/aws/lambda/x"] },
+    { queryMode: "Metrics", logGroupNames: ["/aws/lambda/x"] },
+    { queryMode: "Metrics", subtype: "StartQuery" },
+    { queryMode: "Metrics", queryLanguage: "CWLI" },
+  ]) {
+    await withCloudwatchStub(async (bodies) => {
+      await assert.rejects(
+        () => tools.grafana_query({ datasource_uid: "cw", query: bad }, {}),
+        /refused/,
+        `should refuse ${JSON.stringify(bad)}`,
+      );
+      assert.equal(bodies.length, 0, "no /ds/query request may be sent for a refused CloudWatch query");
+    });
+  }
+});
+
+test("grafana_query: the CloudWatch guard applies only to CloudWatch", async () => {
+  // A loki query carrying an unrelated field named logGroups must not be refused.
+  const payload = { results: { A: { status: 200, frames: [] } } };
+  await withDsQueryStub(payload, async (bodies) => {
+    await callTool("grafana_query", { datasource_uid: "ds", expr: '{a="b"}' });
+    assert.equal(bodies.length, 1);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // grafana_query read-only guard (comentario #1 de gutek): solo types allowlisted
 // ---------------------------------------------------------------------------
 
@@ -380,3 +834,128 @@ test("grafana_query: fails closed when the datasource cannot be resolved", async
   }
 });
 
+
+// ---------------------------------------------------------------------------
+// grafana_http_requests: the data no namespace-scoped tool can reach
+// ---------------------------------------------------------------------------
+
+// Route /series by what is being asked for: "which cluster holds these
+// namespaces" and "what else runs on this cluster" are the same endpoint with
+// different matchers.
+function seriesRouter({ namespaceToCluster = {}, clusterNamespaces = {} }) {
+  return (url) => {
+    const u = decodeURIComponent(String(url));
+    const byCluster = /match\[\]=\{cluster/.test(u);
+    if (byCluster) {
+      const cluster = /cluster=`([^`]+)`/.exec(u)?.[1];
+      return (clusterNamespaces[cluster] || []).map((namespace) => ({ namespace, cluster }));
+    }
+    return Object.entries(namespaceToCluster).map(([namespace, cluster]) => ({ namespace, cluster }));
+  };
+}
+
+test("grafana_http_requests: a dedicated cluster is queried whole, with no upstream filter", async () => {
+  await withLokiStub(
+    {
+      [NS_VALUES]: ["acme-prod", "acme-uat"],
+      [SERIES]: seriesRouter({
+        namespaceToCluster: { "acme-prod": "gravitee-acme-aks-cluster", "acme-uat": "gravitee-acme-aks-cluster" },
+        // Only this customer's namespaces, plus infrastructure that runs on
+        // every cluster and says nothing about tenancy.
+        clusterNamespaces: {
+          "gravitee-acme-aks-cluster": ["acme-prod", "acme-uat", "ingress-nginx", "kube-system"],
+        },
+      }),
+    },
+    async () => {
+      const out = await callTool("grafana_http_requests", { client: "acme", from: "now-1h" });
+      assert.equal(out.cluster, "gravitee-acme-aks-cluster");
+      assert.equal(out.scope.single_tenant_cluster, true);
+      assert.equal(out.scope.tenancy, "dedicated");
+      // Nothing to narrow to: the cluster's ingress stream IS this customer's
+      // request log, including requests rejected before an upstream was chosen.
+      assert.ok(!out.queries.counts.includes("upstream =~"), out.queries.counts);
+      assert.ok(out.queries.counts.includes('job=`flow/ingress-nginx-ingress-nginx`'), out.queries.counts);
+    },
+  );
+});
+
+test("grafana_http_requests: a shared cluster is narrowed to the customer's upstreams", async () => {
+  await withLokiStub(
+    {
+      [NS_VALUES]: ["acme-prod"],
+      [SERIES]: seriesRouter({
+        namespaceToCluster: { "acme-prod": "shared-core-us-prod" },
+        clusterNamespaces: {
+          "shared-core-us-prod": ["acme-prod", "orbit-prod", "beacon-prod", "ingress-nginx"],
+        },
+      }),
+    },
+    async () => {
+      const out = await callTool("grafana_http_requests", { client: "acme", from: "now-1h" });
+      assert.equal(out.scope.single_tenant_cluster, false);
+      assert.equal(out.scope.tenancy, "shared");
+      assert.equal(out.scope.other_tenants_on_cluster, 2);
+      // The boundary that matters: a cluster-wide ingress query here would
+      // return orbit's and beacon's requests under acme's name.
+      assert.ok(out.queries.counts.includes("| upstream =~ `(acme-prod)-.*`"), out.queries.counts);
+      // ...and the cost of that filter is stated rather than hidden.
+      assert.match(out.scope.note, /before an upstream was chosen/);
+    },
+  );
+});
+
+test("grafana_http_requests: refuses to aggregate two clusters into one distribution", async () => {
+  await withLokiStub(
+    {
+      [NS_VALUES]: ["acme-prod", "acme-apac"],
+      [SERIES]: seriesRouter({
+        namespaceToCluster: { "acme-prod": "gravitee-acme-aks-cluster", "acme-apac": "gravitee-acme-apac-aks-cluster" },
+      }),
+    },
+    async () => {
+      const out = await callTool("grafana_http_requests", { client: "acme", from: "now-1h" });
+      assert.deepEqual(out.clusters, ["gravitee-acme-aks-cluster", "gravitee-acme-apac-aks-cluster"]);
+      assert.match(out.note, /describe neither/);
+      assert.equal(out.queries, undefined, "no query should have run");
+    },
+  );
+});
+
+test("grafana_http_requests: says so when the cluster cannot be resolved", async () => {
+  await withLokiStub({ [NS_VALUES]: [], [SERIES]: [] }, async () => {
+    const out = await callTool("grafana_http_requests", { client: "nosuchcustomer", from: "now-1h" });
+    // Not an empty result set dressed as an answer.
+    assert.match(out.note, /Could not resolve a cluster/);
+  });
+});
+
+test("grafana_http_requests: requires a customer or a cluster", async () => {
+  await assert.rejects(() => callTool("grafana_http_requests", { from: "now-1h" }), /client .* or cluster/);
+});
+
+// ---------------------------------------------------------------------------
+// grafana_find_customer: the cluster label, and what it unlocks
+// ---------------------------------------------------------------------------
+
+test("grafana_find_customer: returns the cluster and points at the ingress job", async () => {
+  // The gap this closes: every other tool takes `client` and scopes to these
+  // namespaces, which hold application logs only. Without the cluster there is
+  // no route at all from a customer name to their HTTP request logs.
+  await withLokiStub(
+    {
+      [NS_VALUES]: ["acme-prod", "acme-uat"],
+      [SERIES]: seriesRouter({
+        namespaceToCluster: { "acme-prod": "gravitee-acme-aks-cluster", "acme-uat": "gravitee-acme-aks-cluster" },
+      }),
+    },
+    async () => {
+      const out = await callTool("grafana_find_customer", { query: "acme" });
+      assert.deepEqual(out.hosted_namespaces, ["acme-prod", "acme-uat"]);
+      assert.deepEqual(out.hosted_clusters, ["gravitee-acme-aks-cluster"]);
+      assert.deepEqual(out.clusters, ["gravitee-acme-aks-cluster"]);
+      assert.match(out.http_request_logs_note, /flow\/ingress-nginx-ingress-nginx/);
+      assert.match(out.http_request_logs_note, /grafana_http_requests/);
+    },
+  );
+});
