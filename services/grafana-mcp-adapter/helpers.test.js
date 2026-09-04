@@ -26,6 +26,12 @@ const {
   toLokiNs,
   resolvedWindow,
   coverageVerdict,
+  statusFilterExpr,
+  buildIngressQuery,
+  detectSampling,
+  scopeNote,
+  INGRESS_JOB,
+  NGINX_PATTERN,
   mergeContextStreams,
   normaliseLogLine,
   profileNoise,
@@ -1305,4 +1311,164 @@ test("rankClientSuggestions: de-duplicates and caps at 10", () => {
   const out = rankClientSuggestions([...many, ...many], "april");
   assert.equal(out.length, 10);
   assert.equal(new Set(out).size, out.length);
+});
+
+// ---------------------------------------------------------------------------
+// HTTP request logs (ingress access logs)
+// ---------------------------------------------------------------------------
+
+test("statusFilterExpr: accepts a code, a class, and a list of both", () => {
+  assert.equal(statusFilterExpr("499"), " | status =~ `499`");
+  assert.equal(statusFilterExpr("5xx"), " | status =~ `5..`");
+  assert.equal(statusFilterExpr("499, 5xx"), " | status =~ `499|5..`");
+  assert.equal(statusFilterExpr(""), "");
+});
+
+test("statusFilterExpr: refuses junk rather than matching nothing", () => {
+  // A silently-unmatched filter is the failure this adapter keeps removing: the
+  // query runs, returns zero, and the zero is read as a finding.
+  assert.throws(() => statusFilterExpr("slow"), /Unrecognised status_filter/);
+  assert.throws(() => statusFilterExpr("99"), /Unrecognised status_filter/);
+  assert.throws(() => statusFilterExpr("6xx"), /Unrecognised status_filter/);
+});
+
+test("buildIngressQuery: a dedicated cluster needs no upstream filter", () => {
+  const q = buildIngressQuery({ cluster: "gravitee-acme-aks-cluster" });
+  assert.equal(q, "{cluster=`gravitee-acme-aks-cluster`, job=`" + INGRESS_JOB + "`} | pattern `" + NGINX_PATTERN + "`");
+  assert.ok(!q.includes("upstream =~"));
+});
+
+test("buildIngressQuery: a shared cluster is scoped to the customer's upstreams", () => {
+  // Cluster-wide ingress on a multi-tenant cluster is every tenant's traffic.
+  // The line filter is a prefilter; the `upstream` matcher is the authority.
+  const q = buildIngressQuery({
+    cluster: "shared-core-us-prod",
+    upstreamNamespaces: ["acme-prod", "acme-uat"],
+  });
+  assert.ok(q.includes("|~ `\\[(acme-prod|acme-uat)-`"), q);
+  assert.ok(q.includes("| upstream =~ `(acme-prod|acme-uat)-.*`"), q);
+  assert.ok(q.indexOf("|~ `\\[") < q.indexOf("| pattern"), "prefilter must precede the parser");
+});
+
+test("buildIngressQuery: filters compose in a parseable order", () => {
+  const q = buildIngressQuery({
+    cluster: "gravitee-acme-aks-cluster",
+    method: "post",
+    statusFilter: "5xx",
+    pathFilter: "_import/crd",
+    minDurationSeconds: 4.5,
+  });
+  // Every label filter must come AFTER the parser that creates those labels.
+  const parser = q.indexOf("| pattern");
+  for (const frag of ["| method =", "| status =~", "| path =~", "| request_time >"]) {
+    assert.ok(q.indexOf(frag) > parser, `${frag} must follow the parser`);
+  }
+  assert.ok(q.includes("| method = `POST`"), q);
+  assert.ok(q.includes("| request_time > 4.5"), q);
+  // Path is case-insensitive and regex-escaped: a wrong-case fragment returning
+  // a clean empty result is the exact trap this repeats elsewhere.
+  assert.ok(q.includes("| path =~ `(?i).*_import/crd.*`"), q);
+});
+
+test("buildIngressQuery: requires a cluster", () => {
+  assert.throws(() => buildIngressQuery({}), /cluster is required/);
+});
+
+// ---------------------------------------------------------------------------
+// Adaptive Logs sampling
+// ---------------------------------------------------------------------------
+
+test("detectSampling: silent when nothing is sampled", () => {
+  assert.equal(detectSampling([{ labels: { namespace: "acme-prod" } }]), null);
+  assert.equal(detectSampling([]), null);
+});
+
+test("detectSampling: reports sampled streams as a lower bound, not a total", () => {
+  const out = detectSampling([
+    { labels: { namespace: "acme-prod" } },
+    { labels: { namespace: "acme-prod", __adaptive_logs_sampled__: "99.00" } },
+    { labels: { namespace: "acme-prod", __adaptive_logs_sampled__: "91.00" } },
+  ]);
+  assert.equal(out.sampled_streams, 2);
+  assert.equal(out.total_streams, 3);
+  assert.deepEqual(out.label_values, ["91.00", "99.00"]);
+  assert.match(out.warning, /LOWER BOUNDS/);
+  // The actionable half: this is a retention rule someone can lift, not a hole
+  // in the query. Reading it as the latter cost weeks once.
+  assert.match(out.warning, /exemption/);
+});
+
+test("detectSampling: an empty label value is not sampling", () => {
+  assert.equal(detectSampling([{ labels: { __adaptive_logs_sampled__: "" } }]), null);
+});
+
+test("summarizeQueryResult: surfaces sampling from the log digest", () => {
+  // The label was on every stream all along; nothing read it, so a stream that
+  // was dropping lines looked exactly like a complete one.
+  const payload = {
+    results: {
+      A: {
+        frames: [
+          {
+            schema: {
+              meta: { custom: { frameType: "LabeledTimeValues" } },
+              fields: [
+                { name: "labels", type: "other" },
+                { name: "Time", type: "time" },
+                { name: "Line", type: "string" },
+              ],
+            },
+            data: {
+              values: [
+                [{ namespace: "acme-prod", __adaptive_logs_sampled__: "95.00" }],
+                [1755700000000],
+                ["boom"],
+              ],
+            },
+          },
+        ],
+      },
+    },
+  };
+  const out = summarizeQueryResult(payload, { limit: 100 });
+  assert.equal(out.results.A.adaptive_logs_sampling.sampled_streams, 1);
+});
+
+// ---------------------------------------------------------------------------
+// Scope notes
+// ---------------------------------------------------------------------------
+
+test("scopeNote: a namespace-scoped query says what it did NOT search", () => {
+  const note = scopeNote('{namespace=~"^acme-prod$", service_name=~"(?i).*gateway.*"}');
+  assert.match(note, /APPLICATION logs only/);
+  assert.match(note, /ingress-nginx/);
+  assert.match(note, /grafana_http_requests/);
+});
+
+test("scopeNote: a cluster-scoped query warns about other tenants instead", () => {
+  const note = scopeNote('{cluster=`shared-core-us-prod`, job=`' + INGRESS_JOB + '`}');
+  assert.match(note, /other customers' traffic/);
+  assert.ok(!/APPLICATION logs only/.test(note));
+});
+
+test("scopeNote: nothing to say about an unscoped query", () => {
+  assert.equal(scopeNote('{service_name=~"(?i).*gateway.*"}'), null);
+  assert.equal(scopeNote(""), null);
+});
+
+test("NGINX_PATTERN: captures where the time went, not just how long it took", () => {
+  // request_time alone cannot distinguish a slow backend from a slow ingress,
+  // and on a client timeout upstream_time is the only number saying how far the
+  // backend had got. upstream_status is `-` exactly when the client hung up.
+  for (const field of ["<method>", "<path>", "<status>", "<request_time>", "<upstream>", "<upstream_time>", "<upstream_status>"]) {
+    assert.ok(NGINX_PATTERN.includes(field), `pattern must capture ${field}`);
+  }
+  // The tail differs between clusters (some append scheme and forwarded
+  // addresses); anchoring past it matches nothing on half the estate.
+  assert.ok(NGINX_PATTERN.endsWith("<_>"), NGINX_PATTERN);
+  // The client address, referer and request id stay discarded — naming them
+  // would put them into every series key.
+  for (const field of ["<remote_addr>", "<referer>", "<req_id>"]) {
+    assert.ok(!NGINX_PATTERN.includes(field), `${field} must not become a label`);
+  }
 });

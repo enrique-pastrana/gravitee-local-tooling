@@ -33,6 +33,56 @@ not chained to one another.
 | `grafana_logs_trend` | "When did this start?" — counts matching lines into fixed time buckets and reports total, onset, last seen and peak. Counts only, no log lines. |
 | `grafana_logs_patterns` | "What is dominating this log volume?" — Loki's detected line shapes, ranked by volume. **Does not surface rare lines** (see below). |
 | `grafana_logs_link` | Build a shareable Grafana logs link for a customer's logs. Discovers matching streams via Loki's `/series` (label sets only, no log lines) to scope the link. Defaults to Logs Drilldown links (per-namespace); pass `link_style="explore"` for a raw LogQL Explore link. |
+| `grafana_logs_context` | Every line around a moment in time, **unfiltered** — "what else was happening right then". Refuses a line filter, because a filter is what hides the continuation lines. |
+| `grafana_logs_noise` | What is actually filling a stream: lines reduced to their shape, ranked, each with a pasteable LogQL exclusion. Covers what pattern detection cannot see below its floor. |
+| `grafana_find_customer` | Which customer or deployment is this, by name or by id — and **which cluster** they are on. Touches no logs. |
+| `grafana_http_requests` | HTTP request logs: status distribution, latency percentiles, and parsed individual requests. The only tool that can reach them (see below). |
+
+### HTTP request logs are not in the customer's namespace
+
+Every `client`-scoped tool resolves the customer to their **own** namespaces, and
+those hold application logs only. The access logs — status code, request
+duration, upstream response time — are emitted by the shared ingress controller,
+which runs in the `ingress-nginx` namespace and is identified by the **cluster**
+label:
+
+```logql
+{cluster="<cluster>", job="flow/ingress-nginx-ingress-nginx"}
+```
+
+No namespace-scoped query can reach them. The failure mode is not a missing
+feature: a question like "is the Management API slow for this customer" gets
+probed with `client`-scoped queries, every one comes back empty, and the empty
+results read as evidence the data does not exist.
+
+So `grafana_find_customer` returns `clusters` alongside the namespaces, every
+`client`-scoped tool carries a `scope_note` saying what it did **not** search,
+and `grafana_http_requests` resolves the cluster for you.
+
+Scoping is handled rather than left to the caller. On a cluster dedicated to one
+customer the cluster-wide ingress stream *is* their request log. On a shared
+cluster it is not, so the query is narrowed to requests whose upstream is one of
+that customer's namespaces — with the one honest limit stated in the response: a
+request rejected at the ingress before an upstream was chosen carries no upstream
+and is therefore excluded.
+
+Prefer it over a line filter on the raw stream. The access-log line carries
+several bare numbers, so `|= " 499 "` also matches 200s whose request length
+happened to be 499 bytes; `status_filter` matches the parsed field only.
+
+### Adaptive Logs sampling is reported, not assumed
+
+Grafana Adaptive Logs discards lines before they reach Loki, and marks the
+affected streams with an `__adaptive_logs_sampled__` label. That label was
+already on every stream Loki returned; nothing read it, so a stream that was
+dropping lines looked exactly like a complete one.
+
+`grafana_query`, `grafana_logs_context` and `grafana_logs_noise` now report
+`adaptive_logs_sampling` whenever any matched stream carries it, with the label's
+value. Counts from a sampled stream are lower bounds. Multi-line content suffers
+worst: an exception header can survive while its stack frames are dropped, which
+reads as a truncated log rather than as a retention rule someone can lift — a
+per-cluster/job exemption can be requested from the Platform team.
 
 ### Which datasources `grafana_query` will touch
 

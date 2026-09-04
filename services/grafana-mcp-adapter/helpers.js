@@ -135,6 +135,10 @@ function summarizeLogFrames(frames, { maxStreams, maxSampleLines, maxLineChars, 
     distinct_line_kinds: kinds.length,
     sample_kinds_truncated: kinds.length > maxSampleLines ? kinds.length - maxSampleLines : 0,
   };
+  // Computed over ALL streams, not the reported slice — a sampled stream that
+  // fell outside maxStreams is still dropping lines from the counts above.
+  const sampling = detectSampling(all);
+  if (sampling) digest.adaptive_logs_sampling = sampling;
   if (Object.keys(stats).length) digest.stats = stats;
 
   const limitReached = Number.isFinite(limit) && lineCount >= limit;
@@ -959,4 +963,175 @@ export function rankClientSuggestions(values = [], client = "") {
     .filter((x) => x.contains || x.bestDist <= Math.max(1, Math.ceil(needle.length / 3)))
     .sort((a, b) => Number(b.contains) - Number(a.contains) || a.bestDist - b.bestDist);
   return [...new Set(scored.map((x) => x.v))].slice(0, 10);
+}
+
+// ---------------------------------------------------------------------------
+// HTTP request logs
+// ---------------------------------------------------------------------------
+
+// Where a customer's HTTP request logs actually live.
+//
+// This is the single most costly gap the adapter had. Every customer-scoped tool
+// resolves `client` to the customer's OWN namespaces (`acme-prod`,
+// `apim-dp-<cp>-<dp>`), and those namespaces hold application logs only. The
+// access logs — status code, request duration, upstream response time — are
+// emitted by the shared ingress controller, which runs in the `ingress-nginx`
+// namespace and is identified by the CLUSTER label. No namespace-scoped query
+// can ever reach them.
+//
+// The consequence is not a missing feature but a wrong answer: an investigation
+// asks "is the Management API slow for this customer", every namespace-scoped
+// probe comes back empty, and the empty results read as evidence that the data
+// does not exist. It does exist, one label away.
+export const INGRESS_JOB = "flow/ingress-nginx-ingress-nginx";
+
+// The ingress access-log line, as Loki's `pattern` parser.
+//
+// Verified against live lines on both cluster kinds. `pattern` is used rather
+// than the fifteen-group `regexp` this is usually written with: it is markedly
+// cheaper (no backtracking), and it is readable enough that the next person can
+// see what is being extracted. `<_>` discards a field without naming it, so only
+// the fields worth filtering or reporting on become labels — naming all fifteen
+// would put the remote address and referer into every series key.
+//
+// Fields kept: method, path, status, user_agent, request_time, upstream,
+// upstream_time, upstream_status.
+//
+// upstream_time earns its place: the gap between it and request_time is where
+// the time actually went (backend versus ingress or client), and on a client
+// timeout it is the only number that says how long the backend had got to. So
+// does upstream_status, which is `-` exactly when the client hung up before the
+// backend answered — the signature of a 499.
+//
+// The trailing `<_>` absorbs everything after upstream_status, which differs
+// between clusters (some append scheme and forwarded addresses, some stop at the
+// request id) — anchoring past it would silently match nothing on half the
+// estate. Verified both shapes: this pattern and one truncated at `[<upstream>]`
+// match exactly the same lines, so the extra fields cost no coverage.
+export const NGINX_PATTERN =
+  '<_> - <_> [<_>] "<method> <path> <_>" <status> <_> "<_>" "<user_agent>" <_> <request_time> ' +
+  "[<upstream>] <_> <_> <_> <upstream_time> <upstream_status> <_>";
+
+// Grafana Adaptive Logs marks a sampled stream with this label. Its presence
+// means lines were DISCARDED before reaching Loki.
+export const ADAPTIVE_LOGS_LABEL = "__adaptive_logs_sampled__";
+
+// Translate a status filter into a LogQL label matcher.
+// Accepts a code (`499`), a class (`5xx`), or a comma/space separated list of
+// either. Label matchers are fully anchored in LogQL, so `5..` matches exactly a
+// three-digit 5xx and cannot spill into other fields.
+export function statusFilterExpr(statusFilter) {
+  const terms = String(statusFilter || "")
+    .split(/[,\s]+/)
+    .filter(Boolean);
+  if (!terms.length) return "";
+  const patterns = terms.map((term) => {
+    const klass = /^([1-5])xx$/i.exec(term);
+    if (klass) return `${klass[1]}..`;
+    if (/^[1-5]\d{2}$/.test(term)) return term;
+    throw new Error(
+      `Unrecognised status_filter "${term}". Use a status code (499), a class (5xx), or a list ("499, 5xx").`,
+    );
+  });
+  return ` | status =~ \`${patterns.join("|")}\``;
+}
+
+// Build the LogQL for ingress access logs on one cluster.
+//
+// `upstreamNamespaces` scopes the result to one customer. It is REQUIRED on a
+// cluster that hosts more than one tenant and pointless on a dedicated one, so
+// the caller decides — see resolveIngressScope in server.js, which decides from
+// what is actually deployed on the cluster rather than from a naming convention.
+export function buildIngressQuery({
+  cluster,
+  upstreamNamespaces = [],
+  pathFilter,
+  statusFilter,
+  method,
+  minDurationSeconds,
+} = {}) {
+  if (!cluster) throw new Error("cluster is required");
+  const ns = [...new Set((upstreamNamespaces || []).filter(Boolean))];
+  const alternation = ns.map((n) => escapeRegex(n)).join("|");
+
+  const parts = [`{cluster=\`${cluster}\`, job=\`${INGRESS_JOB}\`}`];
+  // A line filter runs on raw bytes, before the parser, so this cuts the volume
+  // the pattern parser has to touch. It is an optimisation only — the authority
+  // is the `upstream` matcher below, which cannot be fooled by the namespace
+  // name appearing somewhere else in the line.
+  if (ns.length) parts.push(` |~ \`\\[(${alternation})-\``);
+  parts.push(` | pattern \`${NGINX_PATTERN}\``);
+  if (ns.length) parts.push(` | upstream =~ \`(${alternation})-.*\``);
+  if (method) parts.push(` | method = \`${String(method).toUpperCase()}\``);
+  if (statusFilter) parts.push(statusFilterExpr(statusFilter));
+  // Case-insensitive for the same reason line filters are: a wrong-case path
+  // fragment returns a clean, believable, empty result.
+  if (pathFilter) parts.push(` | path =~ \`(?i).*${escapeRegex(pathFilter)}.*\``);
+  if (Number.isFinite(minDurationSeconds) && minDurationSeconds > 0) {
+    parts.push(` | request_time > ${minDurationSeconds}`);
+  }
+  return parts.join("");
+}
+
+// Report that Adaptive Logs is discarding lines from these streams.
+//
+// The label is already on every stream Loki returns; nothing read it, so a
+// sampled stream was indistinguishable from a complete one. That matters most
+// exactly where it is least visible: a stack trace arrives as separate Loki
+// entries, so sampling can keep the exception header and drop its frames,
+// producing a truncated trace that reads as "the log is incomplete" rather than
+// "these lines were deliberately discarded, and an exemption can be requested".
+export function detectSampling(streams = []) {
+  const values = new Set();
+  let sampled = 0;
+  for (const s of streams) {
+    const v = s?.labels?.[ADAPTIVE_LOGS_LABEL];
+    if (v !== undefined && v !== null && String(v) !== "") {
+      sampled++;
+      values.add(String(v));
+    }
+  }
+  if (!sampled) return null;
+  return {
+    sampled_streams: sampled,
+    total_streams: streams.length,
+    label_values: [...values].sort(),
+    warning:
+      `Grafana Adaptive Logs is sampling ${sampled} of ${streams.length} matched streams ` +
+      `(${ADAPTIVE_LOGS_LABEL} = ${[...values].sort().join(", ")}), so lines were discarded before they ` +
+      "reached Loki. Counts from this stream are LOWER BOUNDS, not totals. Multi-line content is affected " +
+      "worst: an exception header can survive while its stack frames are dropped, which looks like a " +
+      "truncated log rather than a sampling rule. A per-cluster/job exemption can be requested from the " +
+      "Platform team.",
+  };
+}
+
+// Describe what a query did and did not search.
+//
+// Derived from the selector actually sent, not from the caller's intent, so it
+// cannot drift out of step with it. The point is narrow: a negative from a
+// customer-scoped query and a negative from a cluster-wide one are reported
+// identically today, and the difference between them is entire categories of
+// infrastructure. Stating the scope alongside the verdict makes the premise
+// visible at the moment it is being relied on, instead of leaving every caller
+// to remember that `client` means "application logs only".
+export function scopeNote(query = "") {
+  const q = String(query || "");
+  const namespaceScoped = /(^|[{,\s])namespace\s*=~?/.test(q);
+  const clusterScoped = /(^|[{,\s])cluster\s*=~?/.test(q);
+  if (clusterScoped) {
+    return (
+      "Scoped to the whole cluster, so shared infrastructure IS included — and on a multi-tenant cluster " +
+      "that means other customers' traffic unless the query narrows it further."
+    );
+  }
+  if (namespaceScoped) {
+    return (
+      "Scoped to customer namespaces: APPLICATION logs only. Shared cluster infrastructure was NOT " +
+      "searched — ingress-nginx, cert-manager and other cluster-level namespaces are outside this scope. " +
+      "HTTP request logs (status codes, request durations, upstream response times) live in the ingress " +
+      "namespace and are NOT covered here; use grafana_http_requests for those."
+    );
+  }
+  return null;
 }

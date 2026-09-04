@@ -834,3 +834,128 @@ test("grafana_query: fails closed when the datasource cannot be resolved", async
   }
 });
 
+
+// ---------------------------------------------------------------------------
+// grafana_http_requests: the data no namespace-scoped tool can reach
+// ---------------------------------------------------------------------------
+
+// Route /series by what is being asked for: "which cluster holds these
+// namespaces" and "what else runs on this cluster" are the same endpoint with
+// different matchers.
+function seriesRouter({ namespaceToCluster = {}, clusterNamespaces = {} }) {
+  return (url) => {
+    const u = decodeURIComponent(String(url));
+    const byCluster = /match\[\]=\{cluster/.test(u);
+    if (byCluster) {
+      const cluster = /cluster=`([^`]+)`/.exec(u)?.[1];
+      return (clusterNamespaces[cluster] || []).map((namespace) => ({ namespace, cluster }));
+    }
+    return Object.entries(namespaceToCluster).map(([namespace, cluster]) => ({ namespace, cluster }));
+  };
+}
+
+test("grafana_http_requests: a dedicated cluster is queried whole, with no upstream filter", async () => {
+  await withLokiStub(
+    {
+      [NS_VALUES]: ["acme-prod", "acme-uat"],
+      [SERIES]: seriesRouter({
+        namespaceToCluster: { "acme-prod": "gravitee-acme-aks-cluster", "acme-uat": "gravitee-acme-aks-cluster" },
+        // Only this customer's namespaces, plus infrastructure that runs on
+        // every cluster and says nothing about tenancy.
+        clusterNamespaces: {
+          "gravitee-acme-aks-cluster": ["acme-prod", "acme-uat", "ingress-nginx", "kube-system"],
+        },
+      }),
+    },
+    async () => {
+      const out = await callTool("grafana_http_requests", { client: "acme", from: "now-1h" });
+      assert.equal(out.cluster, "gravitee-acme-aks-cluster");
+      assert.equal(out.scope.single_tenant_cluster, true);
+      assert.equal(out.scope.tenancy, "dedicated");
+      // Nothing to narrow to: the cluster's ingress stream IS this customer's
+      // request log, including requests rejected before an upstream was chosen.
+      assert.ok(!out.queries.counts.includes("upstream =~"), out.queries.counts);
+      assert.ok(out.queries.counts.includes('job=`flow/ingress-nginx-ingress-nginx`'), out.queries.counts);
+    },
+  );
+});
+
+test("grafana_http_requests: a shared cluster is narrowed to the customer's upstreams", async () => {
+  await withLokiStub(
+    {
+      [NS_VALUES]: ["acme-prod"],
+      [SERIES]: seriesRouter({
+        namespaceToCluster: { "acme-prod": "shared-core-us-prod" },
+        clusterNamespaces: {
+          "shared-core-us-prod": ["acme-prod", "orbit-prod", "beacon-prod", "ingress-nginx"],
+        },
+      }),
+    },
+    async () => {
+      const out = await callTool("grafana_http_requests", { client: "acme", from: "now-1h" });
+      assert.equal(out.scope.single_tenant_cluster, false);
+      assert.equal(out.scope.tenancy, "shared");
+      assert.equal(out.scope.other_tenants_on_cluster, 2);
+      // The boundary that matters: a cluster-wide ingress query here would
+      // return orbit's and beacon's requests under acme's name.
+      assert.ok(out.queries.counts.includes("| upstream =~ `(acme-prod)-.*`"), out.queries.counts);
+      // ...and the cost of that filter is stated rather than hidden.
+      assert.match(out.scope.note, /before an upstream was chosen/);
+    },
+  );
+});
+
+test("grafana_http_requests: refuses to aggregate two clusters into one distribution", async () => {
+  await withLokiStub(
+    {
+      [NS_VALUES]: ["acme-prod", "acme-apac"],
+      [SERIES]: seriesRouter({
+        namespaceToCluster: { "acme-prod": "gravitee-acme-aks-cluster", "acme-apac": "gravitee-acme-apac-aks-cluster" },
+      }),
+    },
+    async () => {
+      const out = await callTool("grafana_http_requests", { client: "acme", from: "now-1h" });
+      assert.deepEqual(out.clusters, ["gravitee-acme-aks-cluster", "gravitee-acme-apac-aks-cluster"]);
+      assert.match(out.note, /describe neither/);
+      assert.equal(out.queries, undefined, "no query should have run");
+    },
+  );
+});
+
+test("grafana_http_requests: says so when the cluster cannot be resolved", async () => {
+  await withLokiStub({ [NS_VALUES]: [], [SERIES]: [] }, async () => {
+    const out = await callTool("grafana_http_requests", { client: "nosuchcustomer", from: "now-1h" });
+    // Not an empty result set dressed as an answer.
+    assert.match(out.note, /Could not resolve a cluster/);
+  });
+});
+
+test("grafana_http_requests: requires a customer or a cluster", async () => {
+  await assert.rejects(() => callTool("grafana_http_requests", { from: "now-1h" }), /client .* or cluster/);
+});
+
+// ---------------------------------------------------------------------------
+// grafana_find_customer: the cluster label, and what it unlocks
+// ---------------------------------------------------------------------------
+
+test("grafana_find_customer: returns the cluster and points at the ingress job", async () => {
+  // The gap this closes: every other tool takes `client` and scopes to these
+  // namespaces, which hold application logs only. Without the cluster there is
+  // no route at all from a customer name to their HTTP request logs.
+  await withLokiStub(
+    {
+      [NS_VALUES]: ["acme-prod", "acme-uat"],
+      [SERIES]: seriesRouter({
+        namespaceToCluster: { "acme-prod": "gravitee-acme-aks-cluster", "acme-uat": "gravitee-acme-aks-cluster" },
+      }),
+    },
+    async () => {
+      const out = await callTool("grafana_find_customer", { query: "acme" });
+      assert.deepEqual(out.hosted_namespaces, ["acme-prod", "acme-uat"]);
+      assert.deepEqual(out.hosted_clusters, ["gravitee-acme-aks-cluster"]);
+      assert.deepEqual(out.clusters, ["gravitee-acme-aks-cluster"]);
+      assert.match(out.http_request_logs_note, /flow\/ingress-nginx-ingress-nginx/);
+      assert.match(out.http_request_logs_note, /grafana_http_requests/);
+    },
+  );
+});
