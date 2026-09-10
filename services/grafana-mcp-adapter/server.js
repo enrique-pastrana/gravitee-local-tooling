@@ -1881,7 +1881,7 @@ registerTool(
     "On a multi-tenant cluster results are narrowed to this customer's upstreams, so they cannot include " +
     "another tenant's traffic. Adaptive Logs sampling is reported when present; counts are then lower " +
     "bounds. Prefer this over grepping the raw stream: `|= \" 499 \"` also matches request sizes of 499 " +
-    "bytes, while status_filter matches the parsed field only. compare_offset (1d, 7d) adds per-status baseline counts, ratios and p95 from the same window that much earlier — so a chronic 499 pattern reads as similar, not as incident impact.",
+    "bytes, while status_filter matches the parsed field only. compare_offset (1d, 7d) adds per-status baseline counts, ratios and p95 from the same window that much earlier — so a chronic 499 pattern reads as already_present, not as incident impact.",
   {
     client: z
       .string()
@@ -2264,6 +2264,7 @@ registerTool(
               row.baseline_count = cmp.baseline;
               row.ratio = cmp.ratio;
               row.change = cmp.change;
+              row.already_present = cmp.already_present;
               if (bP95Map.has(k)) row.baseline_p95_seconds = r3(bP95Map.get(k));
             }
           }
@@ -2280,7 +2281,8 @@ registerTool(
             total: totalCmp,
             note: describeChange(totalCmp, compare_offset, "request volume"),
             ...(onlyInBaseline.length ? { only_in_baseline: onlyInBaseline } : {}),
-            per_status: "Each by_ingress status row carries baseline_count, ratio, change and baseline_p95_seconds.",
+            per_status:
+              "Each by_ingress status row carries baseline_count, ratio, change, already_present and baseline_p95_seconds.",
             change_labels: CHANGE_LABELS_NOTE,
           };
         }

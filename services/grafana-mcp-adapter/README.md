@@ -136,14 +136,22 @@ limit-1 query, and a per-minute ramp around it. Two things it will not do:
 
 `grafana_query`, `grafana_logs_trend` and `grafana_http_requests` take
 `compare_offset` (`1d`, `7d`, `1w`). The identical query runs again over the
-same-length window that much earlier, and each result is labelled against it:
-`similar` (within x0.5-x2), `higher`, `lower`, `new`, `gone`, `none`, or
-`no_baseline`.
+same-length window that much earlier, and each result answers two questions
+separately:
+
+- `already_present` — did this exist in the baseline at all? This is the
+  "was it already happening?" answer.
+- `change` — did its level move? `similar` (within x0.75-x1.33), `higher`,
+  `lower`, `new`, `gone`, `none`, or `no_baseline`.
 
 It exists because a baseline taken earlier the same day — a quieter hour — made a
 chronic 499 pattern and pre-existing restarts read as incident impact. A fixed
-offset compares the same time of day. `similar` means *this was already
-happening*.
+offset compares the same time of day.
+
+The two are kept apart because one label cannot carry both. With a single
+x0.5-x2 "similar" band, a halving came back "similar ... already happening then":
+right about presence, wrong about level. Now it is `lower` and `already_present`
+— not new, but not at the same level either.
 
 - The window is shifted rather than the query rewritten with `offset`
   modifiers, so it is exact for every datasource and query shape.

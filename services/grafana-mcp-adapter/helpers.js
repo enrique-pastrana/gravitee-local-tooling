@@ -1503,13 +1503,20 @@ export function rollupByNode(rows = []) {
 // existing offsets, languages without the modifier); shifting the window is
 // exact for every datasource.
 
-export const CHANGE_THRESHOLD = 2;
+// "Similar" is a claim about LEVEL, and it used to be the only thing a comparison
+// said. With a x0.5-x2 band a halving came back "similar ... already happening
+// then" — true about presence, misleading about level. The two questions are
+// answered separately now: `already_present` says whether the pattern existed in
+// the baseline at all; `change` says whether its level moved, with a band tight
+// enough that a halving is "lower". The band is symmetric: 0.75 = 1 / (4/3).
+export const SIMILAR_BAND = Object.freeze({ low: 0.75, high: 4 / 3 });
 
 export const CHANGE_LABELS_NOTE =
-  "change compares against the baseline: similar = within x0.5-x2 (already present then, so not new in " +
-  "this window); higher >= x2; lower <= x0.5; new = absent then while the streams existed; gone = absent now; " +
-  "none = absent in both; no_baseline = no data at all in the baseline window (outside retention, or not yet " +
-  "deployed), which is evidence of nothing.";
+  "change compares the LEVEL against the baseline: similar = within x0.75-x1.33; higher above that; lower below " +
+  "it; new = absent then while the streams existed; gone = absent now; none = absent in both; no_baseline = no " +
+  "data at all in the baseline window (outside retention, or not yet deployed), which is evidence of nothing. " +
+  "already_present answers separately whether it existed in the baseline at all: a pattern can be lower AND " +
+  "already present, which means not new, but not at the same level either.";
 
 export function parseCompareOffset(offset, { windowSeconds } = {}) {
   const raw = String(offset ?? "").trim().toLowerCase();
@@ -1540,14 +1547,16 @@ export function compareValues(current, baseline, { baselineAvailable = true } = 
   const b = Number(baseline) || 0;
   // A baseline window with no data at all is not a baseline of zero. Calling
   // that "new" would turn retention limits into findings.
-  if (!baselineAvailable) return { current: c, baseline: null, ratio: null, change: "no_baseline" };
-  if (b === 0) return { current: c, baseline: b, ratio: null, change: c === 0 ? "none" : "new" };
-  const ratio = Math.round((c / b) * 100) / 100;
+  if (!baselineAvailable) {
+    return { current: c, baseline: null, ratio: null, change: "no_baseline", already_present: null };
+  }
+  if (b === 0) return { current: c, baseline: b, ratio: null, change: c === 0 ? "none" : "new", already_present: false };
+  const r = c / b;
   let change = "similar";
   if (c === 0) change = "gone";
-  else if (c / b >= CHANGE_THRESHOLD) change = "higher";
-  else if (c / b <= 1 / CHANGE_THRESHOLD) change = "lower";
-  return { current: c, baseline: b, ratio, change };
+  else if (r >= SIMILAR_BAND.high) change = "higher";
+  else if (r <= SIMILAR_BAND.low) change = "lower";
+  return { current: c, baseline: b, ratio: Math.round(r * 100) / 100, change, already_present: true };
 }
 
 export function describeChange(cmp, offset, subject = "the volume") {
@@ -1556,9 +1565,15 @@ export function describeChange(cmp, offset, subject = "the volume") {
     case "similar":
       return `${s} ${offset} earlier was similar (x${cmp.ratio}): this was already happening then, so do not read it as new in this window.`;
     case "higher":
-      return `${s} is x${cmp.ratio} what it was ${offset} earlier.`;
+      return (
+        `${s} is x${cmp.ratio} what it was ${offset} earlier: higher. It was already present then, so this is an ` +
+        "increase in an existing pattern, not a new one."
+      );
     case "lower":
-      return `${s} is x${cmp.ratio} what it was ${offset} earlier: below the baseline.`;
+      return (
+        `${s} is x${cmp.ratio} what it was ${offset} earlier: lower. It was already present then: not new in this ` +
+        "window, but not at the same level either."
+      );
     case "new":
       return `None ${offset} earlier, although the streams existed then: this is new since the baseline.`;
     case "gone":

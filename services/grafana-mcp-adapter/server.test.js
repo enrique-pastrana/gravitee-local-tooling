@@ -1409,6 +1409,9 @@ test("grafana_http_requests: compare_offset labels each status against the same 
       assert.equal(rows["499"].change, "similar");
       assert.equal(rows["499"].baseline_count, 2100);
       assert.equal(rows["502"].change, "new");
+      // Presence is answered separately from level.
+      assert.equal(rows["499"].already_present, true);
+      assert.equal(rows["502"].already_present, false);
       assert.equal(out.comparison.total.change, "similar");
     },
   );

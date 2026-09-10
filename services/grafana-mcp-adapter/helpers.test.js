@@ -1736,7 +1736,7 @@ test("parseCompareOffset: days, weeks, and a refusal to overlap the window", () 
 });
 
 test("compareValues: labels the change, and never calls a missing baseline 'new'", () => {
-  assert.deepEqual(compareValues(215, 210), { current: 215, baseline: 210, ratio: 1.02, change: "similar" });
+  assert.deepEqual(compareValues(215, 210), { current: 215, baseline: 210, ratio: 1.02, change: "similar", already_present: true });
   assert.equal(compareValues(500, 100).change, "higher");
   assert.equal(compareValues(10, 100).change, "lower");
   assert.equal(compareValues(0, 100).change, "gone");
@@ -1881,4 +1881,22 @@ test("applyEdgeCounts: exact edge counts replace Loki's; a failed one is flagged
   assert.equal(out[2].count, 5);
   assert.equal(out[2].partial.count_exact, false);
   assert.equal(summarizeTrend(out).onset, "t1");
+});
+
+test("compareValues: a halving is lower, and still already present", () => {
+  // Live: a total at x0.53 of the day before read "similar ... already happening
+  // then". True about presence, wrong about level.
+  const halved = compareValues(41462, 78410);
+  assert.equal(halved.change, "lower");
+  assert.equal(halved.already_present, true);
+  assert.match(describeChange(halved, "1d", "request volume"), /lower.*already present/);
+  // The band is x0.75-x1.33.
+  assert.equal(compareValues(130, 102).change, "similar"); // x1.27
+  assert.equal(compareValues(140, 102).change, "higher"); // x1.37
+  assert.equal(compareValues(76, 100).change, "similar");
+  assert.equal(compareValues(75, 100).change, "lower");
+  // Presence is its own answer, and unknown when there is no baseline.
+  assert.equal(compareValues(12, 0).already_present, false);
+  assert.equal(compareValues(0, 100).already_present, true);
+  assert.equal(compareValues(12, 0, { baselineAvailable: false }).already_present, null);
 });
