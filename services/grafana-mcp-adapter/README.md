@@ -35,6 +35,7 @@ not chained to one another.
 | `grafana_logs_link` | Build a shareable Grafana logs link for a customer's logs. Discovers matching streams via Loki's `/series` (label sets only, no log lines) to scope the link. Defaults to Logs Drilldown links (per-namespace); pass `link_style="explore"` for a raw LogQL Explore link. |
 | `grafana_logs_context` | Every line around a moment in time, **unfiltered** — "what else was happening right then". Refuses a line filter, because a filter is what hides the continuation lines. |
 | `grafana_logs_noise` | What is actually filling a stream: lines reduced to their shape, ranked, each with a pasteable LogQL exclusion. Covers what pattern detection cannot see below its floor. |
+| `grafana_first_occurrence` | "When did this start?" — the exact first matching line (to the nanosecond), a per-minute ramp around it, and whether the pattern was already running before the window. |
 | `grafana_find_customer` | Which customer or deployment is this, by name or by id — and **which cluster** they are on. Touches no logs. |
 | `grafana_http_requests` | HTTP request logs from both ingress controllers: status distribution, latency percentiles, retries, and failures per upstream pod and node. The only tool that can reach them (see below). |
 
@@ -108,6 +109,28 @@ points per series — unreadable in the digest and over the tool-result limit ra
 `grafana_query` now sends `intervalMs` from `max_data_points` (or an explicit
 `step`), reports `step_seconds`, and `output="timeline"` returns
 `[timestamp, value]` pairs so you can see *when* something changed.
+
+### Onset: the first line, not the first bucket
+
+Loki stamps a `count_over_time` point at the **end** of the interval it counts: at
+a 5m step, the point stamped 17:15 holds the lines from (17:10, 17:15]. Filed under
+its own stamp, every trend bucket read one interval late — an onset read off
+5-minute buckets came out at 10:35 for an error that began at 10:30. Buckets are
+now labelled by the **start** of their interval (every result with buckets says so
+in `bucket_covers`), and the range query asks for one step past the end so the
+final interval is counted.
+
+A bucket still only says "somewhere in this interval". `grafana_first_occurrence`
+finds the onset bucket, then the exact first line inside it with a forward,
+limit-1 query, and a per-minute ramp around it. Two things it will not do:
+
+- **Call a window edge an onset.** It counts the minutes before `from`; if the
+  pattern was already occurring, the result says the first line marks where the
+  *window* starts and to widen `from`.
+- **Treat the first line that reached Loki as the first line written.** On a
+  sampled stream the true first occurrence can be earlier, and the result says so.
+
+`first_occurrence.ns` goes straight into `grafana_logs_context` as `at`.
 
 ### Compare against the same window, earlier
 

@@ -732,8 +732,13 @@ export function buildTrendBuckets(points = [], { startSeconds, endSeconds, stepS
     const t = Number(point?.[0]);
     const v = Number(point?.[1]);
     if (!Number.isFinite(t) || !Number.isFinite(v)) continue;
-    // Snap to the grid rather than trusting Loki's alignment to match ours.
-    const slot = Math.floor(t / stepSeconds) * stepSeconds;
+    // Loki stamps a count_over_time point at the END of the interval it counts:
+    // at a 5m step the point stamped 17:15 holds the lines from (17:10, 17:15].
+    // Filing it under its own stamp presented every bucket one interval late, so
+    // an onset read off 5-minute buckets came out at 10:35 for an error that began
+    // at 10:30. Verified live: a line at 17:13:33 is counted in the 17:15 point.
+    // Filed under the interval's start instead; off-grid stamps snap to the grid.
+    const slot = Math.ceil(t / stepSeconds) * stepSeconds - stepSeconds;
     counts.set(slot, (counts.get(slot) || 0) + v);
   }
   const first = Math.floor(startSeconds / stepSeconds) * stepSeconds;
@@ -1621,4 +1626,72 @@ export function attachBaselineTimeline(current = {}, baseline = {}, offsetSecond
     }
   }
   return current;
+}
+
+// What a trend bucket's time means, stated in every result that has buckets.
+export const BUCKET_COVERS_NOTE =
+  "Each bucket's time is the START of the interval it counts: [time, time + interval). Loki stamps a " +
+  "count_over_time point at the END of its interval; buckets are relabelled so an onset is not reported one " +
+  "interval late. For the exact first line, use grafana_first_occurrence.";
+
+// The earliest line across every stream Loki returned. Loki orders a forward
+// query per stream, so the minimum has to be taken across streams.
+export function earliestLine(result = [], { maxLineChars = 1000 } = {}) {
+  let best = null;
+  for (const r of result || []) {
+    for (const [ns, line] of r?.values || []) {
+      let n;
+      try {
+        n = BigInt(ns);
+      } catch {
+        continue;
+      }
+      if (!best || n < best.n) best = { n, line, labels: r?.stream || {} };
+    }
+  }
+  if (!best) return null;
+  const text = String(best.line ?? "");
+  return {
+    time: new Date(Number(best.n / 1000000n)).toISOString(),
+    ns: best.n.toString(),
+    line: text.length > maxLineChars ? `${text.slice(0, maxLineChars)}…[truncated]` : text,
+    labels: best.labels,
+  };
+}
+
+// What the first line in a window does and does not establish.
+//
+// Two traps. A window edge is not an onset: if the pattern was already running
+// before `from`, the first line in the window marks where the window starts, and
+// presenting it as "when this started" is the same class of error as reading a
+// chronic pattern as incident impact. And on a sampled stream the first line
+// that reached Loki need not be the first line written.
+export function describeOnset({ firstTimeIso, windowStartIso, preWindowMinutes, preWindowLines, sampling } = {}) {
+  const alreadyPresent = Number(preWindowLines) > 0;
+  const parts = [];
+  if (alreadyPresent) {
+    parts.push(
+      `Not an onset: ${preWindowLines} matching line(s) in the ${preWindowMinutes} minutes before the window ` +
+        `(${windowStartIso}). The first line inside the window marks where the WINDOW starts, not where this ` +
+        "started. Widen from to find the real first occurrence.",
+    );
+  } else if (preWindowLines === null || preWindowLines === undefined) {
+    parts.push(
+      `First matching line in the window: ${firstTimeIso}. The minutes before the window could not be checked, ` +
+        "so this may not be the first occurrence overall.",
+    );
+  } else {
+    parts.push(
+      `First occurrence: ${firstTimeIso}, with none earlier in the window and none in the ${preWindowMinutes} ` +
+        "minutes before it.",
+    );
+  }
+  if (sampling) {
+    parts.push(
+      `Adaptive Logs is sampling these streams (${(sampling.label_values || []).join(", ")}): this is the earliest ` +
+        "line that REACHED Loki. The true first occurrence can be earlier, and at low volume the first minutes are " +
+        "the likeliest to be missing.",
+    );
+  }
+  return { already_present_before_window: alreadyPresent, note: parts.join(" ") };
 }

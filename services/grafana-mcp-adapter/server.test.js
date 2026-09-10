@@ -1422,3 +1422,130 @@ test("grafana_http_requests: compare_offset in sample mode is refused", async ()
     );
   });
 });
+
+// ---------------------------------------------------------------------------
+// grafana_first_occurrence, and trend bucket semantics
+// ---------------------------------------------------------------------------
+
+const ONSET_FROM = "2026-09-10T14:00:00Z";
+const ONSET_TO = "2026-09-10T20:00:00Z";
+const atS = (isoStr) => Date.parse(isoStr) / 1000;
+const nsOf = (isoStr) => (BigInt(Date.parse(isoStr)) * 1000000n).toString();
+
+async function withOnsetStub({ coarse = [], first = null, ramp = [], preWindow = 0 }, fn) {
+  const orig = globalThis.fetch;
+  const calls = { coarse: 0, narrow: [], ramp: 0, instant: [] };
+  globalThis.fetch = (url) => {
+    const u = String(url);
+    if (u.includes(NS_VALUES)) return jsonResponse(["acme-prod"]);
+    if (u.includes(SERIES)) return jsonResponse([]);
+    if (u.includes("loki/api/v1/query_range")) {
+      const p = new URL(u).searchParams;
+      if (p.get("direction") === "forward" && p.get("limit") === "1") {
+        calls.narrow.push({
+          start: Number(BigInt(p.get("start")) / 1000000000n),
+          end: Number(BigInt(p.get("end")) / 1000000000n),
+        });
+        return jsonResponse({ resultType: "streams", result: first ? [{ stream: first.labels, values: [[first.ns, first.line]] }] : [] });
+      }
+      if (p.get("step") === "60") {
+        calls.ramp++;
+        return jsonResponse({ resultType: "matrix", result: ramp.length ? [{ metric: {}, values: ramp }] : [] });
+      }
+      calls.coarse++;
+      return jsonResponse({ resultType: "matrix", result: coarse.length ? [{ metric: {}, values: coarse }] : [] });
+    }
+    if (u.includes("loki/api/v1/query")) {
+      calls.instant.push(new URL(u).searchParams.get("query"));
+      return jsonResponse({ resultType: "vector", result: preWindow ? [{ metric: {}, value: [0, String(preWindow)] }] : [] });
+    }
+    return jsonResponse([]);
+  };
+  try {
+    return await fn(calls);
+  } finally {
+    globalThis.fetch = orig;
+  }
+}
+
+const FIRST_LINE = {
+  ns: nsOf("2026-09-10T17:13:33.676Z"),
+  line: "java.lang.OutOfMemoryError: Java heap space",
+  labels: { namespace: "acme-prod", pod: "gw-a" },
+};
+
+test("grafana_first_occurrence: the exact first line inside the onset bucket, not the bucket's end", async () => {
+  await withOnsetStub(
+    {
+      // Loki stamps a 15m count at the END of its interval: 17:15 holds (17:00, 17:15].
+      coarse: [[atS("2026-09-10T17:15:00Z"), "1"], [atS("2026-09-10T18:00:00Z"), "4"]],
+      first: FIRST_LINE,
+      ramp: [[atS("2026-09-10T17:14:00Z"), "1"], [atS("2026-09-10T17:16:00Z"), "3"]],
+    },
+    async (calls) => {
+      const out = await callTool("grafana_first_occurrence", { client: "acme", line_filter: "OutOfMemoryError", from: ONSET_FROM, to: ONSET_TO });
+      assert.equal(out.first_occurrence.time, "2026-09-10T17:13:33.676Z");
+      assert.equal(out.first_occurrence.ns, FIRST_LINE.ns);
+      assert.equal(out.search.onset_bucket, "2026-09-10T17:00:00.000Z");
+      // The narrow search spans the whole onset interval.
+      const n = calls.narrow[0];
+      assert.ok(n.start <= atS("2026-09-10T17:00:00Z") && n.end >= atS("2026-09-10T17:15:00Z"), JSON.stringify(n));
+      const byTime = Object.fromEntries(out.ramp.buckets.map((b) => [b.time, b.count]));
+      assert.equal(byTime["2026-09-10T17:13:00.000Z"], 1);
+      assert.equal(byTime["2026-09-10T17:12:00.000Z"], 0);
+      assert.equal(out.already_present_before_window, false);
+      assert.match(out.note, /First occurrence: 2026-09-10T17:13:33.676Z/);
+      assert.match(out.first_occurrence.next_step, /grafana_logs_context/);
+    },
+  );
+});
+
+test("grafana_first_occurrence: a pattern already running before the window is not called an onset", async () => {
+  await withOnsetStub(
+    {
+      coarse: [[atS("2026-09-10T14:15:00Z"), "9"]],
+      first: { ...FIRST_LINE, ns: nsOf("2026-09-10T14:00:02.000Z") },
+      preWindow: 42,
+    },
+    async () => {
+      const out = await callTool("grafana_first_occurrence", { client: "acme", line_filter: "OutOfMemoryError", from: ONSET_FROM, to: ONSET_TO });
+      assert.equal(out.already_present_before_window, true);
+      assert.equal(out.before_window.lines, 42);
+      assert.match(out.note, /Not an onset/);
+    },
+  );
+});
+
+test("grafana_first_occurrence: no matching lines is said plainly, and nothing is narrowed", async () => {
+  await withOnsetStub({}, async (calls) => {
+    const out = await callTool("grafana_first_occurrence", { client: "acme", line_filter: "never-logged", from: ONSET_FROM, to: ONSET_TO });
+    assert.equal(out.first_occurrence, null);
+    assert.match(out.note, /No matching lines/);
+    assert.equal(calls.narrow.length, 0);
+  });
+});
+
+test("grafana_first_occurrence: requires a line filter", async () => {
+  await assert.rejects(() => callTool("grafana_first_occurrence", { client: "acme" }), /line_filter is required/);
+});
+
+test("grafana_logs_trend: requests one extra step, so the final interval's count is returned", async () => {
+  const orig = globalThis.fetch;
+  let endParam = null;
+  globalThis.fetch = (url) => {
+    const u = String(url);
+    if (u.includes(NS_VALUES)) return jsonResponse(["acme-prod"]);
+    if (u.includes("loki/api/v1/query_range")) {
+      endParam = Number(BigInt(new URL(u).searchParams.get("end")) / 1000000000n);
+      return jsonResponse({ resultType: "matrix", result: [] });
+    }
+    return jsonResponse([]);
+  };
+  try {
+    const out = await callTool("grafana_logs_trend", { client: "acme", from: ONSET_FROM, to: ONSET_TO, interval: "1h" });
+    assert.equal(endParam, atS(ONSET_TO) + 3600);
+    assert.match(out.bucket_covers, /START of the interval/);
+  } finally {
+    globalThis.fetch = orig;
+  }
+});

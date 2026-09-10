@@ -59,6 +59,10 @@ import {
   compareQueryDigests,
   attachBaselineTimeline,
   CHANGE_LABELS_NOTE,
+  earliestLine,
+  describeOnset,
+  BUCKET_COVERS_NOTE,
+  lineFilterExpr,
 } from "./helpers.js";
 import { loadCustomerMap, warmCustomerMap, resolveCustomerNamespaces, matchCustomers, groupByCustomer, lookupById, dataPlaneNamespace, controlPlaneNamespace } from "./customerMap.js";
 
@@ -1277,7 +1281,7 @@ registerTool(
     "NOT COVERED by `client`: HTTP access logs — status codes, request durations, upstream response " +
     "times — come from the shared ingress controller at {cluster=\"<cluster>\", job=~\"flow/ingress-nginx-ingress-nginx|flow/app-routing-system-\"}, " +
     "NOT the customer's namespaces. Application logs are in the customer namespace; request logs are " +
-    "not. Use grafana_http_requests for those. compare_offset (1d, 7d) adds the same window that much earlier: a baseline count per bucket and a similar/higher/lower/new label on the total.",
+    "not. Use grafana_http_requests for those. compare_offset (1d, 7d) adds the same window that much earlier: a baseline count per bucket and a similar/higher/lower/new label on the total. Bucket times are interval STARTS, so onset is the start of the first non-empty interval; for the exact first line use grafana_first_occurrence.",
   {
     client: z.string().describe("Customer name fragment, e.g. 'april', 'demo qa'."),
     component: z.string().optional().describe("Component fragment, e.g. 'gateway', 'api'."),
@@ -1317,7 +1321,9 @@ registerTool(
       const data = await grafanaDatasourceProxyGet(uid, "loki/api/v1/query_range", {
         query,
         start: `${start * 1e9}`,
-        end: `${end * 1e9}`,
+        // One step past the end: the point covering the final interval is stamped
+        // after it, and would otherwise never be returned.
+        end: `${(end + stepSeconds) * 1e9}`,
         step,
       });
 
@@ -1335,7 +1341,7 @@ registerTool(
         const bData = await grafanaDatasourceProxyGet(uid, "loki/api/v1/query_range", {
           query,
           start: `${bStart}000000000`,
-          end: `${bEnd}000000000`,
+          end: `${bEnd + stepSeconds}000000000`,
           step,
         });
         const { points: bPoints } = collapseSampledMatrix(bData?.data?.result || []);
@@ -1366,6 +1372,7 @@ registerTool(
         interval: step,
         ...summary,
         ...(comparison ? { comparison } : {}),
+        bucket_covers: BUCKET_COVERS_NOTE,
         buckets,
       };
       if (trendSampling) result.adaptive_logs_sampling = trendSampling;
@@ -2287,7 +2294,7 @@ registerTool(
         const trendData = await lokiGet("trend", "loki/api/v1/query_range", {
           query: trendQuery,
           start: `${start}000000000`,
-          end: `${end}000000000`,
+          end: `${end + durationSeconds(step)}000000000`,
           step,
         });
         const buckets = buildTrendBuckets(trendData?.data?.result?.[0]?.values || [], {
@@ -2295,7 +2302,7 @@ registerTool(
           endSeconds: end,
           stepSeconds: durationSeconds(step),
         });
-        trend = { interval: step, ...summarizeTrend(buckets), buckets };
+        trend = { interval: step, ...summarizeTrend(buckets), bucket_covers: BUCKET_COVERS_NOTE, buckets };
       } catch (err) {
         partialFailures.push({ part: "trend", error: err.reason || err.message, query: err.query });
       }
@@ -2319,6 +2326,229 @@ registerTool(
           "cluster — pass control_plane_id for it.";
       }
       return textResult(result);
+    }),
+);
+
+registerTool(
+  "grafana_first_occurrence",
+  "Read-only: WHEN did this start — the earliest matching log line in a window, to the nanosecond, plus a " +
+    "per-minute ramp around it. Reading onset off trend buckets is imprecise by construction: a bucket can only " +
+    "say 'somewhere in this interval', and an onset read from 5-minute buckets was 5 minutes late in a real " +
+    "incident. This finds the onset bucket, then the exact first line inside it. " +
+    "It also counts the minutes BEFORE `from`: if the pattern was already occurring then, the first line in the " +
+    "window is only where the window starts, and the result says so instead of presenting the edge as an onset. " +
+    "Adaptive Logs sampling is reported: on a sampled stream this is the earliest line that REACHED Loki, and the " +
+    "true first occurrence can be earlier. " +
+    "Pass first_occurrence.ns as `at` to grafana_logs_context to read the lines around it, unfiltered. " +
+    "Scope by client (resolved like the other log tools) or by exact namespace/service_name. HTTP request logs " +
+    "are not in customer namespaces; use grafana_http_requests for those.",
+  {
+    line_filter: z.string().describe("What to find the first occurrence of: a substring of the log line. Required."),
+    case_sensitive: z
+      .boolean()
+      .default(false)
+      .optional()
+      .describe("Match line_filter case-sensitively. Default false, so a wrong-case filter does not read as absent."),
+    client: z.string().optional().describe("Customer name fragment. Omit if giving an exact namespace."),
+    component: z.string().optional().describe("Component fragment, e.g. 'gateway'."),
+    namespace: z.string().optional().describe("Exact namespace, e.g. from a previous result's streams."),
+    service_name: z.string().optional().describe("Exact service_name, to search one service rather than the namespace."),
+    control_plane_id: z.string().optional().describe("Narrow to one Cockpit organization (see grafana_find_customer)."),
+    from: z.string().default("now-24h").describe("Window start. Widen it if the result says the pattern predates it."),
+    to: z.string().default("now").describe("Window end."),
+    ramp_minutes_before: z
+      .number().int().min(0).max(60).default(10).optional()
+      .describe("Minutes of per-minute counts before the first line."),
+    ramp_minutes_after: z
+      .number().int().min(1).max(120).default(20).optional()
+      .describe("Minutes of per-minute counts after the first line."),
+  },
+  async ({
+    line_filter,
+    case_sensitive = false,
+    client,
+    component,
+    namespace,
+    service_name,
+    control_plane_id,
+    from = "now-24h",
+    to = "now",
+    ramp_minutes_before = 10,
+    ramp_minutes_after = 20,
+  }) =>
+    withToolLogging("grafana_first_occurrence", { client, namespace, from, to }, async () => {
+      const uid = requireDatasourceUid(LOGS_DATASOURCE_UID);
+      if (!line_filter || !String(line_filter).trim()) {
+        throw new Error("line_filter is required: the first occurrence of what? Without one, the answer is the window start.");
+      }
+      if (!client && !namespace) throw new Error("either client or namespace is required");
+
+      let logQuery;
+      let resolution = null;
+      if (namespace) {
+        const matchers = [`namespace="${namespace}"`];
+        if (service_name) matchers.push(`service_name="${service_name}"`);
+        logQuery = `{${matchers.join(", ")}}${lineFilterExpr(line_filter, { caseSensitive: case_sensitive })}`;
+      } else {
+        const resolved = await resolveCustomerSelector({
+          client,
+          component,
+          lineFilter: line_filter,
+          from,
+          controlPlaneId: control_plane_id,
+          caseSensitive: case_sensitive,
+        });
+        logQuery = resolved.selector;
+        resolution = resolved.resolution;
+      }
+      const selector = extractStreamSelector(logQuery);
+      const { start, end } = rangeSeconds(from, to);
+      if (end <= start) throw new Error("to must be after from.");
+      const isoS = (sec) => new Date(sec * 1000).toISOString();
+
+      const base = {
+        query: logQuery,
+        scope_applied: selector,
+        scope_note: scopeNote(selector),
+        ...(resolution ? resolutionReport(resolution) : {}),
+        range: { from, to },
+        resolved_window_utc: `${isoS(start)} .. ${isoS(end)}`,
+      };
+
+      // 1. Which interval did it start in? Coarse counts, grouped by the sampling
+      //    label so sampling is seen in the same read.
+      const step = chooseInterval(Math.max(end - start, 1));
+      const stepSeconds = durationSeconds(step);
+      const coarse = await grafanaDatasourceProxyGet(uid, "loki/api/v1/query_range", {
+        query: `sum by (${ADAPTIVE_LOGS_LABEL}) (count_over_time(${logQuery} [${step}]))`,
+        start: `${start}000000000`,
+        end: `${end + stepSeconds}000000000`,
+        step,
+      });
+      const { points, sampling: coarseSampling } = collapseSampledMatrix(coarse?.data?.result || []);
+      const buckets = buildTrendBuckets(points, { startSeconds: start, endSeconds: end, stepSeconds });
+      const trend = summarizeTrend(buckets);
+
+      // 2. Was it already happening before the window?
+      const beforeMinutes = Math.max(ramp_minutes_before, 10);
+      let preWindowLines = null;
+      try {
+        const pre = await grafanaDatasourceProxyGet(uid, "loki/api/v1/query", {
+          query: `sum(count_over_time(${logQuery} [${beforeMinutes * 60}s]))`,
+          time: `${start}000000000`,
+        });
+        preWindowLines = Number(pre?.data?.result?.[0]?.value?.[1] ?? 0);
+      } catch {
+        preWindowLines = null;
+      }
+      const beforeWindow = {
+        minutes: beforeMinutes,
+        lines: preWindowLines,
+        already_present: Number(preWindowLines) > 0,
+      };
+
+      if (!trend.total) {
+        const spot = coarseSampling || (await samplingSpotCheck(uid, logQuery, { start_ms: start * 1000, end_ms: end * 1000 }));
+        return textResult({
+          ...base,
+          first_occurrence: null,
+          lines_in_window: 0,
+          before_window: beforeWindow,
+          ...(spot ? { adaptive_logs_sampling: spot } : {}),
+          note:
+            "No matching lines in this window." +
+            (Number(preWindowLines) > 0
+              ? ` But ${preWindowLines} matched in the ${beforeMinutes} minutes before it: widen from.`
+              : "") +
+            (spot ? " These streams are sampled, so absence here is not proof it never happened." : ""),
+        });
+      }
+
+      // 3. The exact first line inside the onset interval.
+      const findFirst = async (s, e) => {
+        const d = await grafanaDatasourceProxyGet(uid, "loki/api/v1/query_range", {
+          query: logQuery,
+          start: `${s}000000000`,
+          end: `${e}000000000`,
+          direction: "forward",
+          limit: "1",
+        });
+        return earliestLine(d?.data?.result || []);
+      };
+      const onsetSlot = Math.floor(Date.parse(trend.onset) / 1000);
+      const narrowStart = Math.max(start, onsetSlot - 1);
+      let narrowEnd = Math.min(end, onsetSlot + stepSeconds + 1);
+      let first = await findFirst(narrowStart, narrowEnd);
+      if (!first && narrowEnd < end) {
+        narrowEnd = end;
+        first = await findFirst(narrowStart, narrowEnd);
+      }
+      const search = {
+        coarse_interval: step,
+        onset_bucket: trend.onset,
+        bucket_covers: BUCKET_COVERS_NOTE,
+        narrowed_to_utc: `${isoS(narrowStart)} .. ${isoS(narrowEnd)}`,
+      };
+      if (!first) {
+        return textResult({
+          ...base,
+          first_occurrence: null,
+          search,
+          lines_in_window: trend.total,
+          before_window: beforeWindow,
+          note: "Lines were counted in the window but none could be retrieved around the onset interval. Re-run with a narrower from/to.",
+        });
+      }
+
+      // 4. Per-minute ramp around it: how fast did it rise?
+      const firstSec = Math.floor(Number(BigInt(first.ns) / 1000000000n));
+      const firstMinute = Math.floor(firstSec / 60) * 60;
+      const rampStart = firstMinute - ramp_minutes_before * 60;
+      const rampEnd = firstMinute + ramp_minutes_after * 60;
+      let ramp;
+      try {
+        const r = await grafanaDatasourceProxyGet(uid, "loki/api/v1/query_range", {
+          query: `sum by (${ADAPTIVE_LOGS_LABEL}) (count_over_time(${logQuery} [1m]))`,
+          start: `${rampStart}000000000`,
+          end: `${rampEnd + 60}000000000`,
+          step: "60",
+        });
+        const { points: rampPoints } = collapseSampledMatrix(r?.data?.result || []);
+        ramp = {
+          interval: "1m",
+          bucket_covers: BUCKET_COVERS_NOTE,
+          buckets: buildTrendBuckets(rampPoints, { startSeconds: rampStart, endSeconds: rampEnd, stepSeconds: 60 }).map((b) =>
+            Date.parse(b.time) / 1000 < start ? { ...b, before_window: true } : b,
+          ),
+        };
+      } catch (err) {
+        ramp = { error: err.reason || err.message };
+      }
+
+      const sampling = coarseSampling || detectSampling([{ labels: first.labels || {} }]);
+      const verdict = describeOnset({
+        firstTimeIso: first.time,
+        windowStartIso: isoS(start),
+        preWindowMinutes: beforeMinutes,
+        preWindowLines,
+        sampling,
+      });
+      return textResult({
+        ...base,
+        first_occurrence: {
+          ...first,
+          next_step: "Pass ns as `at` to grafana_logs_context to read the lines around it, unfiltered.",
+        },
+        already_present_before_window: verdict.already_present_before_window,
+        note: verdict.note,
+        search,
+        lines_in_window: trend.total,
+        last_seen_bucket: trend.last_seen,
+        peak: trend.peak,
+        before_window: beforeWindow,
+        ramp,
+        ...(sampling ? { adaptive_logs_sampling: sampling } : {}),
+      });
     }),
 );
 

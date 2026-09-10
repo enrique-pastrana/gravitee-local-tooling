@@ -51,6 +51,9 @@ const {
   attachBaselineBuckets,
   compareQueryDigests,
   attachBaselineTimeline,
+  earliestLine,
+  describeOnset,
+  BUCKET_COVERS_NOTE,
   mergeContextStreams,
   normaliseLogLine,
   profileNoise,
@@ -1802,4 +1805,45 @@ test("attachBaselineTimeline: a series with no counterpart is null and flagged, 
   const out = attachBaselineTimeline(cur, { A: { series: [] } }, 86400);
   assert.equal(out.A.series[0].baseline_points, null);
   assert.equal(out.A.series[0].baseline_missing, true);
+});
+
+// ---------------------------------------------------------------------------
+// Onset: bucket semantics and the first line
+// ---------------------------------------------------------------------------
+
+test("buildTrendBuckets: a Loki point counts the interval BEFORE its timestamp", () => {
+  // Verified live: a line at 17:13:33 is counted in the point stamped 17:15 at a
+  // 5m step. Filed under 17:15, the onset reads one whole interval late.
+  const base = Date.parse("2026-09-10T17:00:00Z") / 1000;
+  const buckets = buildTrendBuckets([[base + 900, "1"]], { startSeconds: base, endSeconds: base + 1200, stepSeconds: 300 });
+  assert.equal(summarizeTrend(buckets).onset, "2026-09-10T17:10:00.000Z");
+  assert.match(BUCKET_COVERS_NOTE, /START of the interval/);
+});
+
+test("earliestLine: the minimum across streams, with its labels and exact nanoseconds", () => {
+  const out = earliestLine([
+    { stream: { pod: "b" }, values: [["1789099013676000500", "later"]] },
+    { stream: { pod: "a" }, values: [["1789099013676000000", "first"], ["1789099020000000000", "x"]] },
+  ]);
+  assert.equal(out.ns, "1789099013676000000");
+  assert.equal(out.line, "first");
+  assert.deepEqual(out.labels, { pod: "a" });
+  assert.equal(out.time, new Date(1789099013676).toISOString());
+  assert.equal(earliestLine([]), null);
+});
+
+test("describeOnset: a window edge is not an onset", () => {
+  const edge = describeOnset({ firstTimeIso: "t1", windowStartIso: "t0", preWindowMinutes: 10, preWindowLines: 42 });
+  assert.equal(edge.already_present_before_window, true);
+  assert.match(edge.note, /Not an onset/);
+  const real = describeOnset({ firstTimeIso: "t1", windowStartIso: "t0", preWindowMinutes: 10, preWindowLines: 0 });
+  assert.equal(real.already_present_before_window, false);
+  assert.match(real.note, /First occurrence: t1/);
+  const unknown = describeOnset({ firstTimeIso: "t1", preWindowMinutes: 10, preWindowLines: null });
+  assert.match(unknown.note, /could not be checked/);
+});
+
+test("describeOnset: on a sampled stream the first line is only the first that reached Loki", () => {
+  const out = describeOnset({ firstTimeIso: "t1", preWindowMinutes: 10, preWindowLines: 0, sampling: { label_values: ["91.00"] } });
+  assert.match(out.note, /REACHED Loki/);
 });
