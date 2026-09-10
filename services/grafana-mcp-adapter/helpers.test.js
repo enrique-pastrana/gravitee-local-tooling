@@ -54,6 +54,7 @@ const {
   earliestLine,
   describeOnset,
   BUCKET_COVERS_NOTE,
+  applyEdgeCounts,
   mergeContextStreams,
   normaliseLogLine,
   profileNoise,
@@ -1846,4 +1847,38 @@ test("describeOnset: a window edge is not an onset", () => {
 test("describeOnset: on a sampled stream the first line is only the first that reached Loki", () => {
   const out = describeOnset({ firstTimeIso: "t1", preWindowMinutes: 10, preWindowLines: 0, sampling: { label_values: ["91.00"] } });
   assert.match(out.note, /REACHED Loki/);
+});
+
+test("buildTrendBuckets: edge buckets reaching outside the window are marked partial", () => {
+  // A 1h trend from 14:34 reported onset 14:00 and 18 lines for a window holding 6:
+  // the first bucket's count included the 34 minutes before the window.
+  const start = Date.parse("2026-09-10T14:34:00Z") / 1000;
+  const end = Date.parse("2026-09-10T17:30:00Z") / 1000;
+  const buckets = buildTrendBuckets([], { startSeconds: start, endSeconds: end, stepSeconds: 3600 });
+  assert.deepEqual(buckets.map((b) => b.time.slice(11, 16)), ["14:00", "15:00", "16:00", "17:00"]);
+  assert.deepEqual(buckets[0].partial, { from: "2026-09-10T14:34:00.000Z", to: "2026-09-10T15:00:00.000Z", seconds: 1560 });
+  assert.equal(buckets[1].partial, undefined);
+  assert.deepEqual(buckets[3].partial, { from: "2026-09-10T17:00:00.000Z", to: "2026-09-10T17:30:00.000Z", seconds: 1800 });
+});
+
+test("buildTrendBuckets: an aligned window has no partial buckets and no bucket at its end", () => {
+  const start = Date.parse("2026-09-10T14:00:00Z") / 1000;
+  const buckets = buildTrendBuckets([], { startSeconds: start, endSeconds: start + 3 * 3600, stepSeconds: 3600 });
+  assert.equal(buckets.length, 3);
+  assert.ok(buckets.every((b) => !b.partial));
+});
+
+test("applyEdgeCounts: exact edge counts replace Loki's; a failed one is flagged, not trusted", () => {
+  const buckets = [
+    { time: "t0", count: 12, partial: { seconds: 1560 } },
+    { time: "t1", count: 6 },
+    { time: "t2", count: 5, partial: { seconds: 1800 } },
+  ];
+  const out = applyEdgeCounts(buckets, { t0: 0, t2: null });
+  assert.equal(out[0].count, 0);
+  assert.equal(out[0].partial.count_exact, true);
+  assert.equal(out[1].count, 6);
+  assert.equal(out[2].count, 5);
+  assert.equal(out[2].partial.count_exact, false);
+  assert.equal(summarizeTrend(out).onset, "t1");
 });

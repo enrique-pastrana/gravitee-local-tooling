@@ -1329,7 +1329,7 @@ test("grafana_logs_trend: compare_offset shows a chronic pattern as already pres
   // The analysis error: a pattern that had run for days, read as incident
   // impact because the baseline came from a quiet hour earlier the same day.
   await withTrendStub(
-    (start, n) => [{ metric: {}, values: [[start + 600, n === 1 ? "215" : "210"]] }],
+    (start, n) => [{ metric: {}, values: [[start + 7200, n === 1 ? "215" : "210"]] }],
     async (starts) => {
       const out = await callTool("grafana_logs_trend", { client: "acme", from: "now-6h", interval: "1h", compare_offset: "1d" });
       assert.equal(starts.length, 2);
@@ -1343,7 +1343,7 @@ test("grafana_logs_trend: compare_offset shows a chronic pattern as already pres
 
 test("grafana_logs_trend: an empty baseline with no streams is no_baseline, not 'new'", async () => {
   await withTrendStub(
-    (start, n) => (n === 1 ? [{ metric: {}, values: [[start + 600, "40"]] }] : []),
+    (start, n) => (n === 1 ? [{ metric: {}, values: [[start + 7200, "40"]] }] : []),
     async () => {
       const out = await callTool("grafana_logs_trend", { client: "acme", from: "now-6h", interval: "1h", compare_offset: "7d" });
       assert.equal(out.comparison.total.change, "no_baseline");
@@ -1545,6 +1545,50 @@ test("grafana_logs_trend: requests one extra step, so the final interval's count
     const out = await callTool("grafana_logs_trend", { client: "acme", from: ONSET_FROM, to: ONSET_TO, interval: "1h" });
     assert.equal(endParam, atS(ONSET_TO) + 3600);
     assert.match(out.bucket_covers, /START of the interval/);
+  } finally {
+    globalThis.fetch = orig;
+  }
+});
+
+test("grafana_logs_trend: edge buckets count only the part of the interval inside the window", async () => {
+  // Live: a 1h trend from 14:34 reported onset 14:00 and 18 lines for a window
+  // that held 6, because the first bucket's count included 14:00-14:34.
+  const FROM = "2026-09-10T14:34:00Z";
+  const TO = "2026-09-10T20:30:00Z";
+  const edgeQueries = [];
+  const orig = globalThis.fetch;
+  globalThis.fetch = (url) => {
+    const u = String(url);
+    if (u.includes(NS_VALUES)) return jsonResponse(["acme-prod"]);
+    if (u.includes("loki/api/v1/query_range")) {
+      return jsonResponse({
+        resultType: "matrix",
+        result: [{ metric: {}, values: [[atS("2026-09-10T15:00:00Z"), "12"], [atS("2026-09-10T18:00:00Z"), "6"], [atS("2026-09-10T21:00:00Z"), "5"]] }],
+      });
+    }
+    if (u.includes("loki/api/v1/query")) {
+      const p = new URL(u).searchParams;
+      const range = Number(/\[(\d+)s\]\)\)$/.exec(p.get("query"))?.[1]);
+      edgeQueries.push({ range, at: Number(BigInt(p.get("time")) / 1000000000n) });
+      // 14:34-15:00 held nothing; 20:00-20:30 held 2.
+      const count = range === 1560 ? "0" : range === 1800 ? "2" : "0";
+      return jsonResponse({ resultType: "vector", result: [{ metric: {}, value: [0, count] }] });
+    }
+    return jsonResponse([]);
+  };
+  try {
+    const out = await callTool("grafana_logs_trend", { client: "acme", from: FROM, to: TO, interval: "1h" });
+    assert.deepEqual(
+      edgeQueries.sort((a, b) => a.at - b.at),
+      [{ range: 1560, at: atS("2026-09-10T15:00:00Z") }, { range: 1800, at: atS(TO) }],
+    );
+    assert.equal(out.buckets[0].time, "2026-09-10T14:00:00.000Z");
+    assert.equal(out.buckets[0].count, 0);
+    assert.equal(out.buckets[0].partial.from, "2026-09-10T14:34:00.000Z");
+    assert.equal(out.onset, "2026-09-10T17:00:00.000Z");
+    assert.equal(out.total, 8);
+    assert.equal(out.buckets.at(-1).count, 2);
+    assert.equal(out.buckets.at(-1).partial.count_exact, true);
   } finally {
     globalThis.fetch = orig;
   }

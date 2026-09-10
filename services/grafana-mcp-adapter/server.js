@@ -63,6 +63,7 @@ import {
   describeOnset,
   BUCKET_COVERS_NOTE,
   lineFilterExpr,
+  applyEdgeCounts,
 } from "./helpers.js";
 import { loadCustomerMap, warmCustomerMap, resolveCustomerNamespaces, matchCustomers, groupByCustomer, lookupById, dataPlaneNamespace, controlPlaneNamespace } from "./customerMap.js";
 
@@ -657,6 +658,33 @@ async function streamsExist(uid, expr, startSeconds, endSeconds) {
   } catch {
     return true;
   }
+}
+
+// Exact counts for trend buckets at the window edges.
+//
+// The step grid does not start at `from` or end at `to`, so Loki's count for an
+// edge bucket includes lines outside the window: before `from` for the first
+// bucket, after `to` for the last. A 1h trend from 14:34 reported its onset at
+// 14:00 and 18 lines when the window held 6. Each partial bucket is re-counted
+// over exactly the part inside the window — at most two small instant queries.
+async function exactEdgeCounts(uid, logQuery, buckets) {
+  const edges = (buckets || []).filter((b) => b.partial && b.partial.seconds > 0);
+  if (!edges.length) return buckets;
+  const exact = {};
+  await Promise.all(
+    edges.map(async (b) => {
+      try {
+        const d = await grafanaDatasourceProxyGet(uid, "loki/api/v1/query", {
+          query: `sum(count_over_time(${logQuery} [${b.partial.seconds}s]))`,
+          time: `${Math.round(Date.parse(b.partial.to) / 1000)}000000000`,
+        });
+        exact[b.time] = Number(d?.data?.result?.[0]?.value?.[1] ?? 0);
+      } catch {
+        exact[b.time] = null;
+      }
+    }),
+  );
+  return applyEdgeCounts(buckets, exact);
 }
 
 // Upstream IPs -> pods and nodes, via kube-state-metrics.
@@ -1328,7 +1356,7 @@ registerTool(
       });
 
       const { points, sampling: trendSampling } = collapseSampledMatrix(data?.data?.result || []);
-      let buckets = buildTrendBuckets(points, { startSeconds: start, endSeconds: end, stepSeconds });
+      let buckets = await exactEdgeCounts(uid, selector, buildTrendBuckets(points, { startSeconds: start, endSeconds: end, stepSeconds }));
       const summary = summarizeTrend(buckets);
 
       // The same query, step and window length, compare_offset earlier. Each
@@ -1345,7 +1373,7 @@ registerTool(
           step,
         });
         const { points: bPoints } = collapseSampledMatrix(bData?.data?.result || []);
-        const bBuckets = buildTrendBuckets(bPoints, { startSeconds: bStart, endSeconds: bEnd, stepSeconds });
+        const bBuckets = await exactEdgeCounts(uid, selector, buildTrendBuckets(bPoints, { startSeconds: bStart, endSeconds: bEnd, stepSeconds }));
         const bSummary = summarizeTrend(bBuckets);
         const baselineAvailable = bSummary.total > 0 || (await streamsExist(uid, selector, bStart, bEnd));
         const total = compareValues(summary.total, bSummary.total, { baselineAvailable });
@@ -2297,11 +2325,15 @@ registerTool(
           end: `${end + durationSeconds(step)}000000000`,
           step,
         });
-        const buckets = buildTrendBuckets(trendData?.data?.result?.[0]?.values || [], {
-          startSeconds: start,
-          endSeconds: end,
-          stepSeconds: durationSeconds(step),
-        });
+        const buckets = await exactEdgeCounts(
+          uid,
+          streamQuery,
+          buildTrendBuckets(trendData?.data?.result?.[0]?.values || [], {
+            startSeconds: start,
+            endSeconds: end,
+            stepSeconds: durationSeconds(step),
+          }),
+        );
         trend = { interval: step, ...summarizeTrend(buckets), bucket_covers: BUCKET_COVERS_NOTE, buckets };
       } catch (err) {
         partialFailures.push({ part: "trend", error: err.reason || err.message, query: err.query });
@@ -2426,7 +2458,9 @@ registerTool(
         step,
       });
       const { points, sampling: coarseSampling } = collapseSampledMatrix(coarse?.data?.result || []);
-      const buckets = buildTrendBuckets(points, { startSeconds: start, endSeconds: end, stepSeconds });
+      // Exact edge counts: otherwise lines before `from` inflate lines_in_window and
+      // can make the first, partial bucket the onset.
+      const buckets = await exactEdgeCounts(uid, logQuery, buildTrendBuckets(points, { startSeconds: start, endSeconds: end, stepSeconds }));
       const trend = summarizeTrend(buckets);
 
       // 2. Was it already happening before the window?

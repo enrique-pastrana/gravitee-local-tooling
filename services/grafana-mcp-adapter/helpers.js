@@ -743,8 +743,19 @@ export function buildTrendBuckets(points = [], { startSeconds, endSeconds, stepS
   }
   const first = Math.floor(startSeconds / stepSeconds) * stepSeconds;
   const buckets = [];
-  for (let t = first; t <= endSeconds && buckets.length < maxBuckets; t += stepSeconds) {
-    buckets.push({ time: new Date(t * 1000).toISOString(), count: counts.get(t) || 0 });
+  // `t < endSeconds`: a bucket starting at the end covers nothing inside the window.
+  for (let t = first; t < endSeconds && buckets.length < maxBuckets; t += stepSeconds) {
+    const bucket = { time: new Date(t * 1000).toISOString(), count: counts.get(t) || 0 };
+    // The grid does not start at `from` or end at `to`. An edge bucket reaching
+    // outside the window counts lines outside it: a 1h trend from 14:34 reported
+    // onset 14:00 and 18 lines when the window held 6. Marked here with the part
+    // actually inside the window, so the caller can count exactly that.
+    const from = Math.max(t, startSeconds);
+    const to = Math.min(t + stepSeconds, endSeconds);
+    if (from > t || to < t + stepSeconds) {
+      bucket.partial = { from: new Date(from * 1000).toISOString(), to: new Date(to * 1000).toISOString(), seconds: to - from };
+    }
+    buckets.push(bucket);
   }
   return buckets;
 }
@@ -1632,7 +1643,8 @@ export function attachBaselineTimeline(current = {}, baseline = {}, offsetSecond
 export const BUCKET_COVERS_NOTE =
   "Each bucket's time is the START of the interval it counts: [time, time + interval). Loki stamps a " +
   "count_over_time point at the END of its interval; buckets are relabelled so an onset is not reported one " +
-  "interval late. For the exact first line, use grafana_first_occurrence.";
+  "interval late. Edge buckets marked partial cover only the part inside the window, counted exactly. For the " +
+  "exact first line, use grafana_first_occurrence.";
 
 // The earliest line across every stream Loki returned. Loki orders a forward
 // query per stream, so the minimum has to be taken across streams.
@@ -1694,4 +1706,19 @@ export function describeOnset({ firstTimeIso, windowStartIso, preWindowMinutes, 
     );
   }
   return { already_present_before_window: alreadyPresent, note: parts.join(" ") };
+}
+
+// Replace the counts of partial edge buckets with exact counts of the part inside
+// the window. `exact` maps bucket time -> count, or null when the exact count
+// could not be obtained — then the Loki count stays and is flagged as inexact
+// rather than silently trusted.
+export function applyEdgeCounts(buckets = [], exact = {}) {
+  return buckets.map((b) => {
+    if (!b.partial || !Object.prototype.hasOwnProperty.call(exact, b.time)) return b;
+    const v = exact[b.time];
+    if (v === null || v === undefined || !Number.isFinite(Number(v))) {
+      return { ...b, partial: { ...b.partial, count_exact: false } };
+    }
+    return { ...b, count: Number(v), partial: { ...b.partial, count_exact: true } };
+  });
 }
