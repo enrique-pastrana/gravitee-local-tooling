@@ -52,6 +52,13 @@ import {
   aggregateUpstreamAttempts,
   rollupByNode,
   ADAPTIVE_LOGS_LABEL,
+  parseCompareOffset,
+  compareValues,
+  describeChange,
+  attachBaselineBuckets,
+  compareQueryDigests,
+  attachBaselineTimeline,
+  CHANGE_LABELS_NOTE,
 } from "./helpers.js";
 import { loadCustomerMap, warmCustomerMap, resolveCustomerNamespaces, matchCustomers, groupByCustomer, lookupById, dataPlaneNamespace, controlPlaneNamespace } from "./customerMap.js";
 
@@ -626,6 +633,28 @@ async function samplingSpotCheck(uid, expr, window) {
   }
 }
 
+// Did the streams behind a query exist at all in a window?
+//
+// Separates a baseline of zero from no baseline. A comparison against a window
+// outside retention, or before a deployment existed, sees nothing — and without
+// this check every level would read as "new". /series is an index read: label
+// sets only, no log bodies. If the check cannot answer, it says the streams
+// existed, so the comparison never invents a "no baseline" it did not observe.
+async function streamsExist(uid, expr, startSeconds, endSeconds) {
+  const selector = extractStreamSelector(expr);
+  if (!selector) return true;
+  try {
+    const data = await grafanaDatasourceProxyGet(uid, "loki/api/v1/series", {
+      "match[]": selector,
+      start: `${Math.floor(startSeconds)}000000000`,
+      end: `${Math.floor(endSeconds)}000000000`,
+    });
+    return (data?.data || []).length > 0;
+  } catch {
+    return true;
+  }
+}
+
 // Upstream IPs -> pods and nodes, via kube-state-metrics.
 //
 // kube_pod_info carries node and host_ip but no pod IP; kube_pod_ips carries the
@@ -853,7 +882,7 @@ registerTool(
     "offset; a timestamp without a timezone is refused rather than guessed. " +
     "Only datasources whose query language is " +
     `read-only are allowed (types: ${[...READONLY_QUERY_TYPES].join(", ")}); a uid of ` +
-    "any other type is rejected. For metric queries the step follows max_data_points (or pass step), and output='timeline' returns [timestamp, value] pairs to show WHEN something changed.",
+    "any other type is rejected. For metric queries the step follows max_data_points (or pass step), and output='timeline' returns [timestamp, value] pairs to show WHEN something changed. compare_offset (1d, 7d) re-runs the query over the same window that much earlier and labels each series similar/higher/lower/new/gone — use it before calling any level incident impact.",
   {
     datasource_uid: z.string().describe("Datasource uid from grafana_list_datasources."),
     expr: z.string().optional().describe("Query expression. Prometheus (PromQL) and Loki (LogQL) only."),
@@ -889,8 +918,16 @@ registerTool(
         "digest (default): per-series first/last/min/max/avg. timeline: [timestamp, value] pairs per series " +
           "at the step — use it to see WHEN something changed; the digest hides the shape.",
       ),
+    compare_offset: z
+      .string()
+      .optional()
+      .describe(
+        "Also run the identical query over the same-length window this long EARLIER (1d, 7d, 1w) and report both " +
+          "with a ratio and a change label. Do this before reading any level as incident impact: an earlier hour " +
+          "the same day is a different traffic regime, and a chronic pattern compared against it reads as new.",
+      ),
   },
-  async ({ datasource_uid, expr, query, from = "now-1h", to = "now", max_data_points = 1000, max_lines = 100, raw = false, step, output = "digest" }) =>
+  async ({ datasource_uid, expr, query, from = "now-1h", to = "now", max_data_points = 1000, max_lines = 100, raw = false, step, output = "digest", compare_offset }) =>
     withToolLogging("grafana_query", { datasource_uid }, async () => {
       if (!expr && !query) throw new Error("either expr (Prometheus/Loki) or query (other datasource types) is required");
       const ds = await assertReadOnly(datasource_uid);
@@ -901,15 +938,20 @@ registerTool(
         log("warn", "Billable datasource queried", { tool: "grafana_query", datasource_uid, type: ds.type });
       }
       const window = resolvedWindow(from, to, 3600);
+      if (compare_offset && raw) {
+        throw new Error("compare_offset is not supported with raw=true: two raw payloads cannot be compared. Use the digest or output='timeline'.");
+      }
+      const offsetSeconds = compare_offset ? parseCompareOffset(compare_offset, { windowSeconds: window.duration_seconds }) : null;
       const intervalMs = queryIntervalMs({
         startMs: window.start_ms,
         endMs: window.end_ms,
         maxDataPoints: max_data_points,
         step,
       });
-      const payload = await grafanaPost("/ds/query", {
-        from,
-        to,
+      const dsQuery = (qFrom, qTo) =>
+        grafanaPost("/ds/query", {
+        from: qFrom,
+        to: qTo,
         queries: [
           {
             // `query` is spread FIRST so the fields below always win. The
@@ -936,6 +978,15 @@ registerTool(
           },
         ],
       });
+      const payload = await dsQuery(from, to);
+      // The same query, step and window length, compare_offset earlier.
+      const baseline = offsetSeconds
+        ? { start_ms: window.start_ms - offsetSeconds * 1000, end_ms: window.end_ms - offsetSeconds * 1000 }
+        : null;
+      const baselinePayload = baseline ? await dsQuery(String(baseline.start_ms), String(baseline.end_ms)) : null;
+      const baselineWindowUtc = baseline
+        ? `${new Date(baseline.start_ms).toISOString()} .. ${new Date(baseline.end_ms).toISOString()}`
+        : null;
       if (raw) {
         // The raw frames carry the cap silently: a log query that hit it looks
         // exactly like one that didn't. Flag it rather than let a partial page
@@ -951,9 +1002,27 @@ registerTool(
         step_seconds: Math.round(intervalMs / 1000),
       };
       if (output === "timeline") {
+        const timeline = timelineFromPayload(payload, { maxPoints: max_data_points });
+        let timelineComparison = null;
+        if (baselinePayload) {
+          attachBaselineTimeline(timeline, timelineFromPayload(baselinePayload, { maxPoints: max_data_points }), offsetSeconds);
+          const all = Object.values(timeline).flatMap((r) => r.series || []);
+          const missing = all.filter((x) => x.baseline_missing).length;
+          timelineComparison = {
+            offset: compare_offset,
+            baseline_window_utc: baselineWindowUtc,
+            series_with_baseline: all.length - missing,
+            series_without_baseline: missing,
+            note:
+              "baseline_points are the same series compare_offset earlier, shifted forward so their timestamps line up with points." +
+              (missing
+                ? ` ${missing} series had no counterpart then (no data in that window, or different labels): baseline_points is null for those, not zero.`
+                : ""),
+          };
+        }
         return textResult(
           withBillingNotice(
-            { window: windowReport, ...scope, results: timelineFromPayload(payload, { maxPoints: max_data_points }) },
+            { window: windowReport, ...scope, ...(timelineComparison ? { comparison: timelineComparison } : {}), results: timeline },
             ds.type,
           ),
         );
@@ -974,6 +1043,26 @@ registerTool(
           if (sampling) applySamplingToCoverage(e, sampling);
         }
       }
+
+      let comparison = null;
+      if (baselinePayload) {
+        const baselineWindow = { ...baseline, from_utc: null, to_utc: null };
+        const baselineDigest = summarizeQueryResult(baselinePayload, { limit: max_lines, window: baselineWindow });
+        let baselineAvailable = Object.values(baselineDigest.results || {}).some(
+          (e) => (e.series_count ?? 0) > 0 || (e.line_count ?? 0) > 0 || (e.row_count ?? 0) > 0 || (e.stats?.bytes_processed ?? 0) > 0,
+        );
+        if (!baselineAvailable && ds.type === "loki" && expr) {
+          baselineAvailable = await streamsExist(datasource_uid, expr, baseline.start_ms / 1000, baseline.end_ms / 1000);
+        }
+        comparison = {
+          offset: compare_offset,
+          baseline_window_utc: baselineWindowUtc,
+          baseline_available: baselineAvailable,
+          results: compareQueryDigests(digest, baselineDigest, { baselineAvailable }),
+          change_labels: CHANGE_LABELS_NOTE,
+          ...(ds.type === "cloudwatch" ? { billing_note: "compare_offset ran this billable query twice." } : {}),
+        };
+      }
       return textResult(
         withBillingNotice(
           {
@@ -983,6 +1072,7 @@ registerTool(
             window: windowReport,
             ...scope,
             ...digest,
+            ...(comparison ? { comparison } : {}),
           },
           ds.type,
         ),
@@ -1187,7 +1277,7 @@ registerTool(
     "NOT COVERED by `client`: HTTP access logs — status codes, request durations, upstream response " +
     "times — come from the shared ingress controller at {cluster=\"<cluster>\", job=~\"flow/ingress-nginx-ingress-nginx|flow/app-routing-system-\"}, " +
     "NOT the customer's namespaces. Application logs are in the customer namespace; request logs are " +
-    "not. Use grafana_http_requests for those.",
+    "not. Use grafana_http_requests for those. compare_offset (1d, 7d) adds the same window that much earlier: a baseline count per bucket and a similar/higher/lower/new label on the total.",
   {
     client: z.string().describe("Customer name fragment, e.g. 'april', 'demo qa'."),
     component: z.string().optional().describe("Component fragment, e.g. 'gateway', 'api'."),
@@ -1201,14 +1291,23 @@ registerTool(
     to: z.string().default("now").describe("Range end."),
     interval: z.string().optional().describe("Bucket size (30s, 5m, 1h, 1d). Defaults to a size giving a readable number of buckets."),
     control_plane_id: z.string().optional().describe("Narrow to one Cockpit organization (see grafana_find_customer)."),
+    compare_offset: z
+      .string()
+      .optional()
+      .describe(
+        "Also run the identical query over the same-length window this long EARLIER (1d, 7d, 1w) and report both " +
+          "with a ratio and a change label. Do this before reading any level as incident impact: an earlier hour " +
+          "the same day is a different traffic regime, and a chronic pattern compared against it reads as new.",
+      ),
   },
-  async ({ client, component, line_filter, from = "now-24h", to = "now", interval, control_plane_id, case_sensitive = false }) =>
+  async ({ client, component, line_filter, from = "now-24h", to = "now", interval, control_plane_id, case_sensitive = false, compare_offset }) =>
     withToolLogging("grafana_logs_trend", { client, component, from, to }, async () => {
       const uid = requireDatasourceUid(LOGS_DATASOURCE_UID);
       const { namespaces, selector, resolution } = await resolveCustomerSelector({ client, component, lineFilter: line_filter, from, controlPlaneId: control_plane_id, caseSensitive: case_sensitive });
       const { start, end } = rangeSeconds(from, to);
       const step = interval || chooseInterval(Math.max(end - start, 1));
       const stepSeconds = durationSeconds(step);
+      const offsetSeconds = compare_offset ? parseCompareOffset(compare_offset, { windowSeconds: end - start }) : null;
 
       // count_over_time's range vector matches the step, so buckets tile the
       // window exactly: no overlap (which double-counts) and no gaps.
@@ -1223,8 +1322,38 @@ registerTool(
       });
 
       const { points, sampling: trendSampling } = collapseSampledMatrix(data?.data?.result || []);
-      const buckets = buildTrendBuckets(points, { startSeconds: start, endSeconds: end, stepSeconds });
+      let buckets = buildTrendBuckets(points, { startSeconds: start, endSeconds: end, stepSeconds });
       const summary = summarizeTrend(buckets);
+
+      // The same query, step and window length, compare_offset earlier. Each
+      // bucket carries its baseline count, so "was this already happening at
+      // this time yesterday?" is answered in the same read.
+      let comparison = null;
+      if (offsetSeconds) {
+        const bStart = start - offsetSeconds;
+        const bEnd = end - offsetSeconds;
+        const bData = await grafanaDatasourceProxyGet(uid, "loki/api/v1/query_range", {
+          query,
+          start: `${bStart}000000000`,
+          end: `${bEnd}000000000`,
+          step,
+        });
+        const { points: bPoints } = collapseSampledMatrix(bData?.data?.result || []);
+        const bBuckets = buildTrendBuckets(bPoints, { startSeconds: bStart, endSeconds: bEnd, stepSeconds });
+        const bSummary = summarizeTrend(bBuckets);
+        const baselineAvailable = bSummary.total > 0 || (await streamsExist(uid, selector, bStart, bEnd));
+        const total = compareValues(summary.total, bSummary.total, { baselineAvailable });
+        buckets = attachBaselineBuckets(buckets, bBuckets);
+        comparison = {
+          offset: compare_offset,
+          baseline_window_utc: `${new Date(bStart * 1000).toISOString()} .. ${new Date(bEnd * 1000).toISOString()}`,
+          total,
+          baseline_peak: bSummary.peak,
+          baseline_onset: bSummary.onset,
+          note: describeChange(total, compare_offset, "matching line volume"),
+          change_labels: CHANGE_LABELS_NOTE,
+        };
+      }
 
       const result = {
         query,
@@ -1236,6 +1365,7 @@ registerTool(
         resolved_window_utc: `${new Date(start * 1000).toISOString()} .. ${new Date(end * 1000).toISOString()}`,
         interval: step,
         ...summary,
+        ...(comparison ? { comparison } : {}),
         buckets,
       };
       if (trendSampling) result.adaptive_logs_sampling = trendSampling;
@@ -1716,7 +1846,7 @@ registerTool(
     "On a multi-tenant cluster results are narrowed to this customer's upstreams, so they cannot include " +
     "another tenant's traffic. Adaptive Logs sampling is reported when present; counts are then lower " +
     "bounds. Prefer this over grepping the raw stream: `|= \" 499 \"` also matches request sizes of 499 " +
-    "bytes, while status_filter matches the parsed field only.",
+    "bytes, while status_filter matches the parsed field only. compare_offset (1d, 7d) adds per-status baseline counts, ratios and p95 from the same window that much earlier — so a chronic 499 pattern reads as similar, not as incident impact.",
   {
     client: z
       .string()
@@ -1757,6 +1887,14 @@ registerTool(
         "Cockpit organization (control plane) id. Includes its control-plane namespace, where bridge traffic " +
           "lands. Shared by every customer in the organization.",
       ),
+    compare_offset: z
+      .string()
+      .optional()
+      .describe(
+        "Also run the identical query over the same-length window this long EARLIER (1d, 7d, 1w) and report both " +
+          "with a ratio and a change label. Do this before reading any level as incident impact: an earlier hour " +
+          "the same day is a different traffic regime, and a chronic pattern compared against it reads as new.",
+      ),
   },
   async ({
     client,
@@ -1772,6 +1910,7 @@ registerTool(
     interval,
     max_lines = 50,
     control_plane_id,
+    compare_offset,
   }) =>
     withToolLogging("grafana_http_requests", { client, cluster, ingress, mode, from, to }, async () => {
       const uid = requireDatasourceUid(LOGS_DATASOURCE_UID);
@@ -1905,6 +2044,11 @@ registerTool(
           throw wrapped;
         }
       };
+
+      if (compare_offset && mode === "sample") {
+        throw new Error("compare_offset applies to mode='aggregate': individual requests from two windows do not compare.");
+      }
+      const offsetSeconds = compare_offset ? parseCompareOffset(compare_offset, { windowSeconds: end - start }) : null;
 
       if (mode === "sample") {
         const data = await lokiGet("sample", "loki/api/v1/query_range", {
@@ -2051,6 +2195,62 @@ registerTool(
         .sort((a, b) => b[1] - a[1])
         .map(([status, count]) => ({ status, count, share_pct: pct(count, total) }));
 
+      // The same counts and p95, the same window length, compare_offset earlier —
+      // per ingress and status, because a chronic 499 pattern next to a new 502
+      // spike is exactly what a single total would blur.
+      let httpComparison = null;
+      if (offsetSeconds) {
+        const bStart = start - offsetSeconds;
+        const bEnd = end - offsetSeconds;
+        const [bCounts, bP95] = await Promise.allSettled([
+          lokiGet("baseline_counts", "loki/api/v1/query", { query: queries.counts, time: `${bEnd}000000000` }),
+          lokiGet("baseline_latency_p95", "loki/api/v1/query", { query: queries.latency_p95, time: `${bEnd}000000000` }),
+        ]);
+        if (bCounts.status === "rejected") {
+          partialFailures.push({ part: "baseline_counts", error: bCounts.reason?.reason || bCounts.reason?.message, query: queries.counts });
+        } else {
+          if (bP95.status === "rejected") {
+            partialFailures.push({ part: "baseline_latency_p95", error: bP95.reason?.reason || bP95.reason?.message, query: queries.latency_p95 });
+          }
+          const bCountMap = new Map();
+          for (const r of bCounts.value?.data?.result || []) {
+            const v = Number(r?.value?.[1]);
+            if (!Number.isFinite(v) || !r?.metric?.status) continue;
+            const k = key(r.metric);
+            bCountMap.set(k, (bCountMap.get(k) || 0) + v);
+          }
+          const bP95Map = numberMap(bP95.status === "fulfilled" ? bP95.value?.data?.result || [] : []);
+          const baselineTotal = [...bCountMap.values()].reduce((a, b) => a + b, 0);
+          const baselineAvailable = baselineTotal > 0 || (await streamsExist(uid, streamQuery, bStart, bEnd));
+          for (const e of byIngress.values()) {
+            for (const row of e.by_status) {
+              const k = `${e.job}\u0000${row.status}`;
+              const cmp = compareValues(row.count, bCountMap.get(k) || 0, { baselineAvailable });
+              row.baseline_count = cmp.baseline;
+              row.ratio = cmp.ratio;
+              row.change = cmp.change;
+              if (bP95Map.has(k)) row.baseline_p95_seconds = r3(bP95Map.get(k));
+            }
+          }
+          const onlyInBaseline = [...bCountMap.entries()]
+            .filter(([k]) => !countMap.has(k))
+            .map(([k, v]) => {
+              const [job, status] = k.split("\u0000");
+              return { ingress: ingressName(job), status, baseline_count: v, change: "gone" };
+            });
+          const totalCmp = compareValues(total, baselineTotal, { baselineAvailable });
+          httpComparison = {
+            offset: compare_offset,
+            baseline_window_utc: `${new Date(bStart * 1000).toISOString()} .. ${new Date(bEnd * 1000).toISOString()}`,
+            total: totalCmp,
+            note: describeChange(totalCmp, compare_offset, "request volume"),
+            ...(onlyInBaseline.length ? { only_in_baseline: onlyInBaseline } : {}),
+            per_status: "Each by_ingress status row carries baseline_count, ratio, change and baseline_p95_seconds.",
+            change_labels: CHANGE_LABELS_NOTE,
+          };
+        }
+      }
+
       // Failures per upstream pod, and the node each pod ran on.
       let upstreamSection = {};
       if (got.by_upstream) {
@@ -2106,6 +2306,7 @@ registerTool(
         total_requests: total,
         by_status: byStatus,
         by_ingress: [...byIngress.values()],
+        ...(httpComparison ? { comparison: httpComparison } : {}),
         ...(sampling ? { adaptive_logs_sampling: sampling } : {}),
         ...upstreamSection,
         ...trend,

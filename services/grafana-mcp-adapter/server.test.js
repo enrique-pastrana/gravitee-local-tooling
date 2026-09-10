@@ -989,7 +989,7 @@ async function withIngressStub({ nsValues, series, instant = () => ({ result: []
     if (u.includes("loki/api/v1/query_range")) return jsonResponse({ resultType: "matrix", result: [] });
     if (u.includes("loki/api/v1/query")) {
       const query = new URL(u).searchParams.get("query");
-      const r = instant(query);
+      const r = instant(query, new URL(u).searchParams);
       if (r.status) return jsonResponse(r.body, { status: r.status });
       return jsonResponse({ resultType: "vector", result: r.result });
     }
@@ -1298,4 +1298,127 @@ test("grafana_query: an empty lookup on an unsampled stream stays a trustworthy 
       assert.equal(out.results.A.coverage, "EMPTY_BUT_SCANNED");
     },
   );
+});
+
+// ---------------------------------------------------------------------------
+// compare_offset: the same window, earlier
+// ---------------------------------------------------------------------------
+
+async function withTrendStub(rangeFor, fn, { seriesExists = true } = {}) {
+  const orig = globalThis.fetch;
+  const starts = [];
+  globalThis.fetch = (url) => {
+    const u = String(url);
+    if (u.includes(NS_VALUES)) return jsonResponse(["acme-prod"]);
+    if (u.includes(SERIES)) return jsonResponse(seriesExists ? [{ namespace: "acme-prod", service_name: "gw" }] : []);
+    if (u.includes("loki/api/v1/query_range")) {
+      const start = Number(BigInt(new URL(u).searchParams.get("start")) / 1000000000n);
+      starts.push(start);
+      return jsonResponse({ resultType: "matrix", result: rangeFor(start, starts.length) });
+    }
+    return jsonResponse([]);
+  };
+  try {
+    return await fn(starts);
+  } finally {
+    globalThis.fetch = orig;
+  }
+}
+
+test("grafana_logs_trend: compare_offset shows a chronic pattern as already present", async () => {
+  // The analysis error: a pattern that had run for days, read as incident
+  // impact because the baseline came from a quiet hour earlier the same day.
+  await withTrendStub(
+    (start, n) => [{ metric: {}, values: [[start + 600, n === 1 ? "215" : "210"]] }],
+    async (starts) => {
+      const out = await callTool("grafana_logs_trend", { client: "acme", from: "now-6h", interval: "1h", compare_offset: "1d" });
+      assert.equal(starts.length, 2);
+      assert.equal(starts[0] - starts[1], 86400);
+      assert.equal(out.comparison.total.change, "similar");
+      assert.match(out.comparison.note, /already happening then/);
+      assert.ok(out.buckets.some((b) => b.baseline === 210), JSON.stringify(out.buckets));
+    },
+  );
+});
+
+test("grafana_logs_trend: an empty baseline with no streams is no_baseline, not 'new'", async () => {
+  await withTrendStub(
+    (start, n) => (n === 1 ? [{ metric: {}, values: [[start + 600, "40"]] }] : []),
+    async () => {
+      const out = await callTool("grafana_logs_trend", { client: "acme", from: "now-6h", interval: "1h", compare_offset: "7d" });
+      assert.equal(out.comparison.total.change, "no_baseline");
+      assert.match(out.comparison.note, /not evidence/);
+    },
+    { seriesExists: false },
+  );
+});
+
+test("grafana_logs_trend: refuses an offset that would overlap the window", async () => {
+  await withTrendStub(() => [], async () => {
+    await assert.rejects(
+      () => callTool("grafana_logs_trend", { client: "acme", from: "now-6h", compare_offset: "1h" }),
+      /overlap/,
+    );
+  });
+});
+
+test("grafana_query: compare_offset runs the same query over the shifted window and labels each series", async () => {
+  await withQueryEndpointStub({ type: "prometheus", payload: SERIES_PAYLOAD }, async ({ bodies }) => {
+    const out = await callTool("grafana_query", { datasource_uid: "ds", expr: "up", from: "now-1h", to: "now", compare_offset: "1d" });
+    assert.equal(bodies.length, 2);
+    const [current, baseline] = bodies;
+    // Same step, same window length, a day earlier.
+    assert.equal(baseline.queries[0].intervalMs, current.queries[0].intervalMs);
+    assert.equal(Number(baseline.to) - Number(baseline.from), 3_600_000);
+    assert.ok(Math.abs(Date.now() - 86_400_000 - Number(baseline.to)) < 60_000, baseline.to);
+    assert.equal(out.comparison.results.A.series[0].avg.change, "similar");
+    assert.equal(out.comparison.baseline_available, true);
+  });
+});
+
+test("grafana_query: compare_offset with raw=true is refused, not silently ignored", async () => {
+  await withQueryEndpointStub({ type: "prometheus", payload: SERIES_PAYLOAD }, async () => {
+    await assert.rejects(
+      () => callTool("grafana_query", { datasource_uid: "ds", expr: "up", raw: true, compare_offset: "1d" }),
+      /raw=true/,
+    );
+  });
+});
+
+test("grafana_http_requests: compare_offset labels each status against the same window earlier", async () => {
+  const nowS = Math.floor(Date.now() / 1000);
+  await withIngressStub(
+    {
+      ...DEDICATED,
+      instant: (q, params) => {
+        if (!q.startsWith("sum by (job, status,")) return { result: [] };
+        const t = Number(BigInt(params.get("time")) / 1000000000n);
+        const isBaseline = t < nowS - 7200;
+        return {
+          result: [
+            { metric: { job: "flow/ingress-nginx-ingress-nginx", status: "499" }, value: [0, isBaseline ? "2100" : "2150"] },
+            ...(isBaseline ? [] : [{ metric: { job: "flow/ingress-nginx-ingress-nginx", status: "502" }, value: [0, "40"] }]),
+          ],
+        };
+      },
+    },
+    async () => {
+      const out = await callTool("grafana_http_requests", { client: "acme", from: "now-6h", compare_offset: "1d" });
+      const rows = Object.fromEntries(out.by_ingress[0].by_status.map((r) => [r.status, r]));
+      // The chronic 499s were already there; the 502s were not.
+      assert.equal(rows["499"].change, "similar");
+      assert.equal(rows["499"].baseline_count, 2100);
+      assert.equal(rows["502"].change, "new");
+      assert.equal(out.comparison.total.change, "similar");
+    },
+  );
+});
+
+test("grafana_http_requests: compare_offset in sample mode is refused", async () => {
+  await withIngressStub(DEDICATED, async () => {
+    await assert.rejects(
+      () => callTool("grafana_http_requests", { client: "acme", mode: "sample", compare_offset: "1d" }),
+      /mode='aggregate'/,
+    );
+  });
 });

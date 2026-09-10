@@ -45,6 +45,12 @@ const {
   collapseSampledMatrix,
   aggregateUpstreamAttempts,
   rollupByNode,
+  parseCompareOffset,
+  compareValues,
+  describeChange,
+  attachBaselineBuckets,
+  compareQueryDigests,
+  attachBaselineTimeline,
   mergeContextStreams,
   normaliseLogLine,
   profileNoise,
@@ -1710,4 +1716,90 @@ test("rollupByNode: failures concentrate on the node the bad pods share", () => 
   assert.equal(nodes[0].pod_count, 2);
   assert.equal(nodes[0].failed_attempts, 19);
   assert.equal(nodes[1].failure_pct, 0);
+});
+
+// ---------------------------------------------------------------------------
+// Comparison against the same window, earlier
+// ---------------------------------------------------------------------------
+
+test("parseCompareOffset: days, weeks, and a refusal to overlap the window", () => {
+  assert.equal(parseCompareOffset("1d"), 86400);
+  assert.equal(parseCompareOffset("1w"), 604800);
+  assert.equal(parseCompareOffset("7d", { windowSeconds: 3600 }), 604800);
+  assert.throws(() => parseCompareOffset("soon"), /compare_offset/);
+  // An overlapping baseline drags every ratio towards "similar".
+  assert.throws(() => parseCompareOffset("1h", { windowSeconds: 6 * 3600 }), /overlap/);
+});
+
+test("compareValues: labels the change, and never calls a missing baseline 'new'", () => {
+  assert.deepEqual(compareValues(215, 210), { current: 215, baseline: 210, ratio: 1.02, change: "similar" });
+  assert.equal(compareValues(500, 100).change, "higher");
+  assert.equal(compareValues(10, 100).change, "lower");
+  assert.equal(compareValues(0, 100).change, "gone");
+  assert.equal(compareValues(12, 0).change, "new");
+  assert.equal(compareValues(0, 0).change, "none");
+  const unknown = compareValues(12, 0, { baselineAvailable: false });
+  assert.equal(unknown.change, "no_baseline");
+  assert.equal(unknown.ratio, null);
+});
+
+test("describeChange: 'similar' says the pattern predates the window", () => {
+  // The error this exists to stop: a chronic pattern read as incident impact.
+  assert.match(describeChange(compareValues(215, 210), "1d", "499 volume"), /already happening then/);
+  assert.match(describeChange(compareValues(12, 0, { baselineAvailable: false }), "7d"), /not evidence/);
+});
+
+test("attachBaselineBuckets: aligns baseline counts by position", () => {
+  const out = attachBaselineBuckets(
+    [{ time: "t1", count: 5 }, { time: "t2", count: 9 }],
+    [{ time: "b1", count: 4 }],
+  );
+  assert.deepEqual(out, [{ time: "t1", count: 5, baseline: 4 }, { time: "t2", count: 9, baseline: 0 }]);
+});
+
+test("compareQueryDigests: matches series by labels, and flags a capped log comparison", () => {
+  const cur = {
+    results: {
+      A: {
+        series_count: 2,
+        series: [
+          { labels: { status: "499" }, avg: 20, last: 22, max: 30 },
+          { labels: { status: "502" }, avg: 5, last: 5, max: 5 },
+        ],
+      },
+      B: { line_count: 100, coverage: "TRUNCATED" },
+    },
+  };
+  const base = {
+    results: {
+      A: {
+        series_count: 2,
+        series: [
+          { labels: { status: "200" }, avg: 7, last: 7, max: 7 },
+          { labels: { status: "499" }, avg: 19, last: 21, max: 29 },
+        ],
+      },
+      B: { line_count: 100, coverage: "OK" },
+    },
+  };
+  const out = compareQueryDigests(cur, base);
+  assert.equal(out.A.series[0].avg.change, "similar");
+  assert.equal(out.A.series[1].avg.change, "new");
+  assert.deepEqual(out.A.only_in_baseline[0].labels, { status: "200" });
+  assert.equal(out.A.only_in_baseline[0].avg.change, "gone");
+  assert.match(out.B.line_count_note, /two caps/);
+});
+
+test("attachBaselineTimeline: shifts baseline points onto the current timestamps", () => {
+  const cur = { A: { series: [{ labels: { s: "1" }, points: [["2026-09-10T00:00:00.000Z", 5]] }] } };
+  const base = { A: { series: [{ labels: { s: "1" }, points: [["2026-09-09T00:00:00.000Z", 4]] }] } };
+  const out = attachBaselineTimeline(cur, base, 86400);
+  assert.deepEqual(out.A.series[0].baseline_points, [["2026-09-10T00:00:00.000Z", 4]]);
+});
+
+test("attachBaselineTimeline: a series with no counterpart is null and flagged, not an empty line", () => {
+  const cur = { A: { series: [{ labels: { s: "1" }, points: [["2026-09-10T00:00:00.000Z", 5]] }] } };
+  const out = attachBaselineTimeline(cur, { A: { series: [] } }, 86400);
+  assert.equal(out.A.series[0].baseline_points, null);
+  assert.equal(out.A.series[0].baseline_missing, true);
 });

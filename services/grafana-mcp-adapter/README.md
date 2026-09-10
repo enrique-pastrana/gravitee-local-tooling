@@ -109,6 +109,35 @@ points per series — unreadable in the digest and over the tool-result limit ra
 `step`), reports `step_seconds`, and `output="timeline"` returns
 `[timestamp, value]` pairs so you can see *when* something changed.
 
+### Compare against the same window, earlier
+
+`grafana_query`, `grafana_logs_trend` and `grafana_http_requests` take
+`compare_offset` (`1d`, `7d`, `1w`). The identical query runs again over the
+same-length window that much earlier, and each result is labelled against it:
+`similar` (within x0.5-x2), `higher`, `lower`, `new`, `gone`, `none`, or
+`no_baseline`.
+
+It exists because a baseline taken earlier the same day — a quieter hour — made a
+chronic 499 pattern and pre-existing restarts read as incident impact. A fixed
+offset compares the same time of day. `similar` means *this was already
+happening*.
+
+- The window is shifted rather than the query rewritten with `offset`
+  modifiers, so it is exact for every datasource and query shape.
+- An offset shorter than the window is refused: an overlapping baseline drags
+  every ratio towards `similar`.
+- A baseline window with no data at all (outside retention, or before a
+  deployment existed) is `no_baseline`, not `new` — for Loki this is checked
+  against `/series`, so a genuine zero still reads as a zero.
+- Two log results capped at `max_lines` are flagged: that compares two caps, not
+  two volumes. Use `grafana_logs_trend` for volume.
+- `grafana_logs_trend` puts a `baseline` count on every bucket;
+  `grafana_http_requests` puts `baseline_count`, `ratio`, `change` and
+  `baseline_p95_seconds` on every status row; `output="timeline"` adds
+  `baseline_points` shifted onto the current timestamps.
+- It doubles the queries a call runs. On CloudWatch that means two billable
+  queries, and the result says so.
+
 ### Adaptive Logs sampling is reported, not assumed
 
 Grafana Adaptive Logs discards lines before they reach Loki, and marks the

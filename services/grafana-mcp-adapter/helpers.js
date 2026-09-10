@@ -1471,3 +1471,154 @@ export function rollupByNode(rows = []) {
     }))
     .sort((a, b) => b.failed_attempts - a.failed_attempts || b.attempts - a.attempts);
 }
+
+// ---------------------------------------------------------------------------
+// Comparison against the same window, earlier
+// ---------------------------------------------------------------------------
+//
+// An incident investigation took its baseline from earlier the same day — a
+// low-traffic hour — and read a chronic 499 pattern and pre-existing restarts as
+// incident impact. The error only surfaced when someone compared against the
+// same window the day before. A fixed offset (1d, 7d) compares like with like:
+// same time of day, same weekday.
+//
+// The comparison re-runs the identical query over a shifted window rather than
+// rewriting it with `offset` modifiers. Rewriting is fragile (subqueries,
+// existing offsets, languages without the modifier); shifting the window is
+// exact for every datasource.
+
+export const CHANGE_THRESHOLD = 2;
+
+export const CHANGE_LABELS_NOTE =
+  "change compares against the baseline: similar = within x0.5-x2 (already present then, so not new in " +
+  "this window); higher >= x2; lower <= x0.5; new = absent then while the streams existed; gone = absent now; " +
+  "none = absent in both; no_baseline = no data at all in the baseline window (outside retention, or not yet " +
+  "deployed), which is evidence of nothing.";
+
+export function parseCompareOffset(offset, { windowSeconds } = {}) {
+  const raw = String(offset ?? "").trim().toLowerCase();
+  let seconds;
+  const weeks = /^(\d+)w$/.exec(raw);
+  if (weeks) seconds = Number(weeks[1]) * 7 * 86400;
+  else {
+    try {
+      seconds = durationSeconds(raw);
+    } catch {
+      throw new Error(`Unrecognised compare_offset "${offset}". Use a duration such as 1d, 7d or 1w.`);
+    }
+  }
+  if (!(seconds > 0)) throw new Error(`compare_offset must be positive, got "${offset}".`);
+  // A baseline that overlaps the window compares the window partly with itself,
+  // and the overlap drags every ratio towards 1 — towards "similar".
+  if (Number.isFinite(windowSeconds) && seconds < windowSeconds) {
+    throw new Error(
+      `compare_offset ${offset} is shorter than the ${windowSeconds}s window, so the baseline would overlap ` +
+        "the period being compared. Use at least the window length; 1d or 7d compares like with like.",
+    );
+  }
+  return seconds;
+}
+
+export function compareValues(current, baseline, { baselineAvailable = true } = {}) {
+  const c = Number(current) || 0;
+  const b = Number(baseline) || 0;
+  // A baseline window with no data at all is not a baseline of zero. Calling
+  // that "new" would turn retention limits into findings.
+  if (!baselineAvailable) return { current: c, baseline: null, ratio: null, change: "no_baseline" };
+  if (b === 0) return { current: c, baseline: b, ratio: null, change: c === 0 ? "none" : "new" };
+  const ratio = Math.round((c / b) * 100) / 100;
+  let change = "similar";
+  if (c === 0) change = "gone";
+  else if (c / b >= CHANGE_THRESHOLD) change = "higher";
+  else if (c / b <= 1 / CHANGE_THRESHOLD) change = "lower";
+  return { current: c, baseline: b, ratio, change };
+}
+
+export function describeChange(cmp, offset, subject = "the volume") {
+  const s = subject.charAt(0).toUpperCase() + subject.slice(1);
+  switch (cmp?.change) {
+    case "similar":
+      return `${s} ${offset} earlier was similar (x${cmp.ratio}): this was already happening then, so do not read it as new in this window.`;
+    case "higher":
+      return `${s} is x${cmp.ratio} what it was ${offset} earlier.`;
+    case "lower":
+      return `${s} is x${cmp.ratio} what it was ${offset} earlier: below the baseline.`;
+    case "new":
+      return `None ${offset} earlier, although the streams existed then: this is new since the baseline.`;
+    case "gone":
+      return `Present ${offset} earlier, absent now.`;
+    case "none":
+      return "Nothing in either window.";
+    case "no_baseline":
+      return (
+        `No data at all ${offset} earlier (outside retention, or not yet deployed), so there is no baseline: ` +
+        "this is not evidence that the pattern is new."
+      );
+    default:
+      return null;
+  }
+}
+
+// Baseline counts beside the current ones, by position. Both windows are built
+// with the same step and length, so bucket i then is bucket i now.
+export function attachBaselineBuckets(current = [], baseline = []) {
+  return current.map((b, i) => ({ ...b, baseline: baseline[i]?.count ?? 0 }));
+}
+
+const labelKey = (labels) => JSON.stringify(Object.entries(labels || {}).sort());
+
+export function compareQueryDigests(current = {}, baseline = {}, { baselineAvailable = true } = {}) {
+  const out = {};
+  for (const [refId, cur] of Object.entries(current.results || {})) {
+    const base = baseline.results?.[refId] || {};
+    const entry = {};
+    if (cur.series_count !== undefined) {
+      const remaining = new Map((base.series || []).map((s) => [labelKey(s.labels), s]));
+      entry.series = (cur.series || []).map((s) => {
+        const b = remaining.get(labelKey(s.labels));
+        remaining.delete(labelKey(s.labels));
+        return {
+          labels: s.labels,
+          avg: compareValues(s.avg, b?.avg, { baselineAvailable }),
+          last: compareValues(s.last, b?.last, { baselineAvailable }),
+          max: compareValues(s.max, b?.max, { baselineAvailable }),
+        };
+      });
+      const gone = [...remaining.values()].map((s) => ({ labels: s.labels, avg: compareValues(0, s.avg) }));
+      if (gone.length) entry.only_in_baseline = gone;
+    }
+    if (cur.line_count !== undefined) {
+      entry.line_count = compareValues(cur.line_count, base.line_count ?? 0, { baselineAvailable });
+      if (cur.coverage === "TRUNCATED" || base.coverage === "TRUNCATED") {
+        entry.line_count_note =
+          "At least one window hit max_lines, so this compares two caps, not two volumes. Use " +
+          "grafana_logs_trend or a count_over_time query to compare volume.";
+      }
+    }
+    if (cur.row_count !== undefined) {
+      entry.row_count = compareValues(cur.row_count, base.row_count ?? 0, { baselineAvailable });
+    }
+    out[refId] = entry;
+  }
+  return out;
+}
+
+// Baseline points shifted forward by the offset, so their timestamps line up with
+// the current points and a reader can compare row by row.
+export function attachBaselineTimeline(current = {}, baseline = {}, offsetSeconds = 0) {
+  for (const [refId, cur] of Object.entries(current)) {
+    const base = new Map((baseline[refId]?.series || []).map((s) => [labelKey(s.labels), s]));
+    for (const s of cur.series || []) {
+      const b = base.get(labelKey(s.labels));
+      // No counterpart is not a flat zero. An empty list read exactly like
+      // "nothing happened then"; null plus a flag says "no baseline for this".
+      if (!b) {
+        s.baseline_points = null;
+        s.baseline_missing = true;
+        continue;
+      }
+      s.baseline_points = (b.points || []).map(([t, v]) => [new Date(Date.parse(t) + offsetSeconds * 1000).toISOString(), v]);
+    }
+  }
+  return current;
+}
