@@ -1180,7 +1180,7 @@ test("grafana_logs_trend: a sampled stream is reported in the same read", async 
 // grafana_query: step, timeline, Loki-only scope note, sampling on negatives
 // ---------------------------------------------------------------------------
 
-async function withQueryEndpointStub({ type, payload, lokiInstant }, fn) {
+async function withQueryEndpointStub({ type, payload, lokiInstant, series }, fn) {
   const orig = globalThis.fetch;
   const bodies = [];
   const instantQueries = [];
@@ -1191,6 +1191,8 @@ async function withQueryEndpointStub({ type, payload, lokiInstant }, fn) {
     else if (u.includes("/ds/query")) {
       bodies.push(JSON.parse(opts.body));
       body = payload;
+    } else if (u.includes("loki/api/v1/series")) {
+      body = { status: "success", data: series ? series(u) : [] };
     } else if (u.includes("loki/api/v1/query")) {
       const q = new URL(u).searchParams.get("query");
       instantQueries.push(q);
@@ -1595,4 +1597,71 @@ test("grafana_logs_trend: edge buckets count only the part of the interval insid
   } finally {
     globalThis.fetch = orig;
   }
+});
+
+// ---------------------------------------------------------------------------
+// grafana_query: owner rollup
+// ---------------------------------------------------------------------------
+
+function namespaceSeriesPayload(entries) {
+  return {
+    results: {
+      A: {
+        status: 200,
+        frames: entries.map(([namespace, cluster, v]) => ({
+          schema: {
+            meta: { type: "timeseries-multi" },
+            fields: [{ name: "Time", type: "time" }, { name: "Value", type: "number", labels: { namespace, cluster } }],
+          },
+          data: { values: [[0, 60_000], [v, v]] },
+        })),
+      },
+    },
+  };
+}
+
+const CONTROL_PLANE_SERIES = () => [
+  { namespace: "apim-cp-cp1111", cluster: "core-us" },
+  { namespace: "apim-cp-cp2222", cluster: "core-us" },
+];
+
+test("grafana_query: a spread over data-plane namespaces rolls up to the control planes that own them", async () => {
+  // The misread: errors on many namespaces across many clusters looked global,
+  // when every one belonged to control planes running in one place.
+  const payload = namespaceSeriesPayload([
+    ["apim-dp-cp1111-dp0001", "eu-a", 10],
+    ["apim-dp-cp1111-dp0002", "us-b", 20],
+    ["apim-dp-cp1111-dp0003", "ap-c", 5],
+    ["apim-dp-cp2222-dp0001", "us-b", 1],
+    ["acme-prod", "eu-a", 3],
+  ]);
+  await withQueryEndpointStub({ type: "prometheus", payload, series: CONTROL_PLANE_SERIES }, async () => {
+    const out = await callTool("grafana_query", { datasource_uid: "ds", expr: "sum by (namespace, cluster) (x)" });
+    const r = out.owner_rollup;
+    assert.equal(r.data_plane_namespaces, 4);
+    assert.equal(r.data_plane_clusters, 3);
+    assert.equal(r.control_planes, 2);
+    assert.equal(r.by_control_plane[0].control_plane_id, "cp1111");
+    assert.deepEqual(r.by_control_plane[0].control_plane_clusters, ["core-us"]);
+    assert.deepEqual(r.by_control_plane_cluster, [{ cluster: "core-us", control_planes: 2, data_planes: 4 }]);
+    assert.match(r.note, /check the control-plane side/);
+  });
+});
+
+test("grafana_query: the rollup counts every namespace, not just the 50 series the digest keeps", async () => {
+  const entries = Array.from({ length: 60 }, (_, i) => [`apim-dp-cp${1111 + (i % 3)}-dp${String(i).padStart(4, "0")}`, "eu-a", 1]);
+  await withQueryEndpointStub({ type: "prometheus", payload: namespaceSeriesPayload(entries), series: () => [] }, async () => {
+    const out = await callTool("grafana_query", { datasource_uid: "ds", expr: "sum by (namespace) (x)" });
+    assert.equal(out.results.A.truncated, 10);
+    assert.equal(out.owner_rollup.data_plane_namespaces, 60);
+    assert.equal(out.owner_rollup.control_planes, 3);
+  });
+});
+
+test("grafana_query: no rollup for a result that is not broad", async () => {
+  const payload = namespaceSeriesPayload([["apim-dp-cp1111-dp0001", "eu-a", 1], ["apim-dp-cp1111-dp0002", "eu-a", 1]]);
+  await withQueryEndpointStub({ type: "prometheus", payload, series: CONTROL_PLANE_SERIES }, async () => {
+    const out = await callTool("grafana_query", { datasource_uid: "ds", expr: "sum by (namespace) (x)" });
+    assert.equal(out.owner_rollup, undefined);
+  });
 });

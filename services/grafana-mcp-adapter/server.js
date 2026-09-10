@@ -64,6 +64,10 @@ import {
   BUCKET_COVERS_NOTE,
   lineFilterExpr,
   applyEdgeCounts,
+  namespaceWeightsFromPayload,
+  buildOwnerRollup,
+  controlPlaneOfNamespace,
+  OWNER_ROLLUP_MIN_NAMESPACES,
 } from "./helpers.js";
 import { loadCustomerMap, warmCustomerMap, resolveCustomerNamespaces, matchCustomers, groupByCustomer, lookupById, dataPlaneNamespace, controlPlaneNamespace } from "./customerMap.js";
 
@@ -914,7 +918,7 @@ registerTool(
     "offset; a timestamp without a timezone is refused rather than guessed. " +
     "Only datasources whose query language is " +
     `read-only are allowed (types: ${[...READONLY_QUERY_TYPES].join(", ")}); a uid of ` +
-    "any other type is rejected. For metric queries the step follows max_data_points (or pass step), and output='timeline' returns [timestamp, value] pairs to show WHEN something changed. compare_offset (1d, 7d) re-runs the query over the same window that much earlier and labels each series similar/higher/lower/new/gone — use it before calling any level incident impact.",
+    "any other type is rejected. For metric queries the step follows max_data_points (or pass step), and output='timeline' returns [timestamp, value] pairs to show WHEN something changed. compare_offset (1d, 7d) re-runs the query over the same window that much earlier and labels each series similar/higher/lower/new/gone — use it before calling any level incident impact. When a result spans several Gravitee Cloud data-plane namespaces (apim-dp-<cp>-<dp>), owner_rollup groups them by the control plane that owns them, where each control plane runs, and its customers: a spread over many namespaces and clusters often traces to a few control planes.",
   {
     datasource_uid: z.string().describe("Datasource uid from grafana_list_datasources."),
     expr: z.string().optional().describe("Query expression. Prometheus (PromQL) and Loki (LogQL) only."),
@@ -1095,6 +1099,37 @@ registerTool(
           ...(ds.type === "cloudwatch" ? { billing_note: "compare_offset ran this billable query twice." } : {}),
         };
       }
+      // Who owns a broad result. A data-plane namespace carries its control plane's
+      // id in its name, so a spread over many namespaces and clusters rolls up to
+      // the control planes behind it — and to where THOSE run, which is where a
+      // problem that surfaces on data planes in every region usually starts.
+      // Built from the raw payload: the digest keeps only 50 series.
+      let ownerRollup = null;
+      try {
+        const weights = namespaceWeightsFromPayload(payload);
+        const dpNamespaces = [...weights.keys()].filter((n) => controlPlaneOfNamespace(n));
+        if (dpNamespaces.length >= OWNER_ROLLUP_MIN_NAMESPACES) {
+          const cps = [...new Set(dpNamespaces.map(controlPlaneOfNamespace))];
+          const [clusterInfo, map] = await Promise.all([
+            LOGS_DATASOURCE_UID
+              ? resolveClusters(cps.slice(0, 100).map(controlPlaneNamespace), { from })
+              : Promise.resolve({ by_namespace: {} }),
+            loadCustomerMap().catch(() => ({ rows: [] })),
+          ]);
+          const customers = {};
+          for (const row of map?.rows || []) {
+            if (!row.control_plane_id || !cps.includes(row.control_plane_id)) continue;
+            (customers[row.control_plane_id] ||= new Set()).add(row.customer);
+          }
+          ownerRollup = buildOwnerRollup(weights, {
+            controlPlaneClusters: clusterInfo?.by_namespace || {},
+            customersByControlPlane: Object.fromEntries(Object.entries(customers).map(([k, v]) => [k, [...v].sort()])),
+          });
+        }
+      } catch (err) {
+        ownerRollup = { error: `owner rollup unavailable: ${err.message}` };
+      }
+
       return textResult(
         withBillingNotice(
           {
@@ -1105,6 +1140,7 @@ registerTool(
             ...scope,
             ...digest,
             ...(comparison ? { comparison } : {}),
+            ...(ownerRollup ? { owner_rollup: ownerRollup } : {}),
           },
           ds.type,
         ),

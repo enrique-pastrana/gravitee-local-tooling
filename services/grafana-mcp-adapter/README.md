@@ -110,6 +110,33 @@ points per series — unreadable in the digest and over the tool-result limit ra
 `step`), reports `step_seconds`, and `output="timeline"` returns
 `[timestamp, value]` pairs so you can see *when* something changed.
 
+### Who owns a broad result
+
+Sync errors on "126 namespaces across 10 clusters" read as a global problem. They
+were all data planes of 19 control planes — and control planes own data planes in
+every region, so trouble on the control-plane side surfaces everywhere at once.
+
+A Gravitee Cloud data-plane namespace carries its owner in its name:
+`apim-dp-<controlPlaneId>-<dataPlaneId>` (trials: `apim-dp-trial-<id>-<dp>`).
+Checked against the live instance: every `apim-dp-*` namespace has that shape,
+and every control-plane id derived from one has a live `apim-cp-<id>` namespace.
+So attribution is exact, not a map lookup.
+
+When a `grafana_query` result spans three or more data-plane namespaces,
+`owner_rollup` groups them:
+
+- `by_control_plane` — each owning control plane, the cluster it runs on (from
+  its own `apim-cp-<id>` namespace), its customers from the deployment map, how
+  many data planes are affected and across which clusters.
+- `by_control_plane_cluster` — the same, rolled up to where the control planes
+  run.
+- a `note` that says so plainly when the result spreads across more data-plane
+  clusters than its control planes run on.
+
+The rollup is built from the raw result, not the digest: the digest keeps 50
+series, and a rollup over a truncated list would undercount exactly the broad
+results it exists for.
+
 ### Onset: the first line, not the first bucket
 
 Loki stamps a `count_over_time` point at the **end** of the interval it counts: at

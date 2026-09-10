@@ -55,6 +55,9 @@ const {
   describeOnset,
   BUCKET_COVERS_NOTE,
   applyEdgeCounts,
+  controlPlaneOfNamespace,
+  namespaceWeightsFromPayload,
+  buildOwnerRollup,
   mergeContextStreams,
   normaliseLogLine,
   profileNoise,
@@ -1899,4 +1902,85 @@ test("compareValues: a halving is lower, and still already present", () => {
   assert.equal(compareValues(12, 0).already_present, false);
   assert.equal(compareValues(0, 100).already_present, true);
   assert.equal(compareValues(12, 0, { baselineAvailable: false }).already_present, null);
+});
+
+// ---------------------------------------------------------------------------
+// Owner rollup
+// ---------------------------------------------------------------------------
+
+test("controlPlaneOfNamespace: reads the owner out of a data-plane namespace, trials included", () => {
+  assert.equal(controlPlaneOfNamespace("apim-dp-cp1111-dp0001"), "cp1111");
+  assert.equal(controlPlaneOfNamespace("apim-dp-trial-tt0001-dp0011"), "trial-tt0001");
+  assert.equal(controlPlaneOfNamespace("apim-cp-cp1111"), null);
+  assert.equal(controlPlaneOfNamespace("acme-prod"), null);
+});
+
+test("namespaceWeightsFromPayload: counts every frame, series and log lines alike", () => {
+  const payload = {
+    results: {
+      A: {
+        frames: [
+          {
+            schema: { meta: { type: "timeseries-multi" }, fields: [{ name: "Time", type: "time" }, { name: "V", type: "number", labels: { namespace: "apim-dp-cp1111-dp0001", cluster: "eu-a" } }] },
+            data: { values: [[0, 1], [4, 6]] },
+          },
+        ],
+      },
+      B: {
+        frames: [
+          {
+            schema: { meta: { custom: { frameType: "LabeledTimeValues" } }, fields: [{ name: "labels", type: "other" }, { name: "Time", type: "time" }, { name: "Line", type: "string" }] },
+            data: { values: [[{ namespace: "apim-dp-cp1111-dp0001", cluster: "us-b" }, { namespace: "acme-prod" }], [1, 2], ["x", "y"]] },
+          },
+        ],
+      },
+    },
+  };
+  const w = namespaceWeightsFromPayload(payload);
+  const dp = w.get("apim-dp-cp1111-dp0001");
+  assert.equal(dp.series, 1);
+  assert.equal(dp.value, 5);
+  assert.equal(dp.lines, 1);
+  assert.deepEqual([...dp.clusters].sort(), ["eu-a", "us-b"]);
+  assert.equal(w.get("acme-prod").lines, 1);
+});
+
+test("buildOwnerRollup: a spread across clusters traces back to its control planes", () => {
+  const w = (clusters, value) => ({ clusters: new Set(clusters), series: 1, value, lines: 0 });
+  const weights = new Map([
+    ["apim-dp-cp1111-dp0001", w(["eu-a"], 10)],
+    ["apim-dp-cp1111-dp0002", w(["us-b"], 20)],
+    ["apim-dp-cp1111-dp0003", w(["ap-c"], 5)],
+    ["apim-dp-cp2222-dp0001", w(["us-b"], 1)],
+    ["acme-prod", w(["eu-a"], 3)],
+  ]);
+  const out = buildOwnerRollup(weights, {
+    controlPlaneClusters: { "apim-cp-cp1111": ["core-us"], "apim-cp-cp2222": ["core-us"] },
+    customersByControlPlane: { cp1111: ["acme", "beacon"] },
+  });
+  assert.equal(out.data_plane_namespaces, 4);
+  assert.equal(out.data_plane_clusters, 3);
+  assert.equal(out.control_planes, 2);
+  assert.equal(out.other_namespaces, 1);
+  assert.deepEqual(out.by_control_plane[0], {
+    control_plane_id: "cp1111",
+    control_plane_namespace: "apim-cp-cp1111",
+    control_plane_clusters: ["core-us"],
+    customers: ["acme", "beacon"],
+    data_planes: 3,
+    data_plane_clusters: ["ap-c", "eu-a", "us-b"],
+    series: 3,
+    value: 35,
+  });
+  assert.deepEqual(out.by_control_plane_cluster, [{ cluster: "core-us", control_planes: 2, data_planes: 4 }]);
+  assert.match(out.note, /4 data-plane namespace\(s\) across 3 cluster\(s\) belong to 2 control plane\(s\), which run on 1 cluster\(s\): core-us \(2\)/);
+  assert.match(out.note, /check the control-plane side/);
+});
+
+test("buildOwnerRollup: nothing to roll up below the threshold", () => {
+  const weights = new Map([
+    ["apim-dp-cp1111-dp0001", { clusters: new Set(), series: 1, value: 1, lines: 0 }],
+    ["apim-dp-cp1111-dp0002", { clusters: new Set(), series: 1, value: 1, lines: 0 }],
+  ]);
+  assert.equal(buildOwnerRollup(weights), null);
 });

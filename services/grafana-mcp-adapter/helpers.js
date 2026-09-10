@@ -1737,3 +1737,137 @@ export function applyEdgeCounts(buckets = [], exact = {}) {
     return { ...b, count: Number(v), partial: { ...b.partial, count_exact: true } };
   });
 }
+
+// ---------------------------------------------------------------------------
+// Who owns a broad result
+// ---------------------------------------------------------------------------
+//
+// Sync errors on "126 namespaces across 10 clusters" read as a global problem.
+// They were all data planes of 19 control planes — which own data planes in every
+// region, so trouble on the control-plane side surfaces everywhere at once. A
+// Gravitee Cloud data-plane namespace carries its control plane's id in its name
+// (verified: every live apim-dp-* namespace has the shape, and every derived id
+// has a live apim-cp-<id> namespace), so the spread can be rolled up to its owners
+// exactly — no map lookup needed for the attribution itself.
+
+const DATA_PLANE_NAMESPACE = /^apim-dp-((?:trial-)?[a-z0-9]+)-[a-z0-9]+$/;
+export const OWNER_ROLLUP_MIN_NAMESPACES = 3;
+
+export function controlPlaneOfNamespace(namespace) {
+  const m = DATA_PLANE_NAMESPACE.exec(String(namespace || ""));
+  return m ? m[1] : null;
+}
+
+// Per-namespace weight across EVERY frame of a raw payload. Built from the payload
+// rather than the digest: the digest keeps 50 series, and a rollup over a
+// truncated list would undercount exactly the broad results it exists for.
+export function namespaceWeightsFromPayload(payload = {}) {
+  const weights = new Map();
+  const add = (labels, { series = 0, value = 0, lines = 0 }) => {
+    const ns = labels?.namespace;
+    if (!ns) return;
+    const w = weights.get(ns) || { clusters: new Set(), series: 0, value: 0, lines: 0 };
+    if (labels.cluster) w.clusters.add(labels.cluster);
+    w.series += series;
+    w.value += value;
+    w.lines += lines;
+    weights.set(ns, w);
+  };
+  for (const res of Object.values(payload.results || {})) {
+    for (const frame of Array.isArray(res?.frames) ? res.frames : []) {
+      const kind = classifyFrame(frame);
+      const fields = frame?.schema?.fields || [];
+      const values = frame?.data?.values || [];
+      if (kind === "logs") {
+        for (const labels of values[findField(fields, "labels")] || []) add(labels, { lines: 1 });
+      } else if (kind !== "table") {
+        for (let i = 0; i < fields.length; i++) {
+          if (fields[i]?.type !== "number") continue;
+          const nums = (values[i] || []).filter((v) => typeof v === "number");
+          const avg = nums.length ? nums.reduce((a, b) => a + b, 0) / nums.length : 0;
+          add(fields[i]?.labels, { series: 1, value: avg });
+        }
+      }
+    }
+  }
+  return weights;
+}
+
+export function buildOwnerRollup(weights, { controlPlaneClusters = {}, customersByControlPlane = {}, limit = 20 } = {}) {
+  const byCp = new Map();
+  const dpClusters = new Set();
+  let dpCount = 0;
+  let other = 0;
+  for (const [ns, w] of weights || []) {
+    const cp = controlPlaneOfNamespace(ns);
+    if (!cp) {
+      other++;
+      continue;
+    }
+    dpCount++;
+    const e = byCp.get(cp) || { id: cp, dataPlanes: 0, clusters: new Set(), series: 0, value: 0, lines: 0 };
+    e.dataPlanes++;
+    for (const c of w.clusters) {
+      e.clusters.add(c);
+      dpClusters.add(c);
+    }
+    e.series += w.series;
+    e.value += w.value;
+    e.lines += w.lines;
+    byCp.set(cp, e);
+  }
+  if (dpCount < OWNER_ROLLUP_MIN_NAMESPACES) return null;
+
+  const weightOf = (r) => r.lines || r.value || 0;
+  const rows = [...byCp.values()]
+    .map((e) => {
+      const cpNs = `apim-cp-${e.id}`;
+      return {
+        control_plane_id: e.id,
+        control_plane_namespace: cpNs,
+        control_plane_clusters: controlPlaneClusters[cpNs] || [],
+        customers: customersByControlPlane[e.id] || [],
+        data_planes: e.dataPlanes,
+        data_plane_clusters: [...e.clusters].sort(),
+        ...(e.series ? { series: e.series, value: Math.round(e.value * 1000) / 1000 } : {}),
+        ...(e.lines ? { lines: e.lines } : {}),
+      };
+    })
+    .sort((a, b) => weightOf(b) - weightOf(a) || b.data_planes - a.data_planes);
+
+  const byCluster = new Map();
+  for (const r of rows) {
+    for (const c of r.control_plane_clusters.length ? r.control_plane_clusters : ["unknown"]) {
+      const e = byCluster.get(c) || { cluster: c, control_planes: 0, data_planes: 0 };
+      e.control_planes++;
+      e.data_planes += r.data_planes;
+      byCluster.set(c, e);
+    }
+  }
+  const clusterRows = [...byCluster.values()].sort((a, b) => b.data_planes - a.data_planes);
+  const known = clusterRows.filter((c) => c.cluster !== "unknown");
+
+  let note =
+    `${dpCount} data-plane namespace(s)${dpClusters.size ? ` across ${dpClusters.size} cluster(s)` : ""} ` +
+    `belong to ${rows.length} control plane(s)`;
+  if (known.length) {
+    note += `, which run on ${known.length} cluster(s): ${known.slice(0, 5).map((c) => `${c.cluster} (${c.control_planes})`).join(", ")}`;
+  }
+  note += ".";
+  if (known.length && dpClusters.size > known.length) {
+    note +=
+      " The result spreads across more data-plane clusters than its control planes run on. Data planes sync from " +
+      "their control plane wherever they run, so check the control-plane side before reading this as a global problem.";
+  }
+
+  return {
+    data_plane_namespaces: dpCount,
+    ...(dpClusters.size ? { data_plane_clusters: dpClusters.size } : {}),
+    control_planes: rows.length,
+    by_control_plane: rows.slice(0, limit),
+    ...(rows.length > limit ? { by_control_plane_truncated: rows.length - limit } : {}),
+    by_control_plane_cluster: clusterRows,
+    ...(other ? { other_namespaces: other } : {}),
+    note,
+  };
+}
