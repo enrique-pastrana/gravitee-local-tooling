@@ -37,6 +37,21 @@ import {
   buildIngressQuery,
   INGRESS_JOB,
   NGINX_PATTERN,
+  INGRESS_JOBS,
+  ingressJobs,
+  ingressName,
+  unwrapNumeric,
+  RETRIED_MATCHER,
+  parseAccessLogLine,
+  applySamplingToCoverage,
+  extractStreamSelector,
+  queryIntervalMs,
+  timelineFromPayload,
+  samplingFromGroupedCounts,
+  collapseSampledMatrix,
+  aggregateUpstreamAttempts,
+  rollupByNode,
+  ADAPTIVE_LOGS_LABEL,
 } from "./helpers.js";
 import { loadCustomerMap, warmCustomerMap, resolveCustomerNamespaces, matchCustomers, groupByCustomer, lookupById, dataPlaneNamespace, controlPlaneNamespace } from "./customerMap.js";
 
@@ -45,6 +60,11 @@ import { loadCustomerMap, warmCustomerMap, resolveCustomerNamespaces, matchCusto
 // every other one. requireDatasourceUid() turns "unset" into a clear error at
 // the point of use instead.
 const LOGS_DATASOURCE_UID = (process.env.GRAFANA_LOGS_DATASOURCE_UID || "").trim();
+
+// Optional Prometheus datasource scraping kube-state-metrics. Used only to turn
+// the upstream IPs in an access log into pods and nodes; everything else works
+// without it, and the result says how to enable it when it is unset.
+const METRICS_DATASOURCE_UID = (process.env.GRAFANA_METRICS_DATASOURCE_UID || "").trim();
 
 // Allowlist of datasource types whose QUERY LANGUAGE cannot write. This is the
 // whole basis of the read-only guarantee — it is not about token permissions, so
@@ -540,12 +560,17 @@ async function resolveIngressScope(cluster, namespaces, { from } = {}) {
       single_tenant: false,
       tenancy: "unknown",
       upstream_namespaces: [...own],
+      own_on_cluster: null,
       note:
         "Could not enumerate what else runs on this cluster, so the query is narrowed to this customer's " +
         "upstreams. That is the safe direction: it cannot return another tenant's requests, but a request " +
         "rejected at the ingress before an upstream was chosen is not included.",
     };
   }
+  // Which of the customer's namespaces actually run here. An explicitly named
+  // cluster that hosts none of them can only ever return a clean zero, and that
+  // zero reads as "no traffic" — so the caller refuses it rather than running it.
+  const ownOnCluster = tenants.filter((n) => own.has(n));
   const foreign = tenants.filter((n) => !own.has(n));
   if (!foreign.length) {
     return {
@@ -553,6 +578,7 @@ async function resolveIngressScope(cluster, namespaces, { from } = {}) {
       single_tenant: true,
       tenancy: "dedicated",
       upstream_namespaces: [],
+      own_on_cluster: ownOnCluster,
       note:
         `Every workload namespace on ${cluster} belongs to this customer, so the cluster-wide ingress ` +
         "stream is their request log in full — including requests rejected before an upstream was chosen.",
@@ -562,7 +588,8 @@ async function resolveIngressScope(cluster, namespaces, { from } = {}) {
     cluster,
     single_tenant: false,
     tenancy: "shared",
-    upstream_namespaces: [...own],
+    upstream_namespaces: ownOnCluster.length ? ownOnCluster : [...own],
+    own_on_cluster: ownOnCluster,
     other_tenant_namespaces: foreign.slice(0, 20),
     other_tenant_count: foreign.length,
     note:
@@ -572,6 +599,80 @@ async function resolveIngressScope(cluster, namespaces, { from } = {}) {
       "upstream was chosen (an unroutable host, a TLS failure) carries no upstream and is therefore not " +
       "included.",
   };
+}
+
+// Is the stream behind a Loki query being sampled?
+//
+// Needed exactly where results cannot say: an empty log result has no streams
+// to carry the label, and a metric result has aggregated it away. Adaptive Logs
+// attaches the label at query time — /series does not return it — so this is a
+// small count over the stream selector alone, grouped by the label, over the
+// last few minutes of the window. A spot check, and reported as one.
+async function samplingSpotCheck(uid, expr, window) {
+  const selector = extractStreamSelector(expr);
+  if (!selector) return null;
+  const endS = Math.floor(window.end_ms / 1000);
+  const rangeS = Math.max(60, Math.min(300, Math.round((window.end_ms - window.start_ms) / 1000)));
+  try {
+    const data = await grafanaDatasourceProxyGet(uid, "loki/api/v1/query", {
+      query: `sum by (${ADAPTIVE_LOGS_LABEL}) (count_over_time(${selector} [${rangeS}s]))`,
+      time: `${endS}000000000`,
+    });
+    return samplingFromGroupedCounts(data?.data?.result || [], {
+      checked: `stream selector ${selector}, last ${rangeS}s of the window`,
+    });
+  } catch {
+    return null;
+  }
+}
+
+// Upstream IPs -> pods and nodes, via kube-state-metrics.
+//
+// kube_pod_info carries node and host_ip but no pod IP; kube_pod_ips carries the
+// pod IP. Joined on (namespace, pod) they map an access log's upstream address
+// to the node it ran on — the step that turned "some pods are failing" into
+// "every failing pod is on one node". last_over_time over the window so a pod
+// that was replaced during it is still found; an IP can therefore list more
+// than one pod, and the result says so.
+async function podsByIp(cluster, ips, { start, end }) {
+  if (!METRICS_DATASOURCE_UID) {
+    return {
+      note:
+        "Upstream IPs were not resolved to pods: set GRAFANA_METRICS_DATASOURCE_UID to a Prometheus " +
+        "datasource that scrapes kube-state-metrics.",
+    };
+  }
+  const unique = [...new Set((ips || []).filter((ip) => /^[0-9a-f.:]+$/i.test(ip)))].slice(0, 100);
+  if (!unique.length) return { pods: new Map() };
+  try {
+    const ds = await assertReadOnly(METRICS_DATASOURCE_UID);
+    if (ds.type !== "prometheus") {
+      return { note: `GRAFANA_METRICS_DATASOURCE_UID is a ${ds.type} datasource, not prometheus; pods not resolved.` };
+    }
+  } catch (err) {
+    return { note: `Pods not resolved: ${err.message}` };
+  }
+  const safeCluster = String(cluster).replace(/["\\]/g, "");
+  const range = `${Math.max(end - start, 60)}s`;
+  const query =
+    "max by (ip, namespace, pod, node, host_ip) (" +
+    `last_over_time(kube_pod_ips{cluster="${safeCluster}", ip=~\`${unique.map((ip) => escapeRegex(ip)).join("|")}\`}[${range}]) ` +
+    "* on (namespace, pod) group_left (node, host_ip) " +
+    `max by (namespace, pod, node, host_ip) (last_over_time(kube_pod_info{cluster="${safeCluster}"}[${range}])))`;
+  try {
+    const data = await grafanaDatasourceProxyGet(METRICS_DATASOURCE_UID, "api/v1/query", { query, time: String(end) });
+    const pods = new Map();
+    for (const r of data?.data?.result || []) {
+      const m = r?.metric || {};
+      if (!m.ip) continue;
+      const list = pods.get(m.ip) || [];
+      list.push({ pod: m.pod || null, namespace: m.namespace || null, node: m.node || null, host_ip: m.host_ip || null });
+      pods.set(m.ip, list);
+    }
+    return { pods, query };
+  } catch (err) {
+    return { note: `Pods not resolved: ${err.reason || err.message}`, query };
+  }
 }
 
 // When a logs query returns nothing, the `client` text often just doesn't match
@@ -747,12 +848,12 @@ registerTool(
     "window those lines actually span — Loki fills the cap backwards from the window end, so a " +
     "capped 1-hour query may cover only its last minute. Every log result carries a `coverage` " +
     "verdict: NO_DATA_SCANNED (Loki scanned zero bytes: wrong selector or window, NOT evidence of " +
-    "absence), EMPTY_BUT_SCANNED (trustworthy negative), TRUNCATED, or OK. Check it before " +
+    "absence), EMPTY_BUT_SCANNED (trustworthy negative), EMPTY_BUT_SAMPLED (scanned, but Adaptive Logs discards lines, so the absence of one line is not proof), TRUNCATED, or OK. Check it before " +
     "reporting any negative finding. Times accept 'now-1h', epoch ms, or ISO 8601 with an explicit " +
     "offset; a timestamp without a timezone is refused rather than guessed. " +
     "Only datasources whose query language is " +
     `read-only are allowed (types: ${[...READONLY_QUERY_TYPES].join(", ")}); a uid of ` +
-    "any other type is rejected.",
+    "any other type is rejected. For metric queries the step follows max_data_points (or pass step), and output='timeline' returns [timestamp, value] pairs to show WHEN something changed.",
   {
     datasource_uid: z.string().describe("Datasource uid from grafana_list_datasources."),
     expr: z.string().optional().describe("Query expression. Prometheus (PromQL) and Loki (LogQL) only."),
@@ -768,13 +869,28 @@ registerTool(
     to: z.string().default("now").describe("Range end, e.g. 'now' or epoch ms."),
     max_data_points: z
       .number().int().min(1).max(5000).default(1000).optional()
-      .describe("Resolution for METRIC queries. Has no effect on log queries — use max_lines for those."),
+      .describe(
+        "Resolution for METRIC queries: the range is divided into this many points (minimum step 1s). " +
+          "Has no effect on log queries — use max_lines for those.",
+      ),
     max_lines: z
       .number().int().min(1).max(5000).default(100).optional()
       .describe("Maximum log lines to return for a Loki log query. Grafana's own default is 100."),
     raw: z.boolean().default(false).optional().describe("Return the full raw frames instead of the digest. Can be very large."),
+    step: z
+      .string()
+      .optional()
+      .describe("Explicit step for METRIC queries (30s, 5m, 15m, 1h). Overrides max_data_points."),
+    output: z
+      .enum(["digest", "timeline"])
+      .default("digest")
+      .optional()
+      .describe(
+        "digest (default): per-series first/last/min/max/avg. timeline: [timestamp, value] pairs per series " +
+          "at the step — use it to see WHEN something changed; the digest hides the shape.",
+      ),
   },
-  async ({ datasource_uid, expr, query, from = "now-1h", to = "now", max_data_points = 1000, max_lines = 100, raw = false }) =>
+  async ({ datasource_uid, expr, query, from = "now-1h", to = "now", max_data_points = 1000, max_lines = 100, raw = false, step, output = "digest" }) =>
     withToolLogging("grafana_query", { datasource_uid }, async () => {
       if (!expr && !query) throw new Error("either expr (Prometheus/Loki) or query (other datasource types) is required");
       const ds = await assertReadOnly(datasource_uid);
@@ -784,6 +900,13 @@ registerTool(
         assertCloudwatchNotBillableLogs(query || {});
         log("warn", "Billable datasource queried", { tool: "grafana_query", datasource_uid, type: ds.type });
       }
+      const window = resolvedWindow(from, to, 3600);
+      const intervalMs = queryIntervalMs({
+        startMs: window.start_ms,
+        endMs: window.end_ms,
+        maxDataPoints: max_data_points,
+        step,
+      });
       const payload = await grafanaPost("/ds/query", {
         from,
         to,
@@ -804,6 +927,11 @@ registerTool(
             // the datasource sets it), so both have to be sent explicitly —
             // otherwise the line cap is invisible and uncontrollable.
             maxDataPoints: max_data_points,
+            // Without intervalMs, /api/ds/query evaluates Loki and Prometheus
+            // metric queries at a 1s step regardless of maxDataPoints: 3,601
+            // points for one hour, unreadable in the digest and over the result
+            // limit raw.
+            intervalMs,
             maxLines: max_lines,
           },
         ],
@@ -814,20 +942,47 @@ registerTool(
         // be read as the complete set.
         return textResult(withBillingNotice(withRawTruncationNote(payload, max_lines), ds.type));
       }
-      const window = resolvedWindow(from, to, 3600);
+      // The scope note describes LOG scoping. On a Prometheus query it claimed
+      // "application logs only" about kube_pod_info.
+      const scope = ds.type === "loki" && expr && scopeNote(expr) ? { scope_applied: expr, scope_note: scopeNote(expr) } : {};
+      const windowReport = {
+        requested: { from, to },
+        resolved_utc: `${window.from_utc} .. ${window.to_utc}`,
+        step_seconds: Math.round(intervalMs / 1000),
+      };
+      if (output === "timeline") {
+        return textResult(
+          withBillingNotice(
+            { window: windowReport, ...scope, results: timelineFromPayload(payload, { maxPoints: max_data_points }) },
+            ds.type,
+          ),
+        );
+      }
+
+      const digest = summarizeQueryResult(payload, { limit: max_lines, window });
+      if (ds.type === "loki" && expr) {
+        const entries = Object.values(digest.results || {});
+        // An empty log result has no streams to carry the sampling label, and a
+        // metric result has aggregated it away — exactly the two cases where a
+        // number or an absence gets over-trusted. Check the stream directly.
+        const needsCheck = entries.some(
+          (e) => !e.adaptive_logs_sampling && (e.coverage === "EMPTY_BUT_SCANNED" || e.series_count !== undefined),
+        );
+        const spot = needsCheck ? await samplingSpotCheck(datasource_uid, expr, window) : null;
+        for (const e of entries) {
+          const sampling = e.adaptive_logs_sampling || spot;
+          if (sampling) applySamplingToCoverage(e, sampling);
+        }
+      }
       return textResult(
         withBillingNotice(
           {
             // Echo the window the query actually ran over. A wrong window is the
             // commonest cause of a confident empty answer, and it belongs in the
             // result rather than being inferred from surprise at the results.
-            window: { requested: { from, to }, resolved_utc: `${window.from_utc} .. ${window.to_utc}` },
-            // What this selector did and did not search. A namespace-scoped
-            // negative and a cluster-wide one read identically without it, and
-            // the difference between them is whole categories of shared
-            // infrastructure — including every HTTP access log.
-            ...(expr && scopeNote(expr) ? { scope_applied: expr, scope_note: scopeNote(expr) } : {}),
-            ...summarizeQueryResult(payload, { limit: max_lines, window }),
+            window: windowReport,
+            ...scope,
+            ...digest,
           },
           ds.type,
         ),
@@ -1030,7 +1185,7 @@ registerTool(
     "last 24h, because incidents are usually reported well after they start. Returns " +
     "counts only — no log lines. " +
     "NOT COVERED by `client`: HTTP access logs — status codes, request durations, upstream response " +
-    "times — come from the shared ingress controller at {cluster=\"<cluster>\", job=\"flow/ingress-nginx-ingress-nginx\"}, " +
+    "times — come from the shared ingress controller at {cluster=\"<cluster>\", job=~\"flow/ingress-nginx-ingress-nginx|flow/app-routing-system-\"}, " +
     "NOT the customer's namespaces. Application logs are in the customer namespace; request logs are " +
     "not. Use grafana_http_requests for those.",
   {
@@ -1057,7 +1212,9 @@ registerTool(
 
       // count_over_time's range vector matches the step, so buckets tile the
       // window exactly: no overlap (which double-counts) and no gaps.
-      const query = `sum(count_over_time(${selector} [${step}]))`;
+      // Grouped by the sampling label so a sampled stream is visible in the same
+      // read at no extra cost; the groups are summed back into one trend.
+      const query = `sum by (${ADAPTIVE_LOGS_LABEL}) (count_over_time(${selector} [${step}]))`;
       const data = await grafanaDatasourceProxyGet(uid, "loki/api/v1/query_range", {
         query,
         start: `${start * 1e9}`,
@@ -1065,7 +1222,7 @@ registerTool(
         step,
       });
 
-      const points = data?.data?.result?.[0]?.values || [];
+      const { points, sampling: trendSampling } = collapseSampledMatrix(data?.data?.result || []);
       const buckets = buildTrendBuckets(points, { startSeconds: start, endSeconds: end, stepSeconds });
       const summary = summarizeTrend(buckets);
 
@@ -1081,6 +1238,7 @@ registerTool(
         ...summary,
         buckets,
       };
+      if (trendSampling) result.adaptive_logs_sampling = trendSampling;
       // An all-zero series and a broken query look identical in the numbers, so
       // say which one this is.
       if (summary.total === 0) {
@@ -1110,7 +1268,7 @@ registerTool(
     "lines Loki assigned to a pattern, so it is NOT a total line count. Loki's pattern " +
     "endpoint does not support line filters. " +
     "NOT COVERED by `client`: HTTP access logs — status codes, request durations, upstream response " +
-    "times — come from the shared ingress controller at {cluster=\"<cluster>\", job=\"flow/ingress-nginx-ingress-nginx\"}, " +
+    "times — come from the shared ingress controller at {cluster=\"<cluster>\", job=~\"flow/ingress-nginx-ingress-nginx|flow/app-routing-system-\"}, " +
     "NOT the customer's namespaces. Application logs are in the customer namespace; request logs are " +
     "not. Use grafana_http_requests for those.",
   {
@@ -1183,7 +1341,7 @@ registerTool(
     "ALSO returns the CLUSTER each customer is on. That matters because the namespaces are only half " +
     "of where their logs live: HTTP access logs — status codes, request durations, upstream response " +
     "times — are emitted by the shared ingress controller at {cluster=\"<cluster>\", " +
-    "job=\"flow/ingress-nginx-ingress-nginx\"} and are unreachable from any namespace-scoped query. " +
+    "job=~\"flow/ingress-nginx-ingress-nginx|flow/app-routing-system-\"} and are unreachable from any namespace-scoped query. " +
     "Application logs are in the customer namespace; request logs are not. Pass the customer to " +
     "grafana_http_requests to read them.",
   {
@@ -1289,9 +1447,10 @@ registerTool(
               http_request_logs_note:
                 "The namespaces above hold APPLICATION logs. HTTP access logs — status codes, request " +
                 "durations, upstream response times — are NOT in them: they are emitted by the shared " +
-                "ingress controller and identified by the cluster label, at " +
-                `{cluster="${clusterInfo.clusters[0]}", job="${INGRESS_JOB}"}` +
-                ". The `client` parameter on the other log tools does not cover those. Use " +
+                "ingress controllers and identified by the cluster label, at " +
+                `{cluster="${clusterInfo.clusters[0]}", job=~"${Object.values(INGRESS_JOBS).join("|")}"}` +
+                " — ingress-nginx for gateway and management traffic, app-routing for bridge traffic. " +
+                "The `client` parameter on the other log tools does not cover those. Use " +
                 "grafana_http_requests, which resolves the cluster and scopes it to this customer.",
             }
           : {}),
@@ -1540,45 +1699,47 @@ registerTool(
 
 registerTool(
   "grafana_http_requests",
-  "Read-only: HTTP request logs for a customer — status codes, request durations and " +
-    "upstream response times, from the ingress access log. Use this for 'how long is the " +
-    "Management API actually taking', 'are we returning 5xx', 'did requests time out'. " +
-    "IMPORTANT — this data is NOT reachable through the other log tools: they scope by " +
-    "`client` to the customer's own namespaces, which hold APPLICATION logs only, while " +
-    "access logs are emitted by the shared ingress controller and identified by the " +
-    "cluster label. A negative from grafana_query or grafana_logs_trend says nothing " +
-    "about request logs. " +
-    "Default mode is aggregate: the status-code distribution and latency percentiles over " +
-    "the window, which is what establishes a pattern (a count of 499s, not a reading of " +
-    "individual lines). Pass mode='sample' for parsed individual requests. " +
-    "Scoping is handled for you: the cluster is resolved from the customer, and on a " +
-    "multi-tenant cluster the query is narrowed to this customer's upstreams so it cannot " +
-    "return another tenant's traffic. " +
-    "Prefer this over a line filter on the raw ingress stream: the access-log line carries " +
-    "several bare numbers, so grepping for a status code also matches request sizes and " +
-    "durations that happen to have that value (verified: `|= \" 499 \"` returns 200s whose " +
-    "request length was 499 bytes). status_filter matches the parsed status field only. " +
-    "Reports upstream_response_time alongside request_time — the gap between them is where " +
-    "the time went, and upstream_status is `-` exactly when the client gave up before the " +
-    "backend answered, which is the signature of a timeout rather than a slow response.",
+  "Read-only: HTTP request logs for a customer — status codes, durations, upstream response times and " +
+    "retries — from BOTH ingress controllers: ingress-nginx (gateways, management API) and the AKS " +
+    "app-routing ingress (bridge traffic, /_bridge/...). Searching one controller for traffic that went " +
+    "through the other returns a clean, scanned, empty — and wrong — result, so both are searched by " +
+    "default. This data is NOT reachable through the other log tools: they scope `client` to the " +
+    "customer's own namespaces, which hold application logs only. " +
+    "Default mode is aggregate, per ingress: status distribution, p50/p95/max request time, upstream p95, " +
+    "retried requests, and by_upstream — attempts and failures per upstream pod IP, resolved to pod and " +
+    "node when a metrics datasource is configured, with a by_node rollup. That table is what exposes one " +
+    "bad node: failures concentrated on pods sharing a node while their siblings elsewhere are healthy. " +
+    "mode='sample' returns parsed requests with every retry attempt kept. " +
+    "Bridge calls terminate on the CONTROL plane, which usually runs on a different cluster from its data " +
+    "planes: pass control_plane_id to include it (it is shared by every customer in that organization, so " +
+    "it is never included implicitly) and cluster to pick which side. " +
+    "On a multi-tenant cluster results are narrowed to this customer's upstreams, so they cannot include " +
+    "another tenant's traffic. Adaptive Logs sampling is reported when present; counts are then lower " +
+    "bounds. Prefer this over grepping the raw stream: `|= \" 499 \"` also matches request sizes of 499 " +
+    "bytes, while status_filter matches the parsed field only.",
   {
     client: z
       .string()
       .optional()
-      .describe("Customer name fragment, e.g. 'april', 'demo qa'. Resolved to their cluster."),
+      .describe("Customer name fragment, e.g. 'acme'. Resolved to their cluster."),
     cluster: z
       .string()
       .optional()
       .describe(
-        "Cluster label, if already known (from grafana_find_customer). Overrides client resolution. " +
-          "On a multi-tenant cluster, pass client too or results will include other tenants.",
+        "Cluster label (from grafana_find_customer). Required when the customer spans clusters — typically " +
+          "control plane and data planes. Refused if none of the customer's namespaces run on it.",
       ),
+    ingress: z
+      .enum(["all", "nginx", "app-routing"])
+      .default("all")
+      .optional()
+      .describe("nginx = gateways and management API; app-routing = bridge; all (default) = both, reported separately."),
     mode: z
       .enum(["aggregate", "sample"])
       .default("aggregate")
       .optional()
-      .describe("aggregate = status distribution + latency percentiles. sample = individual parsed requests."),
-    path_filter: z.string().optional().describe("Substring of the request path, e.g. '_import/crd'. Case-insensitive."),
+      .describe("aggregate = distributions, latency, retries, failures per upstream. sample = parsed individual requests."),
+    path_filter: z.string().optional().describe("Substring of the request path, e.g. '_bridge' or '_import/crd'. Case-insensitive."),
     status_filter: z.string().optional().describe("Status code, class, or list: '499', '5xx', '499, 5xx'."),
     method: z.string().optional().describe("HTTP method, e.g. 'POST'."),
     min_duration_seconds: z
@@ -1587,13 +1748,20 @@ registerTool(
       .describe("Only requests at least this slow, by request_time. Use to surface the slow tail."),
     from: z.string().default("now-1h").describe("Range start, e.g. 'now-6h', or epoch ms."),
     to: z.string().default("now").describe("Range end."),
-    interval: z.string().optional().describe("Bucket size for the aggregate trend (5m, 1h). Defaults to a readable number of buckets."),
+    interval: z.string().optional().describe("Bucket size for the aggregate trend (5m, 15m, 1h)."),
     max_lines: z.number().int().min(1).max(500).default(50).optional().describe("Cap for mode='sample'."),
-    control_plane_id: z.string().optional().describe("Narrow to one Cockpit organization (see grafana_find_customer)."),
+    control_plane_id: z
+      .string()
+      .optional()
+      .describe(
+        "Cockpit organization (control plane) id. Includes its control-plane namespace, where bridge traffic " +
+          "lands. Shared by every customer in the organization.",
+      ),
   },
   async ({
     client,
     cluster,
+    ingress = "all",
     mode = "aggregate",
     path_filter,
     status_filter,
@@ -1605,7 +1773,7 @@ registerTool(
     max_lines = 50,
     control_plane_id,
   }) =>
-    withToolLogging("grafana_http_requests", { client, cluster, mode, from, to }, async () => {
+    withToolLogging("grafana_http_requests", { client, cluster, ingress, mode, from, to }, async () => {
       const uid = requireDatasourceUid(LOGS_DATASOURCE_UID);
       if (!client && !cluster) {
         throw new Error("Pass client (resolved to a cluster) or cluster.");
@@ -1617,7 +1785,6 @@ registerTool(
       let namespaces = [];
       if (client) {
         resolution = await resolveNamespaces(client, { from, control_plane_id });
-        namespaces = resolution.namespaces;
         if (resolution.ambiguous_customer) {
           return textResult({
             client,
@@ -1626,13 +1793,17 @@ registerTool(
             note: resolution.note,
           });
         }
+        namespaces = [...resolution.namespaces];
       }
+      // Bridge traffic terminates on the control plane. Its namespace is shared by
+      // every customer in the organization, so it is included only when asked for.
+      const controlPlaneNs = control_plane_id ? controlPlaneNamespace(control_plane_id) : null;
+      if (controlPlaneNs && !namespaces.includes(controlPlaneNs)) namespaces.push(controlPlaneNs);
 
-      let clusters = cluster ? [cluster] : [];
-      if (!clusters.length) {
-        const info = await resolveClusters(namespaces, { from });
-        clusters = info.clusters;
-      }
+      const clusterInfo = namespaces.length
+        ? await resolveClusters(namespaces, { from })
+        : { clusters: [], by_namespace: {} };
+      const clusters = cluster ? [cluster] : clusterInfo.clusters;
       if (!clusters.length) {
         return textResult({
           client,
@@ -1649,34 +1820,64 @@ registerTool(
         return textResult({
           client,
           clusters,
+          namespace_clusters: clusterInfo.by_namespace,
           note:
             `This customer spans ${clusters.length} clusters. Aggregating them would produce a status ` +
             "distribution and latency percentiles that describe neither. Re-run with cluster set to one of " +
-            "the above.",
+            "the above" +
+            (controlPlaneNs
+              ? " — the control plane (bridge traffic) and the data planes (gateway traffic) are usually on different ones."
+              : "."),
         });
       }
 
       const target = clusters[0];
       const scope = await resolveIngressScope(target, namespaces, { from });
-      const base = {
+      if (namespaces.length && Array.isArray(scope.own_on_cluster) && !scope.own_on_cluster.length) {
+        return textResult({
+          cluster: target,
+          customer_namespaces: namespaces,
+          customer_clusters: clusterInfo.clusters,
+          namespace_clusters: clusterInfo.by_namespace,
+          note:
+            `None of this customer's namespaces run on ${target}, so nothing on its ingress can be attributed ` +
+            "to them — a query here would return a clean zero that means nothing. " +
+            (clusterInfo.clusters.length ? `They run on: ${clusterInfo.clusters.join(", ")}. ` : "") +
+            (controlPlaneNs
+              ? ""
+              : "For bridge traffic pass control_plane_id: bridge calls land on the control plane's cluster, not the data planes'."),
+        });
+      }
+
+      const streamQuery = buildIngressQuery({
         cluster: target,
+        ingress,
         upstreamNamespaces: scope.upstream_namespaces,
         pathFilter: path_filter,
         statusFilter: status_filter,
         method,
         minDurationSeconds: min_duration_seconds,
-      };
-      const streamQuery = buildIngressQuery(base);
+      });
       const { start, end } = rangeSeconds(from, to);
       const rangeLabel = `${Math.max(end - start, 1)}s`;
 
       const shared = {
         cluster: target,
+        ingress,
+        ingress_jobs: ingressJobs(ingress),
         scope: {
           tenancy: scope.tenancy,
           single_tenant_cluster: scope.single_tenant,
           customer_namespaces: namespaces,
           ...(scope.other_tenant_count ? { other_tenants_on_cluster: scope.other_tenant_count } : {}),
+          ...(controlPlaneNs
+            ? {
+                control_plane_namespace: controlPlaneNs,
+                control_plane_note:
+                  "Included because control_plane_id was passed. A control plane is shared by every customer in " +
+                  "its Cockpit organization, so its bridge traffic is theirs collectively, not this customer's alone.",
+              }
+            : {}),
           note: scope.note,
         },
         ...(resolution ? resolutionReport(resolution) : {}),
@@ -1690,151 +1891,231 @@ registerTool(
         },
       };
 
+      // Every Loki call names its query when it fails. A bare "HTTP 400" sent an
+      // incident to hand-written LogQL; the reason and the query fix that in one read.
+      const lokiGet = async (part, path, params) => {
+        try {
+          return await grafanaDatasourceProxyGet(uid, path, params);
+        } catch (err) {
+          log("error", "Loki query failed", { tool: "grafana_http_requests", part, query: params.query, error: err.message });
+          const wrapped = new Error(`${part} query failed: ${err.message} | LogQL: ${params.query}`);
+          wrapped.part = part;
+          wrapped.query = params.query;
+          wrapped.reason = err.reason || err.message;
+          throw wrapped;
+        }
+      };
+
       if (mode === "sample") {
-        const data = await grafanaDatasourceProxyGet(uid, "loki/api/v1/query_range", {
+        const data = await lokiGet("sample", "loki/api/v1/query_range", {
           query: streamQuery,
-          start: `${start * 1e9}`,
-          end: `${end * 1e9}`,
+          start: `${start}000000000`,
+          end: `${end}000000000`,
           limit: String(max_lines),
           direction: "backward",
         });
         const streams = data?.data?.result || [];
         const requests = [];
-        for (const s of streams) {
-          for (const [ns, line] of s.values || []) {
+        let unparsed = 0;
+        for (const st of streams) {
+          for (const [ns, line] of st.values || []) {
+            const parsed = parseAccessLogLine(line);
+            if (!parsed) {
+              unparsed++;
+              continue;
+            }
+            const last = parsed.attempts[parsed.attempts.length - 1] || {};
             requests.push({
               time: new Date(Number(ns) / 1e6).toISOString(),
-              method: s.stream?.method ?? null,
-              path: s.stream?.path ?? null,
-              status: s.stream?.status ?? null,
-              request_time: s.stream?.request_time ? Number(s.stream.request_time) : null,
-              // nginx writes `-` when there was no upstream response — which is
-              // precisely what a 499 looks like: the client hung up before the
-              // backend answered. Kept as the literal `-` rather than coerced to
-              // null, because "no upstream status" is the finding.
-              upstream_response_time:
-                s.stream?.upstream_time && s.stream.upstream_time !== "-" ? Number(s.stream.upstream_time) : null,
-              upstream_status: s.stream?.upstream_status ?? null,
-              user_agent: s.stream?.user_agent ?? null,
-              upstream: s.stream?.upstream ?? null,
+              ingress: ingressName(st.stream?.job),
+              method: parsed.method,
+              path: parsed.path,
+              status: parsed.status,
+              request_time: parsed.request_time,
+              // The final attempt, for a one-glance read; `-` means that upstream
+              // never answered — the signature of a timeout, not a slow response.
+              upstream_status: last.status ?? null,
+              upstream_response_time: last.response_time ?? null,
+              upstream_addr: last.addr ?? null,
+              retried: parsed.retried,
+              ...(parsed.retried ? { attempts: parsed.attempts } : {}),
+              user_agent: parsed.user_agent,
+              upstream: parsed.upstream,
             });
           }
         }
         requests.sort((a, b) => (a.time < b.time ? 1 : -1));
-        const sampling = detectSampling(streams.map((s) => ({ labels: s.stream || {} })));
-        const truncated = requests.length >= max_lines;
+        const sampling = detectSampling(streams.map((st) => ({ labels: st.stream || {} })));
+        const returned = requests.length + unparsed;
         return textResult({
           query: streamQuery,
           ...shared,
           request_count: requests.length,
-          requests: requests.slice(0, max_lines),
+          ...(unparsed ? { unparsed_lines: unparsed } : {}),
+          requests,
           ...(sampling ? { adaptive_logs_sampling: sampling } : {}),
-          ...(truncated
+          ...(returned >= max_lines
             ? {
                 limit_reached: true,
                 note:
-                  `Returned ${requests.length} requests, the cap. Loki fills the cap from the END of the ` +
-                  "window backwards, so the earlier part of the range was not returned — use " +
-                  "mode='aggregate' for totals over the whole window.",
+                  `Returned ${returned} lines, the cap. Loki fills the cap from the END of the window backwards, ` +
+                  "so the earlier part of the range was not returned — use mode='aggregate' for totals.",
               }
             : {}),
         });
       }
 
-      // Aggregate. Counting is what establishes a pattern — reading lines is
-      // not — so this is the default. Two instant queries over the whole window:
-      // a status distribution and a latency profile, each grouped BY STATUS so
-      // the slow tail is attributed rather than averaged away. Grouping is not
-      // optional: without it the extracted path and user_agent become part of
-      // every series key and one window returns hundreds of series.
-      const countQuery = `sum by (status) (count_over_time(${streamQuery} [${rangeLabel}]))`;
-      const latencyQuery =
-        `quantile_over_time(0.95, ${streamQuery} | unwrap request_time [${rangeLabel}]) by (status)`;
-      // p50 alongside p95 because these distributions are routinely bimodal: two
-      // clients with different timeouts produce two clusters of durations, and a
-      // p95 alone reports only the slower one. p50 << p95 is the shape that says
-      // "a tail", not "everything is slow".
-      const medianQuery =
-        `quantile_over_time(0.5, ${streamQuery} | unwrap request_time [${rangeLabel}]) by (status)`;
-      const worstQuery = `max_over_time(${streamQuery} | unwrap request_time [${rangeLabel}]) by (status)`;
-      // Where the time actually went. request_time includes everything the
-      // ingress did; upstream_time is what the backend took. On a client timeout
-      // it is the only number saying how far the backend had got, and `-` (no
-      // upstream response at all) has to be excluded or it poisons the unwrap.
-      const upstreamLatencyQuery =
-        `quantile_over_time(0.95, ${streamQuery} | upstream_time != \`-\` ` +
-        `| unwrap upstream_time [${rangeLabel}]) by (status)`;
-
-      const instant = (query) =>
-        grafanaDatasourceProxyGet(uid, "loki/api/v1/query", { query, time: `${end * 1e9}` });
-      const [counts, p50, p95, worst, upstreamP95] = await Promise.all([
-        instant(countQuery),
-        instant(medianQuery),
-        instant(latencyQuery),
-        instant(worstQuery),
-        instant(upstreamLatencyQuery),
-      ]);
-
-      const numberByStatus = (payload) => {
-        const out = {};
-        for (const r of payload?.data?.result || []) {
-          const status = r?.metric?.status;
-          const value = Number(r?.value?.[1]);
-          if (status && Number.isFinite(value)) out[status] = value;
-        }
-        return out;
+      // Aggregate. Every unwrap is guarded: a retried request's upstream_time is a
+      // list, and one unparseable sample fails the whole query rather than being
+      // skipped. Everything is grouped by job so the two ingress controllers —
+      // different traffic, different latency — are never averaged together.
+      const G = "job, status";
+      const queries = {
+        counts: `sum by (job, status, ${ADAPTIVE_LOGS_LABEL}) (count_over_time(${streamQuery} [${rangeLabel}]))`,
+        latency_p50: `quantile_over_time(0.5, ${streamQuery}${unwrapNumeric("request_time")} [${rangeLabel}]) by (${G})`,
+        latency_p95: `quantile_over_time(0.95, ${streamQuery}${unwrapNumeric("request_time")} [${rangeLabel}]) by (${G})`,
+        latency_max: `max_over_time(${streamQuery}${unwrapNumeric("request_time")} [${rangeLabel}]) by (${G})`,
+        // Single-attempt requests only — the guard excludes lists rather than
+        // failing on them — and retries are counted separately so the exclusion
+        // is visible rather than silent.
+        upstream_latency_p95: `quantile_over_time(0.95, ${streamQuery}${unwrapNumeric("upstream_time")} [${rangeLabel}]) by (${G})`,
+        retried: `sum by (job) (count_over_time(${streamQuery}${RETRIED_MATCHER} [${rangeLabel}]))`,
+        by_upstream: `sum by (job, upstream_addr, upstream_status) (count_over_time(${streamQuery} [${rangeLabel}]))`,
       };
-      const countByStatus = numberByStatus(counts);
-      const p50ByStatus = numberByStatus(p50);
-      const p95ByStatus = numberByStatus(p95);
-      const maxByStatus = numberByStatus(worst);
-      const upstreamP95ByStatus = numberByStatus(upstreamP95);
+      const instant = (part) => lokiGet(part, "loki/api/v1/query", { query: queries[part], time: `${end}000000000` });
 
-      const total = Object.values(countByStatus).reduce((a, b) => a + b, 0);
-      const byStatus = Object.keys(countByStatus)
-        .sort((a, b) => countByStatus[b] - countByStatus[a])
-        .map((status) => ({
+      // The counts are the answer; everything else refines it. Only the counts may
+      // fail the call — a refinement Loki rejects (a series limit on a busy
+      // cluster, say) is reported alongside the answer, not allowed to replace it.
+      const counts = await instant("counts");
+      const secondary = ["latency_p50", "latency_p95", "latency_max", "upstream_latency_p95", "retried", "by_upstream"];
+      const settled = await Promise.allSettled(secondary.map((part) => instant(part)));
+      const got = {};
+      const partialFailures = [];
+      secondary.forEach((part, idx) => {
+        const r = settled[idx];
+        if (r.status === "fulfilled") got[part] = r.value?.data?.result || [];
+        else partialFailures.push({ part, error: r.reason?.reason || r.reason?.message, query: queries[part] });
+      });
+
+      const countRows = counts?.data?.result || [];
+      const sampling = samplingFromGroupedCounts(countRows);
+      const key = (m) => `${m?.job || ""}\u0000${m?.status || ""}`;
+      const countMap = new Map();
+      for (const r of countRows) {
+        const v = Number(r?.value?.[1]);
+        if (!Number.isFinite(v) || !r?.metric?.status) continue;
+        const k = key(r.metric);
+        countMap.set(k, (countMap.get(k) || 0) + v);
+      }
+      const numberMap = (rows = []) => {
+        const m = new Map();
+        for (const r of rows) {
+          const v = Number(r?.value?.[1]);
+          if (Number.isFinite(v)) m.set(key(r.metric), v);
+        }
+        return m;
+      };
+      const p50 = numberMap(got.latency_p50);
+      const p95 = numberMap(got.latency_p95);
+      const worst = numberMap(got.latency_max);
+      const upP95 = numberMap(got.upstream_latency_p95);
+      const retriedByJob = new Map((got.retried || []).map((r) => [r?.metric?.job || "", Number(r?.value?.[1])]));
+      const r3 = (v) => Math.round(v * 1000) / 1000;
+      const pct = (n, d) => (d ? Math.round((n / d) * 1000) / 10 : 0);
+
+      const byIngress = new Map();
+      const statusTotals = new Map();
+      for (const [k, count] of countMap) {
+        const [job, status] = k.split("\u0000");
+        const e = byIngress.get(job) || { ingress: ingressName(job), job, total_requests: 0, by_status: [] };
+        e.total_requests += count;
+        e.by_status.push({
           status,
-          count: countByStatus[status],
-          share_pct: total ? Math.round((countByStatus[status] / total) * 1000) / 10 : 0,
-          ...(p50ByStatus[status] !== undefined ? { p50_seconds: Math.round(p50ByStatus[status] * 1000) / 1000 } : {}),
-          ...(p95ByStatus[status] !== undefined ? { p95_seconds: Math.round(p95ByStatus[status] * 1000) / 1000 } : {}),
-          ...(maxByStatus[status] !== undefined ? { max_seconds: Math.round(maxByStatus[status] * 1000) / 1000 } : {}),
-          ...(upstreamP95ByStatus[status] !== undefined
-            ? { upstream_p95_seconds: Math.round(upstreamP95ByStatus[status] * 1000) / 1000 }
-            : {}),
-        }));
+          count,
+          ...(p50.has(k) ? { p50_seconds: r3(p50.get(k)) } : {}),
+          ...(p95.has(k) ? { p95_seconds: r3(p95.get(k)) } : {}),
+          ...(worst.has(k) ? { max_seconds: r3(worst.get(k)) } : {}),
+          ...(upP95.has(k) ? { upstream_p95_seconds: r3(upP95.get(k)) } : {}),
+        });
+        byIngress.set(job, e);
+        statusTotals.set(status, (statusTotals.get(status) || 0) + count);
+      }
+      const total = [...statusTotals.values()].reduce((a, b) => a + b, 0);
+      for (const e of byIngress.values()) {
+        e.by_status.sort((a, b) => b.count - a.count);
+        for (const row of e.by_status) row.share_pct = pct(row.count, e.total_requests);
+        if (retriedByJob.has(e.job)) e.retried_requests = retriedByJob.get(e.job);
+      }
+      const byStatus = [...statusTotals.entries()]
+        .sort((a, b) => b[1] - a[1])
+        .map(([status, count]) => ({ status, count, share_pct: pct(count, total) }));
 
-      // A trend alongside the totals: a status distribution says what happened,
-      // not when. Counting 499s in five-minute buckets is what turns "there are
-      // some timeouts" into "215 in one bucket, at this minute".
+      // Failures per upstream pod, and the node each pod ran on.
+      let upstreamSection = {};
+      if (got.by_upstream) {
+        const agg = aggregateUpstreamAttempts(got.by_upstream, { limit: 100 });
+        const resolved = await podsByIp(target, agg.rows.map((r) => r.ip), { start, end });
+        if (resolved.pods) {
+          for (const row of agg.rows) {
+            const pods = resolved.pods.get(row.ip);
+            if (pods) row.pods = pods;
+          }
+        }
+        const byNode = resolved.pods ? rollupByNode(agg.rows) : [];
+        upstreamSection = {
+          by_upstream: agg.rows.slice(0, 20),
+          upstreams_total: agg.total_upstreams,
+          ...(agg.total_upstreams > 20 ? { by_upstream_truncated: agg.total_upstreams - 20 } : {}),
+          ...(byNode.length ? { by_node: byNode } : {}),
+          ...(resolved.pods
+            ? {
+                pod_resolution:
+                  "Upstream IPs resolved to pods via kube_pod_ips over the query window. An IP can be reused after " +
+                  "a pod is replaced, so one may list more than one pod.",
+              }
+            : {}),
+          ...(resolved.note ? { pod_resolution_note: resolved.note } : {}),
+        };
+      }
+
+      // A trend alongside the totals: a distribution says what happened, not when.
       const step = interval || chooseInterval(Math.max(end - start, 1));
-      const trendData = await grafanaDatasourceProxyGet(uid, "loki/api/v1/query_range", {
-        query: `sum(count_over_time(${streamQuery} [${step}]))`,
-        start: `${start * 1e9}`,
-        end: `${end * 1e9}`,
-        step,
-      });
-      const buckets = buildTrendBuckets(trendData?.data?.result?.[0]?.values || [], {
-        startSeconds: start,
-        endSeconds: end,
-        stepSeconds: durationSeconds(step),
-      });
+      let trend = {};
+      try {
+        const trendQuery = `sum(count_over_time(${streamQuery} [${step}]))`;
+        const trendData = await lokiGet("trend", "loki/api/v1/query_range", {
+          query: trendQuery,
+          start: `${start}000000000`,
+          end: `${end}000000000`,
+          step,
+        });
+        const buckets = buildTrendBuckets(trendData?.data?.result?.[0]?.values || [], {
+          startSeconds: start,
+          endSeconds: end,
+          stepSeconds: durationSeconds(step),
+        });
+        trend = { interval: step, ...summarizeTrend(buckets), buckets };
+      } catch (err) {
+        partialFailures.push({ part: "trend", error: err.reason || err.message, query: err.query });
+      }
 
       const result = {
-        queries: { counts: countQuery, latency: latencyQuery, upstream_latency: upstreamLatencyQuery },
+        queries,
         ...shared,
         total_requests: total,
         by_status: byStatus,
-        interval: step,
-        ...summarizeTrend(buckets),
-        buckets,
+        by_ingress: [...byIngress.values()],
+        ...(sampling ? { adaptive_logs_sampling: sampling } : {}),
+        ...upstreamSection,
+        ...trend,
+        ...(partialFailures.length ? { partial_failures: partialFailures } : {}),
       };
       if (!total) {
         result.note =
-          "No requests matched. The query ran; this is not an error. Check the filters, widen the range, " +
-          "or drop status_filter/path_filter. If everything is empty, confirm the cluster with " +
-          "grafana_find_customer — the ingress job is shared, so a wrong cluster returns a clean zero.";
+          "No requests matched. The query ran; this is not an error. Check the filters, widen the range, or drop " +
+          "status_filter/path_filter. Bridge traffic goes through the app-routing ingress on the CONTROL plane's " +
+          "cluster — pass control_plane_id for it.";
       }
       return textResult(result);
     }),

@@ -54,10 +54,16 @@ const iso = (ms) => (Number.isFinite(ms) ? new Date(ms).toISOString() : null);
 //   TRUNCATED          - hit the cap; older matches were never returned.
 //   EMPTY_BUT_SCANNED  - a trustworthy negative for this filter and window.
 //   OK                 - results, within the cap.
-export function coverageVerdict({ lineCount, bytesProcessed, limitReached }) {
+//   EMPTY_BUT_SAMPLED  - scanned and empty, but Adaptive Logs discards lines
+//                        before Loki sees them. NOT proof a specific line was
+//                        never written.
+export function coverageVerdict({ lineCount, bytesProcessed, limitReached, sampled = false }) {
   if (limitReached) return "TRUNCATED";
   if (bytesProcessed === 0) return "NO_DATA_SCANNED";
-  if (lineCount === 0) return bytesProcessed === undefined ? "UNKNOWN" : "EMPTY_BUT_SCANNED";
+  if (lineCount === 0) {
+    if (bytesProcessed === undefined) return "UNKNOWN";
+    return sampled ? "EMPTY_BUT_SAMPLED" : "EMPTY_BUT_SCANNED";
+  }
   return "OK";
 }
 
@@ -985,36 +991,74 @@ export function rankClientSuggestions(values = [], client = "") {
 // does not exist. It does exist, one label away.
 export const INGRESS_JOB = "flow/ingress-nginx-ingress-nginx";
 
-// The ingress access-log line, as Loki's `pattern` parser.
+// There are TWO ingress controllers, and they carry different traffic.
 //
-// Verified against live lines on both cluster kinds. `pattern` is used rather
-// than the fifteen-group `regexp` this is usually written with: it is markedly
-// cheaper (no backtracking), and it is readable enough that the next person can
-// see what is being extracted. `<_>` discards a field without naming it, so only
-// the fields worth filtering or reporting on become labels — naming all fifteen
-// would put the remote address and referer into every series key.
-//
-// Fields kept: method, path, status, user_agent, request_time, upstream,
-// upstream_time, upstream_status.
-//
-// upstream_time earns its place: the gap between it and request_time is where
-// the time actually went (backend versus ingress or client), and on a client
-// timeout it is the only number that says how long the backend had got to. So
-// does upstream_status, which is `-` exactly when the client hung up before the
-// backend answered — the signature of a 499.
-//
-// The trailing `<_>` absorbs everything after upstream_status, which differs
-// between clusters (some append scheme and forwarded addresses, some stop at the
-// request id) — anchoring past it would silently match nothing on half the
-// estate. Verified both shapes: this pattern and one truncated at `[<upstream>]`
-// match exactly the same lines, so the extra fields cost no coverage.
-export const NGINX_PATTERN =
-  '<_> - <_> [<_>] "<method> <path> <_>" <status> <_> "<_>" "<user_agent>" <_> <request_time> ' +
-  "[<upstream>] <_> <_> <_> <upstream_time> <upstream_status> <_>";
+// ingress-nginx fronts gateways and the management API. The AKS app-routing
+// add-on (namespace `app-routing-system`) fronts the bridge: every data plane's
+// `/_bridge/...` sync call to its control plane. Searching only ingress-nginx for
+// bridge failures returns a clean, scanned, empty result — a false negative that
+// hid the key evidence of an incident, where bridge calls to one pod IP returned
+// 499 after 1s while calls to its sibling returned 200 in 2ms. Both controllers
+// write the same access-log format, so both are parsed identically.
+export const INGRESS_JOBS = Object.freeze({
+  nginx: INGRESS_JOB,
+  "app-routing": "flow/app-routing-system-",
+});
 
-// Grafana Adaptive Logs marks a sampled stream with this label. Its presence
-// means lines were DISCARDED before reaching Loki.
-export const ADAPTIVE_LOGS_LABEL = "__adaptive_logs_sampled__";
+export function ingressJobs(ingress = "all") {
+  if (ingress === "all" || ingress === undefined || ingress === null) return Object.values(INGRESS_JOBS);
+  const job = INGRESS_JOBS[ingress];
+  if (!job) {
+    throw new Error(`Unknown ingress "${ingress}". Use one of: ${Object.keys(INGRESS_JOBS).join(", ")}, all.`);
+  }
+  return [job];
+}
+
+export function ingressName(job) {
+  const hit = Object.entries(INGRESS_JOBS).find(([, j]) => j === job);
+  return hit ? hit[0] : job || null;
+}
+
+// The access-log line, parsed in two stages.
+//
+// The head — method through upstream name — is fixed-shape, so Loki's `pattern`
+// parser handles it cheaply and readably. `<_>` discards a field without naming
+// it, so the client address and referer never become labels.
+//
+// The tail cannot be a pattern. When nginx retries a request against another
+// upstream it records every attempt, comma-separated, in each upstream field:
+//
+//   [ns-svc-82] [] 10.0.1.11:8082, 10.0.1.12:8082 0, 99 83.442, 0.502 502, 200 <req_id>
+//
+// A space-delimited pattern shifts every field after the first comma, so
+// upstream_time came out as "0," — and one such value anywhere in the window
+// made Loki reject the entire unwrap query with HTTP 400. That is why the tool
+// failed on longer windows: they were more likely to contain a retry. Retried
+// requests are also exactly the interesting ones. The regexp captures each
+// field as a whole list instead. Verified live: head-only and head+tail match
+// exactly the same lines, on both ingress controllers.
+export const NGINX_PATTERN =
+  '<_> - <_> [<_>] "<method> <path> <_>" <status> <_> "<_>" "<user_agent>" <_> <request_time> [<upstream>] <_>';
+
+const UPSTREAM_LIST = "\\S+(?:(?:, | : )\\S+)*";
+export const UPSTREAM_TAIL_REGEXP =
+  `\\] \\[[^\\]]*\\] (?P<upstream_addr>${UPSTREAM_LIST}) ${UPSTREAM_LIST} ` +
+  `(?P<upstream_time>${UPSTREAM_LIST}) (?P<upstream_status>${UPSTREAM_LIST}) [0-9a-f]{32}`;
+
+// Only a request that went to more than one upstream has a list here.
+export const RETRIED_MATCHER = " | upstream_addr =~ `.*(?:, | : ).*`";
+
+// Numeric operations only on values that ARE numbers. An unwrap or a numeric
+// comparison that meets a non-number does not skip the sample — it fails the
+// whole query. Label matchers are fully anchored in LogQL, so this admits a
+// single number and nothing else (not "0,", not "-", not an empty string).
+export function numericGuard(field) {
+  return ` | ${field} =~ \`[0-9]+(?:\\.[0-9]+)?\``;
+}
+
+export function unwrapNumeric(field) {
+  return `${numericGuard(field)} | unwrap ${field}`;
+}
 
 // Translate a status filter into a LogQL label matcher.
 // Accepts a code (`499`), a class (`5xx`), or a comma/space separated list of
@@ -1044,6 +1088,7 @@ export function statusFilterExpr(statusFilter) {
 // what is actually deployed on the cluster rather than from a naming convention.
 export function buildIngressQuery({
   cluster,
+  ingress = "all",
   upstreamNamespaces = [],
   pathFilter,
   statusFilter,
@@ -1051,27 +1096,76 @@ export function buildIngressQuery({
   minDurationSeconds,
 } = {}) {
   if (!cluster) throw new Error("cluster is required");
+  const jobs = ingressJobs(ingress);
   const ns = [...new Set((upstreamNamespaces || []).filter(Boolean))];
   const alternation = ns.map((n) => escapeRegex(n)).join("|");
+  const jobMatcher =
+    jobs.length === 1 ? `job=\`${jobs[0]}\`` : `job=~\`${jobs.map((j) => escapeRegex(j)).join("|")}\``;
 
-  const parts = [`{cluster=\`${cluster}\`, job=\`${INGRESS_JOB}\`}`];
-  // A line filter runs on raw bytes, before the parser, so this cuts the volume
-  // the pattern parser has to touch. It is an optimisation only — the authority
-  // is the `upstream` matcher below, which cannot be fooled by the namespace
-  // name appearing somewhere else in the line.
+  const parts = [`{cluster=\`${cluster}\`, ${jobMatcher}}`];
+  // A line filter runs on raw bytes, before any parser, so this cuts the volume
+  // the parsers touch. It is an optimisation only — the authority is the
+  // `upstream` matcher below, which cannot be fooled by the namespace name
+  // appearing somewhere else in the line.
   if (ns.length) parts.push(` |~ \`\\[(${alternation})-\``);
   parts.push(` | pattern \`${NGINX_PATTERN}\``);
+  parts.push(` | regexp \`${UPSTREAM_TAIL_REGEXP}\``);
+  // Access-log lines only. Both controllers also log their own lifecycle and
+  // errors to the same stream; those have no status and must neither be counted
+  // as requests nor reach an unwrap.
+  parts.push(" | status =~ `[1-5][0-9][0-9]`");
   if (ns.length) parts.push(` | upstream =~ \`(${alternation})-.*\``);
-  if (method) parts.push(` | method = \`${String(method).toUpperCase()}\``);
+  if (method) parts.push(` | method = \`${String(method).replace(/`/g, "").toUpperCase()}\``);
   if (statusFilter) parts.push(statusFilterExpr(statusFilter));
   // Case-insensitive for the same reason line filters are: a wrong-case path
   // fragment returns a clean, believable, empty result.
-  if (pathFilter) parts.push(` | path =~ \`(?i).*${escapeRegex(pathFilter)}.*\``);
+  if (pathFilter) parts.push(` | path =~ \`(?i).*${escapeRegex(String(pathFilter).replace(/`/g, ""))}.*\``);
   if (Number.isFinite(minDurationSeconds) && minDurationSeconds > 0) {
-    parts.push(` | request_time > ${minDurationSeconds}`);
+    parts.push(`${numericGuard("request_time")} | request_time > ${minDurationSeconds}`);
   }
   return parts.join("");
 }
+
+// The same line, parsed in JS for sample mode — where each attempt matters
+// individually. A retried request that ended 200 after two 502s is a success to
+// the client and a failure of two specific pods; flattening it to one status and
+// one address loses the second fact, which is the one that finds a bad node.
+const JS_LIST = "\\S+(?:(?:, | : )\\S+)*";
+const ACCESS_LINE = new RegExp(
+  '^(\\S+) - (\\S+) \\[([^\\]]+)\\] "(\\S+) (\\S+) ([^"]*)" (\\d{3}) (\\d+) "([^"]*)" "([^"]*)" (\\d+) ([\\d.]+) ' +
+    `\\[([^\\]]*)\\] \\[[^\\]]*\\] (${JS_LIST}) (${JS_LIST}) (${JS_LIST}) (${JS_LIST}) ([0-9a-f]{32})`,
+);
+
+export function parseAccessLogLine(line) {
+  const m = ACCESS_LINE.exec(String(line || ""));
+  if (!m) return null;
+  const list = (s) => String(s).split(/, | : /);
+  const num = (s) => (s === undefined || s === "-" || s === "" ? null : Number(s));
+  const addrs = list(m[14]);
+  const times = list(m[16]);
+  const statuses = list(m[17]);
+  const attempts = addrs.map((addr, i) => ({
+    addr,
+    // `-` is kept literally: "the upstream never answered" is the finding.
+    status: statuses[i] ?? null,
+    response_time: num(times[i]),
+  }));
+  return {
+    method: m[4],
+    path: m[5],
+    status: Number(m[7]),
+    request_time: Number(m[12]),
+    user_agent: m[10],
+    upstream: m[13] || null,
+    attempts,
+    retried: attempts.length > 1,
+  };
+}
+
+// Grafana Adaptive Logs marks a sampled stream with this label. Its presence
+// means lines were DISCARDED before reaching Loki. It is attached at query time:
+// /series and the label-values endpoints do not return it, only results do.
+export const ADAPTIVE_LOGS_LABEL = "__adaptive_logs_sampled__";
 
 // Report that Adaptive Logs is discarding lines from these streams.
 //
@@ -1081,7 +1175,7 @@ export function buildIngressQuery({
 // entries, so sampling can keep the exception header and drop its frames,
 // producing a truncated trace that reads as "the log is incomplete" rather than
 // "these lines were deliberately discarded, and an exemption can be requested".
-export function detectSampling(streams = []) {
+export function detectSampling(streams = [], { noun = "streams" } = {}) {
   const values = new Set();
   let sampled = 0;
   for (const s of streams) {
@@ -1097,7 +1191,7 @@ export function detectSampling(streams = []) {
     total_streams: streams.length,
     label_values: [...values].sort(),
     warning:
-      `Grafana Adaptive Logs is sampling ${sampled} of ${streams.length} matched streams ` +
+      `Grafana Adaptive Logs is sampling ${sampled} of ${streams.length} matched ${noun} ` +
       `(${ADAPTIVE_LOGS_LABEL} = ${[...values].sort().join(", ")}), so lines were discarded before they ` +
       "reached Loki. Counts from this stream are LOWER BOUNDS, not totals. Multi-line content is affected " +
       "worst: an exception header can survive while its stack frames are dropped, which looks like a " +
@@ -1115,10 +1209,34 @@ export function detectSampling(streams = []) {
 // infrastructure. Stating the scope alongside the verdict makes the premise
 // visible at the moment it is being relied on, instead of leaving every caller
 // to remember that `client` means "application logs only".
+// Namespaces that belong to the platform on every cluster, never to a customer.
+const INFRA_NAMESPACE =
+  /^(?:ingress-nginx|app-routing-system|kube-[a-z0-9-]+|cert-manager|monitoring|flow|default|external-dns|velero|calico-system|gatekeeper-system)$/;
+
+function namespaceMatcherValues(q) {
+  const values = [];
+  for (const m of q.matchAll(/(?:^|[{,\s])namespace\s*(=~|=)\s*["`]([^"`]*)["`]/g)) {
+    if (m[1] === "=") values.push(m[2]);
+    else for (const alt of m[2].split("|")) values.push(alt.replace(/^\^/, "").replace(/\$$/, ""));
+  }
+  return values.filter(Boolean);
+}
+
 export function scopeNote(query = "") {
   const q = String(query || "");
   const namespaceScoped = /(^|[{,\s])namespace\s*=~?/.test(q);
   const clusterScoped = /(^|[{,\s])cluster\s*=~?/.test(q);
+  const nsValues = namespaceMatcherValues(q);
+  // Checked before anything else: an ingress namespace is the OPPOSITE of
+  // customer scope — every tenant's traffic on the cluster — and calling it
+  // "application logs only" inverted the warning exactly where it mattered.
+  if (namespaceScoped && nsValues.length && nsValues.every((v) => INFRA_NAMESPACE.test(v))) {
+    return (
+      `Scoped to shared infrastructure namespace(s) (${[...new Set(nsValues)].join(", ")}), not to a customer. ` +
+      "An ingress namespace holds HTTP request logs for EVERY tenant on its cluster, so results include other " +
+      "customers' traffic unless narrowed. grafana_http_requests scopes ingress logs to one customer."
+    );
+  }
   if (clusterScoped) {
     return (
       "Scoped to the whole cluster, so shared infrastructure IS included — and on a multi-tenant cluster " +
@@ -1134,4 +1252,222 @@ export function scopeNote(query = "") {
     );
   }
   return null;
+}
+
+// Downgrade a scanned-but-empty verdict when the stream is being sampled.
+//
+// "The streams exist and were searched" is true of a sampled stream and still
+// not a trustworthy negative: a specific request id, trace id or exception can
+// have been discarded before it reached Loki. Reporting EMPTY_BUT_SCANNED there
+// told an investigation a request never happened.
+export function applySamplingToCoverage(entry, sampling) {
+  if (!entry || !sampling) return entry;
+  entry.adaptive_logs_sampling = entry.adaptive_logs_sampling || sampling;
+  if (entry.coverage === "EMPTY_BUT_SCANNED") {
+    entry.coverage = "EMPTY_BUT_SAMPLED";
+    delete entry.coverage_note;
+    entry.coverage_warning =
+      "No matching lines, and the streams were scanned — but Adaptive Logs is discarding lines from them " +
+      `(${sampling.label_values.join(", ")}). Absence of a specific line (a request id, a trace id, one ` +
+      "exception) is NOT proof it was never logged. Counts from these streams are lower bounds.";
+  }
+  return entry;
+}
+
+// The stream selector of a LogQL expression: the first `{...}`, respecting
+// quoted and backtick-quoted strings (which may contain braces).
+export function extractStreamSelector(expr = "") {
+  const s = String(expr || "");
+  const start = s.indexOf("{");
+  if (start === -1) return null;
+  let quote = null;
+  for (let i = start + 1; i < s.length; i++) {
+    const c = s[i];
+    if (quote) {
+      if (c === "\\" && quote === '"') i++;
+      else if (c === quote) quote = null;
+      continue;
+    }
+    if (c === '"' || c === "`") quote = c;
+    else if (c === "}") return s.slice(start, i + 1);
+  }
+  return null;
+}
+
+// The query step Grafana should use, in milliseconds.
+//
+// /api/ds/query does not derive a step from maxDataPoints: without intervalMs
+// both the Loki and Prometheus backends evaluate at 1s, so a 1h range returned
+// 3,601 points per series whatever max_data_points said — too many to read and,
+// raw, over the tool-result limit. An explicit step wins; otherwise the range is
+// divided across the requested number of points.
+export function queryIntervalMs({ startMs, endMs, maxDataPoints = 1000, step } = {}) {
+  if (step) {
+    const seconds = durationSeconds(step);
+    if (!Number.isFinite(seconds) || seconds <= 0) {
+      throw new Error(`Unrecognised step "${step}". Use a duration such as 30s, 5m, 1h.`);
+    }
+    return seconds * 1000;
+  }
+  const span = Math.max(0, Number(endMs) - Number(startMs));
+  return Math.max(1000, Math.ceil(span / Math.max(1, maxDataPoints)));
+}
+
+// A compact timeline: [timestamp, value] pairs per series, at the step the
+// query ran at. The digest's first/last/min/max/avg answers "how big"; only the
+// points answer "when", and raw frames were too large to return.
+export function timelineFromPayload(payload = {}, { maxSeries = 20, maxPoints = 500 } = {}) {
+  const out = {};
+  for (const [refId, res] of Object.entries(payload.results || {})) {
+    const series = [];
+    for (const frame of Array.isArray(res?.frames) ? res.frames : []) {
+      const kind = classifyFrame(frame);
+      if (kind === "logs" || kind === "table") continue;
+      const fields = frame?.schema?.fields || [];
+      const timeIdx = fields.findIndex((f) => f?.type === "time");
+      if (timeIdx === -1) continue;
+      const times = frame?.data?.values?.[timeIdx] || [];
+      for (let idx = 0; idx < fields.length; idx++) {
+        if (fields[idx]?.type !== "number") continue;
+        const values = frame?.data?.values?.[idx] || [];
+        const points = [];
+        for (let i = 0; i < times.length; i++) {
+          if (typeof values[i] !== "number") continue;
+          points.push([new Date(Number(times[i])).toISOString(), values[i]]);
+        }
+        series.push({ labels: fields[idx]?.labels || {}, point_count: points.length, points });
+      }
+    }
+    out[refId] = {
+      status: res?.status ?? null,
+      series_count: series.length,
+      series: series.slice(0, maxSeries).map((s) =>
+        s.points.length > maxPoints
+          ? { ...s, points: s.points.slice(0, maxPoints), points_truncated: s.points.length - maxPoints }
+          : s,
+      ),
+      series_truncated: series.length > maxSeries ? series.length - maxSeries : 0,
+    };
+  }
+  return out;
+}
+
+// Sampling, read from a metric result grouped by the sampling label.
+//
+// Grouping by the label costs nothing extra on a count the tool runs anyway, and
+// it is the only reliable way to see sampling once lines are aggregated into
+// numbers. Reported as the share of counted lines that came from sampled
+// streams, because that is what bounds how far the numbers can be trusted.
+export function samplingFromGroupedCounts(result = [], { checked } = {}) {
+  let total = 0;
+  let sampledLines = 0;
+  const values = new Set();
+  for (const r of result || []) {
+    const n = Number(r?.value?.[1]);
+    if (!Number.isFinite(n)) continue;
+    total += n;
+    const v = r?.metric?.[ADAPTIVE_LOGS_LABEL];
+    if (v !== undefined && v !== null && String(v) !== "") {
+      sampledLines += n;
+      values.add(String(v));
+    }
+  }
+  if (!values.size) return null;
+  const pct = total ? Math.round((sampledLines / total) * 1000) / 10 : 100;
+  const labelValues = [...values].sort();
+  return {
+    sampled_share_pct: pct,
+    label_values: labelValues,
+    ...(checked ? { checked } : {}),
+    warning:
+      `Grafana Adaptive Logs is sampling these streams (${ADAPTIVE_LOGS_LABEL} = ${labelValues.join(", ")}): ` +
+      `${pct}% of the lines counted came from sampled streams, and lines were discarded before they reached ` +
+      "Loki. Counts are LOWER BOUNDS, and the absence of a specific line (a request id, a trace id, one " +
+      "exception) is not proof it was never logged. A per-cluster/job exemption can be requested from the " +
+      "Platform team.",
+  };
+}
+
+// A matrix grouped by the sampling label, summed back into one series.
+export function collapseSampledMatrix(result = []) {
+  const merged = new Map();
+  const totals = [];
+  for (const r of result || []) {
+    let sum = 0;
+    for (const [t, v] of r?.values || []) {
+      const n = Number(v);
+      if (!Number.isFinite(n)) continue;
+      merged.set(Number(t), (merged.get(Number(t)) || 0) + n);
+      sum += n;
+    }
+    totals.push({ metric: r?.metric || {}, value: [0, String(sum)] });
+  }
+  const points = [...merged.entries()].sort((a, b) => a[0] - b[0]).map(([t, v]) => [t, String(v)]);
+  return { points, sampling: samplingFromGroupedCounts(totals) };
+}
+
+// Attempts and failures per upstream address.
+//
+// Grouping requests by pod is what found the root cause of an incident: every
+// failing pod sat on one node while siblings elsewhere were healthy. A retried
+// request carries one address and one status PER ATTEMPT, and the failed
+// attempts are the evidence — a request that ended 200 after two 502s is two
+// bad pods and one good one — so the lists are split pairwise, not flattened.
+// `-` as a status means that upstream never answered, which is a failure.
+export function aggregateUpstreamAttempts(result = [], { limit = 20 } = {}) {
+  const per = new Map();
+  for (const r of result || []) {
+    const n = Number(r?.value?.[1]);
+    if (!Number.isFinite(n) || n <= 0) continue;
+    const addrs = String(r?.metric?.upstream_addr ?? "").split(/, | : /);
+    const statuses = String(r?.metric?.upstream_status ?? "").split(/, | : /);
+    addrs.forEach((addr, i) => {
+      if (!addr || addr === "-") return;
+      const status = statuses[i] ?? "-";
+      const e = per.get(addr) || { addr, ingress: new Set(), attempts: 0, failed: 0, by_status: {} };
+      e.attempts += n;
+      e.by_status[status] = (e.by_status[status] || 0) + n;
+      if (!/^[23]\d\d$/.test(status)) e.failed += n;
+      if (r?.metric?.job) e.ingress.add(ingressName(r.metric.job));
+      per.set(addr, e);
+    });
+  }
+  const rows = [...per.values()].map((e) => ({
+    upstream_addr: e.addr,
+    ip: e.addr.replace(/:\d+$/, ""),
+    ingress: [...e.ingress].sort(),
+    attempts: e.attempts,
+    failed_attempts: e.failed,
+    failure_pct: e.attempts ? Math.round((e.failed / e.attempts) * 1000) / 10 : 0,
+    by_status: e.by_status,
+  }));
+  rows.sort((a, b) => b.failed_attempts - a.failed_attempts || b.attempts - a.attempts);
+  return { rows: rows.slice(0, limit), total_upstreams: rows.length };
+}
+
+// Roll upstream rows (with resolved pods) up to the node they ran on. One bad
+// node shows up as one row carrying the failures while the others are clean.
+export function rollupByNode(rows = []) {
+  const per = new Map();
+  for (const r of rows || []) {
+    for (const p of r?.pods || []) {
+      if (!p?.node) continue;
+      const e = per.get(p.node) || { node: p.node, host_ip: p.host_ip || null, pods: new Set(), attempts: 0, failed: 0 };
+      e.pods.add(p.pod);
+      e.attempts += r.attempts || 0;
+      e.failed += r.failed_attempts || 0;
+      per.set(p.node, e);
+    }
+  }
+  return [...per.values()]
+    .map((e) => ({
+      node: e.node,
+      host_ip: e.host_ip,
+      pod_count: e.pods.size,
+      pods: [...e.pods].sort(),
+      attempts: e.attempts,
+      failed_attempts: e.failed,
+      failure_pct: e.attempts ? Math.round((e.failed / e.attempts) * 1000) / 10 : 0,
+    }))
+    .sort((a, b) => b.failed_attempts - a.failed_attempts || b.attempts - a.attempts);
 }

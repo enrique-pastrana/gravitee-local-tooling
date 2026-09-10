@@ -36,19 +36,26 @@ not chained to one another.
 | `grafana_logs_context` | Every line around a moment in time, **unfiltered** — "what else was happening right then". Refuses a line filter, because a filter is what hides the continuation lines. |
 | `grafana_logs_noise` | What is actually filling a stream: lines reduced to their shape, ranked, each with a pasteable LogQL exclusion. Covers what pattern detection cannot see below its floor. |
 | `grafana_find_customer` | Which customer or deployment is this, by name or by id — and **which cluster** they are on. Touches no logs. |
-| `grafana_http_requests` | HTTP request logs: status distribution, latency percentiles, and parsed individual requests. The only tool that can reach them (see below). |
+| `grafana_http_requests` | HTTP request logs from both ingress controllers: status distribution, latency percentiles, retries, and failures per upstream pod and node. The only tool that can reach them (see below). |
 
 ### HTTP request logs are not in the customer's namespace
 
 Every `client`-scoped tool resolves the customer to their **own** namespaces, and
 those hold application logs only. The access logs — status code, request
-duration, upstream response time — are emitted by the shared ingress controller,
-which runs in the `ingress-nginx` namespace and is identified by the **cluster**
-label:
+duration, upstream response time — are emitted by shared ingress controllers and
+identified by the **cluster** label. There are **two**, carrying different traffic:
 
-```logql
-{cluster="<cluster>", job="flow/ingress-nginx-ingress-nginx"}
-```
+| Controller | Job | Carries |
+| --- | --- | --- |
+| ingress-nginx | `flow/ingress-nginx-ingress-nginx` | gateways, management API |
+| AKS app-routing | `flow/app-routing-system-` | bridge (`/_bridge/...`) — data plane to control plane sync |
+
+Searching one for traffic that went through the other returns a clean, scanned,
+empty result. `grafana_http_requests` searches both by default (`ingress=all`)
+and reports them separately. Bridge calls terminate on the **control plane**,
+which usually runs on a different cluster from its data planes: pass
+`control_plane_id` (and `cluster`) to read them. A control plane is shared by every
+customer in its Cockpit organization, so it is never included implicitly.
 
 No namespace-scoped query can reach them. The failure mode is not a missing
 feature: a question like "is the Management API slow for this customer" gets
@@ -70,6 +77,38 @@ Prefer it over a line filter on the raw stream. The access-log line carries
 several bare numbers, so `|= " 499 "` also matches 200s whose request length
 happened to be 499 bytes; `status_filter` matches the parsed field only.
 
+### Retries, failing pods and nodes
+
+When nginx retries a request against another upstream it writes every attempt,
+comma-separated, into each upstream field (`10.0.1.11:8082, 10.0.1.12:8082 …
+502, 200`). A space-delimited parser shifts every field after the first comma,
+and a single unparseable value makes Loki reject the whole unwrap query with
+HTTP 400 — which is why the tool used to fail on longer windows. The upstream
+fields are now captured as whole lists, every unwrap is guarded to admit only a
+single number, and only the request count can fail a call: a refinement Loki
+rejects is reported under `partial_failures` with its query and Loki's reason.
+
+Aggregate mode reports `by_upstream`: attempts and failures per upstream pod IP,
+with retries split pairwise (a request that ended 200 after a 502 is one bad pod
+and one good one). With `GRAFANA_METRICS_DATASOURCE_UID` set to a Prometheus
+datasource scraping kube-state-metrics, IPs are resolved to pods and nodes
+(`kube_pod_ips` joined to `kube_pod_info` — the latter has no pod IP of its own)
+and rolled up in `by_node`: one bad node shows up as the row carrying the
+failures while its siblings elsewhere are clean.
+
+`nginx_ingress_controller_requests` is scraped (labels `exported_namespace`,
+`ingress`, `status`, `controller_class`), but **not on every cluster** — check
+coverage for the cluster before reading an empty result as "no requests".
+
+### Metric step and timelines
+
+`/api/ds/query` does not derive a step from `maxDataPoints`: without `intervalMs`
+Loki and Prometheus metric queries evaluate at 1s, so an hour returned 3,601
+points per series — unreadable in the digest and over the tool-result limit raw.
+`grafana_query` now sends `intervalMs` from `max_data_points` (or an explicit
+`step`), reports `step_seconds`, and `output="timeline"` returns
+`[timestamp, value]` pairs so you can see *when* something changed.
+
 ### Adaptive Logs sampling is reported, not assumed
 
 Grafana Adaptive Logs discards lines before they reach Loki, and marks the
@@ -77,9 +116,15 @@ affected streams with an `__adaptive_logs_sampled__` label. That label was
 already on every stream Loki returned; nothing read it, so a stream that was
 dropping lines looked exactly like a complete one.
 
-`grafana_query`, `grafana_logs_context` and `grafana_logs_noise` now report
-`adaptive_logs_sampling` whenever any matched stream carries it, with the label's
-value. Counts from a sampled stream are lower bounds. Multi-line content suffers
+`adaptive_logs_sampling` is reported wherever it can be seen: from stream labels
+on returned lines (`grafana_query`, `grafana_logs_context`, `grafana_logs_noise`),
+from counts grouped by the label (`grafana_logs_trend`, `grafana_http_requests`),
+and — where results cannot carry it — by a short spot check on the stream selector.
+That last case matters most: an empty log result has no streams to carry the
+label, and a request-id lookup that found nothing on a sampled stream was
+reported as `EMPTY_BUT_SCANNED`, "a trustworthy negative". It is now
+`EMPTY_BUT_SAMPLED`: the absence of one line is not proof it was never logged.
+Counts from a sampled stream are lower bounds. Multi-line content suffers
 worst: an exception header can survive while its stack frames are dropped, which
 reads as a truncated log rather than as a retention rule someone can lift — a
 per-cluster/job exemption can be requested from the Platform team.

@@ -875,7 +875,9 @@ test("grafana_http_requests: a dedicated cluster is queried whole, with no upstr
       // Nothing to narrow to: the cluster's ingress stream IS this customer's
       // request log, including requests rejected before an upstream was chosen.
       assert.ok(!out.queries.counts.includes("upstream =~"), out.queries.counts);
-      assert.ok(out.queries.counts.includes('job=`flow/ingress-nginx-ingress-nginx`'), out.queries.counts);
+      // Both ingress controllers by default: bridge traffic never touches ingress-nginx.
+      assert.ok(out.queries.counts.includes("flow/ingress-nginx-ingress-nginx"), out.queries.counts);
+      assert.ok(out.queries.counts.includes("flow/app-routing-system-"), out.queries.counts);
     },
   );
 });
@@ -956,6 +958,344 @@ test("grafana_find_customer: returns the cluster and points at the ingress job",
       assert.deepEqual(out.clusters, ["gravitee-acme-aks-cluster"]);
       assert.match(out.http_request_logs_note, /flow\/ingress-nginx-ingress-nginx/);
       assert.match(out.http_request_logs_note, /grafana_http_requests/);
+    },
+  );
+});
+
+// ---------------------------------------------------------------------------
+// grafana_http_requests: failures, retries, both ingresses, explicit scope
+// ---------------------------------------------------------------------------
+
+function jsonResponse(data, { status = 200 } = {}) {
+  const body = typeof data === "string" ? data : JSON.stringify({ status: "success", data });
+  return Promise.resolve({
+    ok: status < 400,
+    status,
+    text: () => Promise.resolve(body),
+    headers: { get: () => null },
+  });
+}
+
+// A fetch stub that answers namespace values, /series and Loki instant queries
+// separately. `instant(query)` returns { result } or { status, body } to fail.
+async function withIngressStub({ nsValues, series, instant = () => ({ result: [] }) }, fn) {
+  const orig = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = (url) => {
+    const u = String(url);
+    calls.push(u);
+    if (u.includes(NS_VALUES)) return jsonResponse(nsValues);
+    if (u.includes(SERIES)) return jsonResponse(series(u));
+    if (u.includes("loki/api/v1/query_range")) return jsonResponse({ resultType: "matrix", result: [] });
+    if (u.includes("loki/api/v1/query")) {
+      const query = new URL(u).searchParams.get("query");
+      const r = instant(query);
+      if (r.status) return jsonResponse(r.body, { status: r.status });
+      return jsonResponse({ resultType: "vector", result: r.result });
+    }
+    return jsonResponse([]);
+  };
+  try {
+    return await fn(calls);
+  } finally {
+    globalThis.fetch = orig;
+  }
+}
+
+const DEDICATED = {
+  nsValues: ["acme-prod"],
+  series: seriesRouter({
+    namespaceToCluster: { "acme-prod": "gravitee-acme-aks-cluster" },
+    clusterNamespaces: { "gravitee-acme-aks-cluster": ["acme-prod", "ingress-nginx", "app-routing-system"] },
+  }),
+};
+const LOKI_400 =
+  "pipeline error: 'SampleExtractionErr' for series: '{__error__=\"SampleExtractionErr\", " +
+  "__error_details__=\"strconv.ParseFloat: parsing \\\"0,\\\": invalid syntax\"}'";
+
+test("grafana_http_requests: every unwrap is guarded, so a retried request cannot fail the query", async () => {
+  await withIngressStub(DEDICATED, async () => {
+    const out = await callTool("grafana_http_requests", { client: "acme", from: "now-6h" });
+    for (const [part, q] of Object.entries(out.queries)) {
+      for (const m of q.matchAll(/\| unwrap (\w+)/g)) {
+        const guard = `| ${m[1]} =~ \`[0-9]+(?:\\.[0-9]+)?\` | unwrap ${m[1]}`;
+        assert.ok(q.includes(guard), `${part}: unguarded unwrap of ${m[1]}`);
+      }
+    }
+  });
+});
+
+test("grafana_http_requests: a failing refinement is reported, not allowed to take down the answer", async () => {
+  await withIngressStub(
+    {
+      ...DEDICATED,
+      instant: (q) => {
+        if (q.includes("unwrap upstream_time")) return { status: 400, body: LOKI_400 };
+        if (q.startsWith("sum by (job, status,")) {
+          return {
+            result: [
+              { metric: { job: "flow/ingress-nginx-ingress-nginx", status: "200" }, value: [0, "90"] },
+              { metric: { job: "flow/app-routing-system-", status: "499", __adaptive_logs_sampled__: "91.00" }, value: [0, "10"] },
+            ],
+          };
+        }
+        return { result: [] };
+      },
+    },
+    async () => {
+      const out = await callTool("grafana_http_requests", { client: "acme", from: "now-6h" });
+      assert.equal(out.total_requests, 100);
+      // Two controllers, reported separately — never averaged together.
+      assert.deepEqual(out.by_ingress.map((e) => e.ingress).sort(), ["app-routing", "nginx"]);
+      assert.equal(out.adaptive_logs_sampling.sampled_share_pct, 10);
+      const failure = out.partial_failures.find((f) => f.part === "upstream_latency_p95");
+      // The reason Loki gave, and the query it gave it for.
+      assert.match(failure.error, /SampleExtractionErr/);
+      assert.match(failure.query, /unwrap upstream_time/);
+    },
+  );
+});
+
+test("grafana_http_requests: a failing count names the query and Loki's reason", async () => {
+  await withIngressStub(
+    { ...DEDICATED, instant: (q) => (q.startsWith("sum by (job, status,") ? { status: 400, body: LOKI_400 } : { result: [] }) },
+    async () => {
+      await assert.rejects(
+        () => callTool("grafana_http_requests", { client: "acme", from: "now-6h" }),
+        (err) => {
+          assert.match(err.message, /counts query failed/);
+          assert.match(err.message, /HTTP 400: pipeline error/);
+          assert.match(err.message, /LogQL: sum by \(job, status/);
+          return true;
+        },
+      );
+    },
+  );
+});
+
+test("grafana_http_requests: failures are attributed per upstream pod, retries split pairwise", async () => {
+  await withIngressStub(
+    {
+      ...DEDICATED,
+      instant: (q) =>
+        q.startsWith("sum by (job, upstream_addr")
+          ? {
+              result: [
+                { metric: { job: "flow/ingress-nginx-ingress-nginx", upstream_addr: "10.0.1.12:8082", upstream_status: "200" }, value: [0, "50"] },
+                {
+                  metric: { job: "flow/ingress-nginx-ingress-nginx", upstream_addr: "10.0.1.11:8082, 10.0.1.12:8082", upstream_status: "502, 200" },
+                  value: [0, "7"],
+                },
+              ],
+            }
+          : { result: [] },
+    },
+    async () => {
+      const out = await callTool("grafana_http_requests", { client: "acme", from: "now-6h" });
+      assert.equal(out.by_upstream[0].upstream_addr, "10.0.1.11:8082");
+      assert.equal(out.by_upstream[0].failed_attempts, 7);
+      assert.equal(out.by_upstream[1].failed_attempts, 0);
+      // Without a metrics datasource the pods are not resolved — and it says how to fix that.
+      assert.match(out.pod_resolution_note, /GRAFANA_METRICS_DATASOURCE_UID/);
+    },
+  );
+});
+
+test("grafana_http_requests: an explicit cluster running none of the customer's namespaces is refused", async () => {
+  // The call that returned a clean, meaningless zero during an incident: the
+  // customer's data planes were on one cluster, the query named another.
+  await withIngressStub(
+    {
+      nsValues: ["acme-prod"],
+      series: seriesRouter({
+        namespaceToCluster: { "acme-prod": "shared-worker-us-east-prod" },
+        clusterNamespaces: { "shared-worker-us-prod": ["orbit-prod", "ingress-nginx"] },
+      }),
+    },
+    async (calls) => {
+      const out = await callTool("grafana_http_requests", { client: "acme", cluster: "shared-worker-us-prod", from: "now-1h" });
+      assert.match(out.note, /None of this customer's namespaces run on shared-worker-us-prod/);
+      assert.deepEqual(out.customer_clusters, ["shared-worker-us-east-prod"]);
+      assert.match(out.note, /control_plane_id/);
+      assert.ok(!calls.some((u) => u.includes("loki/api/v1/query")), "no ingress query may run");
+    },
+  );
+});
+
+test("grafana_http_requests: control_plane_id brings in bridge traffic, and only when asked", async () => {
+  const stub = {
+    nsValues: ["acme-prod"],
+    series: seriesRouter({
+      namespaceToCluster: { "acme-prod": "shared-worker-us-east-prod", "apim-cp-cp1111": "shared-worker-us-prod" },
+      clusterNamespaces: { "shared-worker-us-prod": ["apim-cp-cp1111", "apim-cp-cp2222", "app-routing-system"] },
+    }),
+  };
+  await withIngressStub(stub, async () => {
+    // Control plane and data planes on different clusters: refuse to blend them.
+    const split = await callTool("grafana_http_requests", { client: "acme", control_plane_id: "cp1111", from: "now-1h" });
+    assert.equal(split.clusters.length, 2);
+    assert.match(split.note, /control plane \(bridge traffic\)/);
+
+    const bridge = await callTool("grafana_http_requests", {
+      client: "acme",
+      control_plane_id: "cp1111",
+      cluster: "shared-worker-us-prod",
+      from: "now-1h",
+    });
+    assert.equal(bridge.scope.control_plane_namespace, "apim-cp-cp1111");
+    assert.match(bridge.scope.control_plane_note, /shared by every customer/);
+    // Narrowed to that control plane, not every tenant on the cluster.
+    assert.ok(bridge.queries.counts.includes("| upstream =~ `(apim-cp-cp1111)-.*`"), bridge.queries.counts);
+  });
+});
+
+test("grafana_logs_trend: a sampled stream is reported in the same read", async () => {
+  await withIngressStub(
+    { nsValues: ["acme-prod"], series: () => [] },
+    async (calls) => {
+      const orig = globalThis.fetch;
+      globalThis.fetch = (url) => {
+        const u = String(url);
+        if (u.includes("loki/api/v1/query_range")) {
+          calls.push(u);
+          return jsonResponse({
+            resultType: "matrix",
+            result: [{ metric: { __adaptive_logs_sampled__: "95.00" }, values: [[Math.floor(Date.now() / 1000) - 60, "4"]] }],
+          });
+        }
+        return orig(url);
+      };
+      try {
+        const out = await callTool("grafana_logs_trend", { client: "acme", from: "now-1h", interval: "5m" });
+        assert.match(out.query, /^sum by \(__adaptive_logs_sampled__\)/);
+        assert.equal(out.adaptive_logs_sampling.sampled_share_pct, 100);
+      } finally {
+        globalThis.fetch = orig;
+      }
+    },
+  );
+});
+
+// ---------------------------------------------------------------------------
+// grafana_query: step, timeline, Loki-only scope note, sampling on negatives
+// ---------------------------------------------------------------------------
+
+async function withQueryEndpointStub({ type, payload, lokiInstant }, fn) {
+  const orig = globalThis.fetch;
+  const bodies = [];
+  const instantQueries = [];
+  globalThis.fetch = (url, opts) => {
+    const u = String(url);
+    let body = {};
+    if (u.includes("/datasources/uid/")) body = { uid: "ds", name: `test ${type}`, type };
+    else if (u.includes("/ds/query")) {
+      bodies.push(JSON.parse(opts.body));
+      body = payload;
+    } else if (u.includes("loki/api/v1/query")) {
+      const q = new URL(u).searchParams.get("query");
+      instantQueries.push(q);
+      body = { status: "success", data: { resultType: "vector", result: lokiInstant ? lokiInstant(q) : [] } };
+    }
+    return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve(JSON.stringify(body)), headers: { get: () => null } });
+  };
+  try {
+    return await fn({ bodies, instantQueries });
+  } finally {
+    globalThis.fetch = orig;
+  }
+}
+
+const SERIES_PAYLOAD = {
+  results: {
+    A: {
+      status: 200,
+      frames: [
+        {
+          schema: { meta: { type: "timeseries-multi" }, fields: [{ name: "Time", type: "time" }, { name: "Value", type: "number", labels: { status: "499" } }] },
+          data: { values: [[0, 60_000, 120_000], [2, 4, 6]] },
+        },
+      ],
+    },
+  },
+};
+
+const EMPTY_LOG_PAYLOAD = {
+  results: {
+    A: {
+      status: 200,
+      frames: [
+        {
+          schema: {
+            meta: {
+              custom: { frameType: "LabeledTimeValues" },
+              stats: [{ displayName: "Summary: total bytes processed", value: 123456 }],
+            },
+            fields: [{ name: "labels", type: "other" }, { name: "Time", type: "time" }, { name: "Line", type: "string" }],
+          },
+          data: { values: [[], [], []] },
+        },
+      ],
+    },
+  },
+};
+
+test("grafana_query: derives the metric step from max_data_points instead of evaluating every second", async () => {
+  await withQueryEndpointStub({ type: "prometheus", payload: SERIES_PAYLOAD }, async ({ bodies }) => {
+    const out = await callTool("grafana_query", { datasource_uid: "ds", expr: "up", from: "now-1h", to: "now", max_data_points: 60 });
+    assert.equal(bodies[0].queries[0].intervalMs, 60_000);
+    assert.equal(out.window.step_seconds, 60);
+    await callTool("grafana_query", { datasource_uid: "ds", expr: "up", from: "now-1h", to: "now", step: "15m" });
+    assert.equal(bodies[1].queries[0].intervalMs, 900_000);
+  });
+});
+
+test("grafana_query: output=timeline returns the points", async () => {
+  await withQueryEndpointStub({ type: "prometheus", payload: SERIES_PAYLOAD }, async () => {
+    const out = await callTool("grafana_query", { datasource_uid: "ds", expr: "up", output: "timeline" });
+    assert.deepEqual(out.results.A.series[0].points, [
+      [new Date(0).toISOString(), 2],
+      [new Date(60_000).toISOString(), 4],
+      [new Date(120_000).toISOString(), 6],
+    ]);
+  });
+});
+
+test("grafana_query: the log scope note is not attached to a Prometheus query", async () => {
+  // It told a kube_pod_info query it had searched "APPLICATION logs only".
+  await withQueryEndpointStub({ type: "prometheus", payload: SERIES_PAYLOAD }, async () => {
+    const out = await callTool("grafana_query", { datasource_uid: "ds", expr: 'kube_pod_info{namespace="acme-prod"}' });
+    assert.equal(out.scope_note, undefined);
+  });
+});
+
+test("grafana_query: an empty lookup on a sampled stream is not reported as a trustworthy negative", async () => {
+  // A request-id lookup came back EMPTY_BUT_SCANNED when the line had most
+  // likely been discarded by Adaptive Logs before it reached Loki.
+  await withQueryEndpointStub(
+    {
+      type: "loki",
+      payload: EMPTY_LOG_PAYLOAD,
+      lokiInstant: () => [
+        { metric: { __adaptive_logs_sampled__: "91.00" }, value: [0, "900"] },
+        { metric: {}, value: [0, "100"] },
+      ],
+    },
+    async ({ instantQueries }) => {
+      const out = await callTool("grafana_query", { datasource_uid: "ds", expr: '{namespace="acme-prod"} |= "0123456789abcdef"' });
+      assert.equal(out.results.A.coverage, "EMPTY_BUT_SAMPLED");
+      assert.match(out.results.A.coverage_warning, /NOT proof/);
+      // The check reads the stream selector alone — the filter found nothing to read.
+      assert.match(instantQueries[0], /count_over_time\(\{namespace="acme-prod"\} \[/);
+    },
+  );
+});
+
+test("grafana_query: an empty lookup on an unsampled stream stays a trustworthy negative", async () => {
+  await withQueryEndpointStub(
+    { type: "loki", payload: EMPTY_LOG_PAYLOAD, lokiInstant: () => [{ metric: {}, value: [0, "100"] }] },
+    async () => {
+      const out = await callTool("grafana_query", { datasource_uid: "ds", expr: '{namespace="acme-prod"} |= "nope"' });
+      assert.equal(out.results.A.coverage, "EMPTY_BUT_SCANNED");
     },
   );
 });

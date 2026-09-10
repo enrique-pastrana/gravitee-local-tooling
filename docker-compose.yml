@@ -83,6 +83,7 @@ services:
       GRAFANA_TOKEN: ${GRAFANA_TOKEN:-}
       GRAFANA_TIMEOUT_SECONDS: ${GRAFANA_TIMEOUT_SECONDS:-15}
       GRAFANA_LOGS_DATASOURCE_UID: ${GRAFANA_LOGS_DATASOURCE_UID:-}
+      GRAFANA_METRICS_DATASOURCE_UID: ${GRAFANA_METRICS_DATASOURCE_UID:-}
       # Gravitee Cloud customers live in `apim-dp-<cp>-<dp>` namespaces carrying
       # their name nowhere, so the adapter resolves them through the deployment
       # map in cloud-deployments-configuration - a private repo, so the fetch

@@ -32,6 +32,19 @@ const {
   scopeNote,
   INGRESS_JOB,
   NGINX_PATTERN,
+  INGRESS_JOBS,
+  ingressJobs,
+  UPSTREAM_TAIL_REGEXP,
+  unwrapNumeric,
+  parseAccessLogLine,
+  applySamplingToCoverage,
+  extractStreamSelector,
+  queryIntervalMs,
+  timelineFromPayload,
+  samplingFromGroupedCounts,
+  collapseSampledMatrix,
+  aggregateUpstreamAttempts,
+  rollupByNode,
   mergeContextStreams,
   normaliseLogLine,
   profileNoise,
@@ -1333,8 +1346,11 @@ test("statusFilterExpr: refuses junk rather than matching nothing", () => {
 });
 
 test("buildIngressQuery: a dedicated cluster needs no upstream filter", () => {
-  const q = buildIngressQuery({ cluster: "gravitee-acme-aks-cluster" });
-  assert.equal(q, "{cluster=`gravitee-acme-aks-cluster`, job=`" + INGRESS_JOB + "`} | pattern `" + NGINX_PATTERN + "`");
+  const q = buildIngressQuery({ cluster: "gravitee-acme-aks-cluster", ingress: "nginx" });
+  assert.ok(
+    q.startsWith("{cluster=`gravitee-acme-aks-cluster`, job=`" + INGRESS_JOB + "`} | pattern `" + NGINX_PATTERN + "`"),
+    q,
+  );
   assert.ok(!q.includes("upstream =~"));
 });
 
@@ -1456,19 +1472,242 @@ test("scopeNote: nothing to say about an unscoped query", () => {
   assert.equal(scopeNote(""), null);
 });
 
-test("NGINX_PATTERN: captures where the time went, not just how long it took", () => {
-  // request_time alone cannot distinguish a slow backend from a slow ingress,
-  // and on a client timeout upstream_time is the only number saying how far the
-  // backend had got. upstream_status is `-` exactly when the client hung up.
-  for (const field of ["<method>", "<path>", "<status>", "<request_time>", "<upstream>", "<upstream_time>", "<upstream_status>"]) {
+test("NGINX_PATTERN + tail: capture where the time went, not just how long it took", () => {
+  for (const field of ["<method>", "<path>", "<status>", "<request_time>", "<upstream>"]) {
     assert.ok(NGINX_PATTERN.includes(field), `pattern must capture ${field}`);
   }
-  // The tail differs between clusters (some append scheme and forwarded
-  // addresses); anchoring past it matches nothing on half the estate.
-  assert.ok(NGINX_PATTERN.endsWith("<_>"), NGINX_PATTERN);
-  // The client address, referer and request id stay discarded — naming them
-  // would put them into every series key.
-  for (const field of ["<remote_addr>", "<referer>", "<req_id>"]) {
-    assert.ok(!NGINX_PATTERN.includes(field), `${field} must not become a label`);
+  for (const field of ["upstream_addr", "upstream_time", "upstream_status"]) {
+    assert.ok(UPSTREAM_TAIL_REGEXP.includes(`(?P<${field}>`), `tail must capture ${field}`);
   }
+  // The tail differs between clusters; anchoring past it matches nothing on half the estate.
+  assert.ok(NGINX_PATTERN.endsWith("<_>"), NGINX_PATTERN);
+  // Discarded fields must not become labels (series keys).
+  for (const field of ["remote_addr", "referer", "req_id", "upstream_len"]) {
+    assert.ok(!NGINX_PATTERN.includes(`<${field}>`), field);
+    assert.ok(!UPSTREAM_TAIL_REGEXP.includes(`(?P<${field}>`), field);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Retries, both ingress controllers, guards, sampling, step
+// ---------------------------------------------------------------------------
+
+const SINGLE_LINE =
+  '203.0.113.10 - - [10/Sep/2026:14:14:36 +0000] "PUT /management/v2/organizations/o1/environments/e1/apis/_import/crd?dryRun=true HTTP/2.0" 499 0 "-" "Go-http-client/2.0" 1651 12.851 [acme-prod-apim-api-83] [] 10.0.2.21:8083 0 12.850 - fedcba9876543210fedcba9876543210';
+const RETRIED_LINE =
+  '203.0.113.11 - - [10/Sep/2026:14:14:36 +0000] "GET /orders/v1/lookup HTTP/1.1" 500 208 "-" "axios/1.11.0" 1476 191.621 [apim-dp-cp1111-dp0001-prod-apim-dp-cp1111-dp0001-gateway-82] [] 10.0.1.11:8082, 10.0.1.12:8082, 10.0.1.13:8082 0, 0, 208 120.007, 71.153, 0.462 504, 502, 500 0123456789abcdef0123456789abcdef';
+const TRAILING_LINE = `${SINGLE_LINE} scheme-https - 203.0.113.10 - 203.0.113.10`;
+
+test("parseAccessLogLine: a single-attempt client timeout", () => {
+  const r = parseAccessLogLine(SINGLE_LINE);
+  assert.equal(r.status, 499);
+  assert.equal(r.request_time, 12.851);
+  assert.equal(r.retried, false);
+  assert.deepEqual(r.attempts, [{ addr: "10.0.2.21:8083", status: "-", response_time: 12.85 }]);
+  assert.equal(r.upstream, "acme-prod-apim-api-83");
+});
+
+test("parseAccessLogLine: a retried request keeps every attempt, aligned", () => {
+  // The line shape that broke the tool: a space-delimited parser read
+  // upstream_time as "0," and Loki rejected the whole query with HTTP 400.
+  const r = parseAccessLogLine(RETRIED_LINE);
+  assert.equal(r.status, 500);
+  assert.equal(r.retried, true);
+  assert.deepEqual(r.attempts, [
+    { addr: "10.0.1.11:8082", status: "504", response_time: 120.007 },
+    { addr: "10.0.1.12:8082", status: "502", response_time: 71.153 },
+    { addr: "10.0.1.13:8082", status: "500", response_time: 0.462 },
+  ]);
+});
+
+test("parseAccessLogLine: tolerates trailing fields, rejects non-request lines", () => {
+  assert.equal(parseAccessLogLine(TRAILING_LINE)?.status, 499);
+  assert.equal(parseAccessLogLine('I0910 18:43:23.800000 7 controller.go:214] "Backend successfully reloaded"'), null);
+  assert.equal(parseAccessLogLine(""), null);
+});
+
+test("UPSTREAM_TAIL_REGEXP: captures whole lists, so a retry cannot shift fields", () => {
+  // Loki's regexp is RE2 with (?P<name>); JS spells the groups (?<name>).
+  const re = new RegExp(UPSTREAM_TAIL_REGEXP.replace(/\(\?P</g, "(?<"));
+  const single = re.exec(SINGLE_LINE).groups;
+  assert.deepEqual([single.upstream_addr, single.upstream_time, single.upstream_status], ["10.0.2.21:8083", "12.850", "-"]);
+  const retried = re.exec(RETRIED_LINE).groups;
+  assert.equal(retried.upstream_addr, "10.0.1.11:8082, 10.0.1.12:8082, 10.0.1.13:8082");
+  assert.equal(retried.upstream_time, "120.007, 71.153, 0.462");
+  assert.equal(retried.upstream_status, "504, 502, 500");
+});
+
+test("unwrapNumeric: the guard admits one number and nothing else", () => {
+  assert.equal(unwrapNumeric("upstream_time"), " | upstream_time =~ `[0-9]+(?:\\.[0-9]+)?` | unwrap upstream_time");
+  // LogQL label matchers are fully anchored; mirror that here.
+  const guard = /^[0-9]+(?:\.[0-9]+)?$/;
+  for (const ok of ["0", "12.850", "0.002"]) assert.ok(guard.test(ok), ok);
+  for (const bad of ["0,", "-", "", "120.007, 71.153"]) assert.ok(!guard.test(bad), `must reject ${JSON.stringify(bad)}`);
+});
+
+test("ingressJobs: both controllers by default, one on request, refusal otherwise", () => {
+  assert.deepEqual(ingressJobs(), ["flow/ingress-nginx-ingress-nginx", "flow/app-routing-system-"]);
+  assert.deepEqual(ingressJobs("app-routing"), ["flow/app-routing-system-"]);
+  assert.throws(() => ingressJobs("traefik"), /Unknown ingress/);
+});
+
+test("buildIngressQuery: every parameter combination yields a well-ordered query", () => {
+  const combos = [];
+  for (const ingress of ["all", "nginx", "app-routing"])
+    for (const upstreamNamespaces of [[], ["acme-prod", "acme-uat"]])
+      for (const method of [undefined, "post"])
+        for (const statusFilter of [undefined, "499, 5xx"])
+          for (const pathFilter of [undefined, "_bridge"])
+            for (const minDurationSeconds of [undefined, 1.5])
+              combos.push({ ingress, upstreamNamespaces, method, statusFilter, pathFilter, minDurationSeconds });
+  assert.equal(combos.length, 96);
+
+  for (const c of combos) {
+    const q = buildIngressQuery({ cluster: "shared-core-us-prod", ...c });
+    const label = JSON.stringify(c);
+    assert.ok(q.startsWith("{cluster=`shared-core-us-prod`, job"), label);
+    const pattern = q.indexOf("| pattern");
+    const regexp = q.indexOf("| regexp");
+    assert.ok(pattern > 0 && regexp > pattern, `parsers out of order: ${label}`);
+    // Every label filter must follow the parsers that create its label.
+    for (const m of q.matchAll(/\| (status|upstream|method|path|request_time) (=~|=|>)/g)) {
+      assert.ok(m.index > regexp, `${m[0]} precedes the parsers: ${label}`);
+    }
+    // A numeric comparison is always guarded: one "-" would fail the query.
+    if (c.minDurationSeconds) {
+      assert.ok(q.includes("| request_time =~ `[0-9]+(?:\\.[0-9]+)?` | request_time > 1.5"), label);
+    }
+    assert.equal(q.includes("| upstream =~"), c.upstreamNamespaces.length > 0, label);
+    const wanted = c.ingress === "all" ? Object.values(INGRESS_JOBS) : [INGRESS_JOBS[c.ingress]];
+    for (const job of Object.values(INGRESS_JOBS)) {
+      assert.equal(q.includes(job), wanted.includes(job), `${job}: ${label}`);
+    }
+    assert.equal((q.match(/`/g) || []).length % 2, 0, `unbalanced backticks: ${label}`);
+  }
+});
+
+test("scopeNote: an ingress namespace is shared infrastructure, not customer scope", () => {
+  // It said "APPLICATION logs only" here — the opposite of the truth, on the one
+  // namespace that holds every tenant's request logs.
+  const note = scopeNote('sum by (cluster) (count_over_time({namespace="app-routing-system"}[5m]))');
+  assert.match(note, /shared infrastructure/);
+  assert.match(note, /EVERY tenant/);
+  assert.ok(!/APPLICATION logs only/.test(note));
+  assert.match(scopeNote('{namespace=~"^acme-prod$|^acme-uat$"}'), /APPLICATION logs only/);
+});
+
+test("coverageVerdict: a sampled stream cannot give a trustworthy negative", () => {
+  assert.equal(coverageVerdict({ lineCount: 0, bytesProcessed: 100, sampled: true }), "EMPTY_BUT_SAMPLED");
+  assert.equal(coverageVerdict({ lineCount: 0, bytesProcessed: 100 }), "EMPTY_BUT_SCANNED");
+  assert.equal(coverageVerdict({ lineCount: 0, bytesProcessed: 0, sampled: true }), "NO_DATA_SCANNED");
+});
+
+test("applySamplingToCoverage: downgrades a scanned empty result and says why", () => {
+  // A request-id lookup came back EMPTY_BUT_SCANNED — "a trustworthy negative" —
+  // when the line had most likely been sampled out.
+  const entry = { coverage: "EMPTY_BUT_SCANNED", coverage_note: "trustworthy negative" };
+  applySamplingToCoverage(entry, { label_values: ["91.00"], warning: "w" });
+  assert.equal(entry.coverage, "EMPTY_BUT_SAMPLED");
+  assert.equal(entry.coverage_note, undefined);
+  assert.match(entry.coverage_warning, /NOT proof/);
+  const ok = { coverage: "OK" };
+  applySamplingToCoverage(ok, { label_values: ["91.00"], warning: "w" });
+  assert.equal(ok.coverage, "OK");
+  assert.ok(ok.adaptive_logs_sampling);
+});
+
+test("samplingFromGroupedCounts: reports the share of lines from sampled streams", () => {
+  const out = samplingFromGroupedCounts([
+    { metric: { __adaptive_logs_sampled__: "91.00" }, value: [0, "900"] },
+    { metric: {}, value: [0, "100"] },
+  ]);
+  assert.equal(out.sampled_share_pct, 90);
+  assert.deepEqual(out.label_values, ["91.00"]);
+  assert.match(out.warning, /LOWER BOUNDS/);
+  assert.equal(samplingFromGroupedCounts([{ metric: {}, value: [0, "5"] }]), null);
+});
+
+test("collapseSampledMatrix: splitting by the sampling label does not change the trend", () => {
+  const { points, sampling } = collapseSampledMatrix([
+    { metric: { __adaptive_logs_sampled__: "99.00" }, values: [[100, "3"], [160, "4"]] },
+    { metric: {}, values: [[100, "1"], [220, "2"]] },
+  ]);
+  assert.deepEqual(points, [[100, "4"], [160, "4"], [220, "2"]]);
+  assert.equal(sampling.sampled_share_pct, 70);
+});
+
+test("extractStreamSelector: the first selector, ignoring braces inside strings", () => {
+  assert.equal(
+    extractStreamSelector('sum by (status) (count_over_time({cluster="c", job=~"a|b"} | regexp `[0-9a-f]{32}` [5m]))'),
+    '{cluster="c", job=~"a|b"}',
+  );
+  assert.equal(extractStreamSelector('{app="x}"} |= "y"'), '{app="x}"}');
+  assert.equal(extractStreamSelector("up"), null);
+});
+
+test("queryIntervalMs: derives the step instead of evaluating every second", () => {
+  // Without it a 1h query returned 3,601 points per series at any max_data_points.
+  assert.equal(queryIntervalMs({ startMs: 0, endMs: 3_600_000, maxDataPoints: 60 }), 60_000);
+  assert.equal(queryIntervalMs({ startMs: 0, endMs: 60_000, maxDataPoints: 1000 }), 1000);
+  assert.equal(queryIntervalMs({ startMs: 0, endMs: 3_600_000, maxDataPoints: 60, step: "15m" }), 900_000);
+  assert.throws(() => queryIntervalMs({ startMs: 0, endMs: 1, step: "soon" }));
+});
+
+test("timelineFromPayload: returns the points, not just their summary", () => {
+  const t0 = 1789000000000;
+  const payload = {
+    results: {
+      A: {
+        status: 200,
+        frames: [
+          {
+            schema: {
+              meta: { type: "timeseries-multi" },
+              fields: [
+                { name: "Time", type: "time" },
+                { name: "Value", type: "number", labels: { status: "499" } },
+              ],
+            },
+            data: { values: [[t0, t0 + 900_000], [3, 215]] },
+          },
+        ],
+      },
+    },
+  };
+  const out = timelineFromPayload(payload);
+  assert.deepEqual(out.A.series[0].labels, { status: "499" });
+  assert.deepEqual(out.A.series[0].points, [
+    [new Date(t0).toISOString(), 3],
+    [new Date(t0 + 900_000).toISOString(), 215],
+  ]);
+});
+
+test("aggregateUpstreamAttempts: splits retries pairwise and ranks by failures", () => {
+  const { rows, total_upstreams } = aggregateUpstreamAttempts([
+    { metric: { job: INGRESS_JOBS.nginx, upstream_addr: "10.0.1.12:8082", upstream_status: "200" }, value: [0, "50"] },
+    { metric: { job: INGRESS_JOBS.nginx, upstream_addr: "10.0.1.11:8082, 10.0.1.12:8082", upstream_status: "502, 200" }, value: [0, "7"] },
+    { metric: { job: INGRESS_JOBS["app-routing"], upstream_addr: "10.0.1.11:8082", upstream_status: "-" }, value: [0, "3"] },
+  ]);
+  assert.equal(total_upstreams, 2);
+  // The bad pod: 7 failed retries plus 3 that never answered.
+  assert.equal(rows[0].upstream_addr, "10.0.1.11:8082");
+  assert.equal(rows[0].ip, "10.0.1.11");
+  assert.equal(rows[0].failed_attempts, 10);
+  assert.deepEqual(rows[0].ingress, ["app-routing", "nginx"]);
+  // Its sibling served the retries: healthy, and kept for contrast.
+  assert.equal(rows[1].attempts, 57);
+  assert.equal(rows[1].failed_attempts, 0);
+});
+
+test("rollupByNode: failures concentrate on the node the bad pods share", () => {
+  const nodes = rollupByNode([
+    { attempts: 10, failed_attempts: 10, pods: [{ pod: "gw-a", node: "node-1", host_ip: "10.1.0.1" }] },
+    { attempts: 12, failed_attempts: 9, pods: [{ pod: "gw-b", node: "node-1", host_ip: "10.1.0.1" }] },
+    { attempts: 57, failed_attempts: 0, pods: [{ pod: "gw-c", node: "node-2", host_ip: "10.1.0.2" }] },
+    { attempts: 5, failed_attempts: 5 },
+  ]);
+  assert.equal(nodes[0].node, "node-1");
+  assert.equal(nodes[0].pod_count, 2);
+  assert.equal(nodes[0].failed_attempts, 19);
+  assert.equal(nodes[1].failure_pct, 0);
 });
