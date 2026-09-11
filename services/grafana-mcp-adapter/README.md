@@ -37,6 +37,7 @@ not chained to one another.
 | `grafana_logs_noise` | What is actually filling a stream: lines reduced to their shape, ranked, each with a pasteable LogQL exclusion. Covers what pattern detection cannot see below its floor. |
 | `grafana_first_occurrence` | "When did this start?" — the exact first matching line (to the nanosecond), a per-minute ramp around it, and whether the pattern was already running before the window. |
 | `grafana_failure_topology` | "Is it the application or the node?" — matching log lines per pod, joined to nodes, with healthy sibling pods for contrast and a verdict. |
+| `grafana_explore_link` | An Explore link for any set of queries: several in one pane, split panes, or mixed datasources. Absolute range by default. |
 | `grafana_find_customer` | Which customer or deployment is this, by name or by id — and **which cluster** they are on. Touches no logs. |
 | `grafana_http_requests` | HTTP request logs from both ingress controllers: status distribution, latency percentiles, retries, and failures per upstream pod and node. The only tool that can reach them (see below). |
 
@@ -110,6 +111,30 @@ points per series — unreadable in the digest and over the tool-result limit ra
 `grafana_query` now sends `intervalMs` from `max_data_points` (or an explicit
 `step`), reports `step_seconds`, and `output="timeline"` returns
 `[timestamp, value]` pairs so you can see *when* something changed.
+
+### Explore links
+
+Multi-query and split-pane Explore links used to be URL-encoded by hand.
+`grafana_explore_link` takes `queries` with `split` (one pane per query, at most
+two), or explicit `panes`, and returns the URL. A pane holding queries for more
+than one datasource uses Grafana's Mixed datasource. Every datasource is checked
+against the read-only allowlist; CloudWatch Logs Insights is refused and a
+CloudWatch link carries the billing notice, since opening it runs the query.
+
+The format was verified on this instance (Grafana 13.3) by opening each shape
+and reading back the URL Grafana rewrote itself to: split panes, a Mixed pane,
+a Loki logs pane, absolute and relative ranges. Grafana adds editor state of its
+own on load (`editorMode`, `direction`, `compact`) and may replace the pane ids
+with its own; neither changes what the link shows. The tool's own output was
+opened the same way before this shipped: datasources, queries and ranges came
+through unchanged.
+
+**Time zones.** Explore displays times in the *viewer's* time-zone preference
+and ignores a `timezone` parameter in the URL. Links therefore default to an
+**absolute** range in epoch milliseconds: every viewer sees the same instants,
+each in their own zone. A relative range such as `now-1h` is re-evaluated when
+the link is opened, so a link pasted into a ticket would show a different window
+tomorrow; pass `absolute: false` if that is what you want.
 
 ### Is it the application or the node?
 

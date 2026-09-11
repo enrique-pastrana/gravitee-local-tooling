@@ -69,6 +69,7 @@ import {
   controlPlaneOfNamespace,
   OWNER_ROLLUP_MIN_NAMESPACES,
   buildFailureTopology,
+  buildExploreLink,
 } from "./helpers.js";
 import { loadCustomerMap, warmCustomerMap, resolveCustomerNamespaces, matchCustomers, groupByCustomer, lookupById, dataPlaneNamespace, controlPlaneNamespace } from "./customerMap.js";
 
@@ -1224,7 +1225,7 @@ registerTool(
     "line_filter is set, each drilldown link also carries an `explore_url`: the Logs " +
     "Drilldown app pre-fills the filter but doesn't apply it on load, so paste the " +
     "explore_url for evidence — it honours the filter immediately. Ask the user before " +
-    "widening the range since logs are large.",
+    "widening the range since logs are large. For several queries, split panes or other datasources, use grafana_explore_link.",
   {
     client: z.string().describe("Customer name fragment, e.g. 'april', 'alliander', 'apim-cloudgate'."),
     component: z.string().optional().describe("Component fragment, e.g. 'gateway', 'engine', 'ui'."),
@@ -2802,6 +2803,137 @@ registerTool(
         ...(placement.note ? { node_placement_note: placement.note } : {}),
         ...(sampling ? { adaptive_logs_sampling: sampling } : {}),
       });
+    }),
+);
+
+registerTool(
+  "grafana_explore_link",
+  "Read-only: build a Grafana Explore link for any set of queries — several queries in one pane, two panes " +
+    "side by side (split), or queries for different datasources together — without URL-encoding by hand. The " +
+    "format was verified on this instance by opening each shape in Grafana. Nothing runs when the link is built; " +
+    "the queries run when someone opens it. " +
+    "Pass `queries` with `split` (true: one pane per query, at most two; false: all in one pane), or `panes` " +
+    "directly. A pane with queries for more than one datasource uses Grafana's Mixed datasource. Every datasource " +
+    "is checked against the read-only allowlist. Loki and Prometheus take `expr`; other types take their native " +
+    "`query` object. " +
+    "The range is ABSOLUTE by default (epoch milliseconds): a relative range like now-1h shows a different window " +
+    "every time the link is opened, which is wrong for a link pasted into a ticket. Explore displays times in the " +
+    "viewer's own time zone and ignores a timezone parameter in the URL; an absolute range is the same instant for " +
+    "every viewer. For a single customer's logs in the Logs Drilldown app, use grafana_logs_link.",
+  {
+    queries: z
+      .array(
+        z.object({
+          datasource_uid: z.string().describe("Datasource uid (grafana_list_datasources)."),
+          expr: z.string().optional().describe("LogQL or PromQL."),
+          query: z.record(z.any()).optional().describe("Native query fields for other datasource types."),
+          instant: z.boolean().optional().describe("Instant rather than range query (Loki, Prometheus)."),
+        }),
+      )
+      .min(1)
+      .max(10)
+      .optional()
+      .describe("Queries to show. Use with split."),
+    split: z
+      .boolean()
+      .default(false)
+      .optional()
+      .describe("With queries: true puts each query in its own pane (at most two); false puts them all in one pane."),
+    panes: z
+      .array(
+        z.object({
+          queries: z
+            .array(
+              z.object({
+                datasource_uid: z.string(),
+                expr: z.string().optional(),
+                query: z.record(z.any()).optional(),
+                instant: z.boolean().optional(),
+              }),
+            )
+            .min(1)
+            .max(10),
+        }),
+      )
+      .min(1)
+      .max(2)
+      .optional()
+      .describe("Explicit panes, instead of queries + split."),
+    from: z.string().default("now-1h").describe("Range start: now-6h, epoch ms, or ISO 8601 with an explicit offset."),
+    to: z.string().default("now").describe("Range end."),
+    absolute: z
+      .boolean()
+      .default(true)
+      .optional()
+      .describe("Resolve the range to absolute instants now (default). false keeps it relative, re-evaluated on open."),
+  },
+  async ({ queries, split = false, panes, from = "now-1h", to = "now", absolute = true }) =>
+    withToolLogging("grafana_explore_link", { panes: panes?.length, queries: queries?.length, split, from, to }, async () => {
+      if (Boolean(queries) === Boolean(panes)) throw new Error("Pass either queries (with split) or panes, not both.");
+      let layout;
+      if (panes) layout = panes;
+      else if (split) {
+        if (queries.length > 2) {
+          throw new Error(`split puts each query in its own pane and Explore shows two; got ${queries.length} queries. Use panes to group them.`);
+        }
+        layout = queries.map((q) => ({ queries: [q] }));
+      } else layout = [{ queries }];
+
+      // Every datasource checked once: a typo fails here, not silently in the
+      // viewer's browser, and nothing outside the read-only allowlist is linked.
+      const uids = [...new Set(layout.flatMap((pane) => pane.queries.map((q) => q.datasource_uid)))];
+      const types = {};
+      const names = {};
+      for (const uid of uids) {
+        const ds = await assertReadOnly(uid);
+        types[uid] = ds.type;
+        names[uid] = ds.name;
+      }
+      for (const q of layout.flatMap((pane) => pane.queries)) {
+        if (types[q.datasource_uid] === "cloudwatch") assertCloudwatchNotBillableLogs(q.query || {});
+      }
+
+      const link = buildExploreLink({
+        panes: layout.map((pane) => ({
+          queries: pane.queries.map((q) => ({
+            datasource: { uid: q.datasource_uid, type: types[q.datasource_uid] },
+            expr: q.expr,
+            query: q.query,
+            instant: q.instant,
+          })),
+        })),
+        from,
+        to,
+        absolute,
+      });
+
+      const result = {
+        url: link.url,
+        url_length: link.url.length,
+        panes: Object.entries(link.panes).map(([id, pane]) => ({
+          id,
+          datasource: pane.datasource,
+          queries: pane.queries.map((q) => ({
+            refId: q.refId,
+            datasource: names[q.datasource.uid] || q.datasource.uid,
+            type: q.datasource.type,
+            ...(q.expr ? { expr: q.expr } : {}),
+          })),
+        })),
+        range: link.range,
+        range_utc: link.range_utc,
+        absolute: link.absolute,
+        timezone_note:
+          "Explore shows times in the viewer's own time-zone preference and ignores a timezone parameter in the URL. " +
+          (link.absolute
+            ? "This range is absolute (epoch milliseconds), so every viewer sees the same instants, each displayed in their own zone."
+            : "This range is RELATIVE: it is re-evaluated when the link is opened, so it will show a different window later."),
+        ...(link.url.length > 8000
+          ? { length_note: "This link is over 8,000 characters; some chat tools and ticket systems truncate URLs that long." }
+          : {}),
+      };
+      const billable = uids.some((uid) => types[uid] === "cloudwatch");
+      return textResult(billable ? withBillingNotice(result, "cloudwatch") : result);
     }),
 );
 

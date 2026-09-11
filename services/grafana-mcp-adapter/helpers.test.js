@@ -59,6 +59,8 @@ const {
   namespaceWeightsFromPayload,
   buildOwnerRollup,
   buildFailureTopology,
+  buildExploreLink,
+  MIXED_DATASOURCE_UID,
   mergeContextStreams,
   normaliseLogLine,
   profileNoise,
@@ -2089,4 +2091,73 @@ test("buildFailureTopology: errors on half the fleet are not 'a few nodes'", () 
   const out = buildFailureTopology(fleet(spec));
   assert.notEqual(out.verdict, "nodes_concentrated");
   assert.equal(out.verdict, "uneven");
+});
+
+// ---------------------------------------------------------------------------
+// Explore links
+// ---------------------------------------------------------------------------
+
+const LOKI = { type: "loki", uid: "logs" };
+const PROM = { type: "prometheus", uid: "prom" };
+const decodePanes = (url) => JSON.parse(decodeURIComponent(new URL(url).searchParams.get("panes")));
+const EXPLORE_NOW = Date.parse("2026-09-11T13:00:00Z");
+
+test("buildExploreLink: one pane, absolute range by default, round-trips through the URL", () => {
+  const out = buildExploreLink({ panes: [{ queries: [{ datasource: LOKI, expr: '{namespace="acme-prod"}' }] }], from: "now-1h", now: EXPLORE_NOW });
+  assert.ok(out.url.startsWith("https://g.example.com/explore?schemaVersion=1&orgId=1&panes="), out.url);
+  assert.deepEqual(decodePanes(out.url), out.panes);
+  assert.deepEqual(out.panes.p1, {
+    datasource: "logs",
+    queries: [{ refId: "A", datasource: LOKI, expr: '{namespace="acme-prod"}', queryType: "range" }],
+    range: { from: String(EXPLORE_NOW - 3_600_000), to: String(EXPLORE_NOW) },
+  });
+  assert.equal(out.range_utc, "2026-09-11T12:00:00.000Z .. 2026-09-11T13:00:00.000Z");
+});
+
+test("buildExploreLink: split panes, each with its own datasource fields", () => {
+  const out = buildExploreLink({
+    panes: [
+      { queries: [{ datasource: LOKI, expr: "sum(count_over_time({a=\"b\"}[5m]))" }] },
+      { queries: [{ datasource: PROM, expr: "sum(up)" }] },
+    ],
+    now: EXPLORE_NOW,
+  });
+  assert.deepEqual(Object.keys(out.panes), ["p1", "p2"]);
+  assert.deepEqual(out.panes.p2.queries[0], { refId: "A", datasource: PROM, expr: "sum(up)", range: true, instant: false });
+});
+
+test("buildExploreLink: several datasources in one pane use the Mixed datasource", () => {
+  const out = buildExploreLink({
+    panes: [{ queries: [{ datasource: LOKI, expr: "x" }, { datasource: PROM, expr: "y", instant: true }] }],
+    now: EXPLORE_NOW,
+  });
+  assert.equal(out.panes.p1.datasource, MIXED_DATASOURCE_UID);
+  assert.deepEqual(out.panes.p1.queries.map((q) => [q.refId, q.datasource.uid]), [["A", "logs"], ["B", "prom"]]);
+  assert.equal(out.panes.p1.queries[1].instant, true);
+});
+
+test("buildExploreLink: relative on request, and an ISO offset lands on the exact instant", () => {
+  const rel = buildExploreLink({ panes: [{ queries: [{ datasource: LOKI, expr: "x" }] }], from: "now-15m", absolute: false, now: EXPLORE_NOW });
+  assert.deepEqual(rel.panes.p1.range, { from: "now-15m", to: "now" });
+  const iso = buildExploreLink({ panes: [{ queries: [{ datasource: LOKI, expr: "x" }] }], from: "2026-09-10T10:30:00-05:00", to: "2026-09-10T16:00:00Z", now: EXPLORE_NOW });
+  assert.deepEqual(iso.panes.p1.range, { from: String(Date.parse("2026-09-10T15:30:00Z")), to: String(Date.parse("2026-09-10T16:00:00Z")) });
+});
+
+test("buildExploreLink: native queries keep their fields but cannot override refId or datasource", () => {
+  const es = { type: "elasticsearch", uid: "es" };
+  const out = buildExploreLink({
+    panes: [{ queries: [{ datasource: es, query: { query: "status:499", refId: "Z", datasource: { uid: "evil" }, timeField: "@timestamp" } }] }],
+    now: EXPLORE_NOW,
+  });
+  assert.deepEqual(out.panes.p1.queries[0], { query: "status:499", timeField: "@timestamp", refId: "A", datasource: es });
+});
+
+test("buildExploreLink: refuses what Explore cannot show or a query cannot run", () => {
+  const q = { datasource: LOKI, expr: "x" };
+  assert.throws(() => buildExploreLink({ panes: [] }), /at least one pane/);
+  assert.throws(() => buildExploreLink({ panes: [{ queries: [q] }, { queries: [q] }, { queries: [q] }] }), /shows 2 panes/);
+  assert.throws(() => buildExploreLink({ panes: [{ queries: [] }] }), /pane 1 has no queries/);
+  assert.throws(() => buildExploreLink({ panes: [{ queries: [{ datasource: LOKI }] }] }), /needs expr/);
+  assert.throws(() => buildExploreLink({ panes: [{ queries: [{ datasource: { type: "elasticsearch", uid: "es" }, expr: "x" }] }] }), /native query object/);
+  assert.throws(() => buildExploreLink({ panes: [{ queries: [q] }], from: "now", to: "now-1h", now: EXPLORE_NOW }), /to must be after from/);
 });

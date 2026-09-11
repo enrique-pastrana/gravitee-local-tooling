@@ -1763,3 +1763,94 @@ test("grafana_failure_topology: a namespace pattern keeps its backslashes", asyn
     assert.ok(calls.loki[0].includes(String.raw`namespace=~"apim-cp-\\w+"`), calls.loki[0]);
   });
 });
+
+// ---------------------------------------------------------------------------
+// grafana_explore_link
+// ---------------------------------------------------------------------------
+
+async function withDatasourceTypes(types, fn) {
+  const orig = globalThis.fetch;
+  globalThis.fetch = (url) => {
+    const u = String(url);
+    const m = /\/datasources\/uid\/([^/?]+)/.exec(u);
+    if (m) {
+      const uid = decodeURIComponent(m[1]);
+      if (!types[uid]) return jsonResponse("not found", { status: 404 });
+      return jsonResponse(JSON.stringify({ uid, name: `${uid} name`, type: types[uid] }));
+    }
+    return jsonResponse([]);
+  };
+  try {
+    return await fn();
+  } finally {
+    globalThis.fetch = orig;
+  }
+}
+
+const EXPLORE_TYPES = { "ex-logs": "loki", "ex-prom": "prometheus", "ex-k6": "k6-datasource", "ex-cw": "cloudwatch" };
+const panesOf = (url) => JSON.parse(decodeURIComponent(new URL(url).searchParams.get("panes")));
+
+test("grafana_explore_link: split puts each query in its own pane with its datasource type", async () => {
+  await withDatasourceTypes(EXPLORE_TYPES, async () => {
+    const out = await callTool("grafana_explore_link", {
+      queries: [
+        { datasource_uid: "ex-logs", expr: 'sum(count_over_time({namespace="acme-prod"}[5m]))' },
+        { datasource_uid: "ex-prom", expr: 'sum(kube_pod_info{namespace="acme-prod"})' },
+      ],
+      split: true,
+      from: "now-1h",
+    });
+    const panes = panesOf(out.url);
+    assert.deepEqual(Object.keys(panes), ["p1", "p2"]);
+    assert.equal(panes.p1.queries[0].datasource.type, "loki");
+    assert.equal(panes.p2.queries[0].datasource.type, "prometheus");
+    // Absolute by default, so a link in a ticket shows the same window tomorrow.
+    assert.match(panes.p1.range.from, /^\d{13}$/);
+    assert.equal(out.absolute, true);
+    assert.match(out.timezone_note, /viewer's own time-zone/);
+  });
+});
+
+test("grafana_explore_link: queries for two datasources in one pane use Mixed", async () => {
+  await withDatasourceTypes(EXPLORE_TYPES, async () => {
+    const out = await callTool("grafana_explore_link", {
+      queries: [{ datasource_uid: "ex-logs", expr: "x" }, { datasource_uid: "ex-prom", expr: "y" }],
+      from: "now-15m",
+      absolute: false,
+    });
+    const panes = panesOf(out.url);
+    assert.equal(panes.p1.datasource, "-- Mixed --");
+    assert.deepEqual(panes.p1.range, { from: "now-15m", to: "now" });
+    assert.match(out.timezone_note, /RELATIVE/);
+  });
+});
+
+test("grafana_explore_link: refuses what it should not link", async () => {
+  await withDatasourceTypes(EXPLORE_TYPES, async () => {
+    await assert.rejects(
+      () => callTool("grafana_explore_link", { queries: [{ datasource_uid: "ex-k6", query: { x: 1 } }] }),
+      /not in the read-only allowlist/,
+    );
+    await assert.rejects(
+      () => callTool("grafana_explore_link", { queries: [{ datasource_uid: "ex-logs", expr: "a" }], panes: [{ queries: [{ datasource_uid: "ex-logs", expr: "a" }] }] }),
+      /either queries .* or panes/,
+    );
+    await assert.rejects(
+      () => callTool("grafana_explore_link", { queries: [1, 2, 3].map(() => ({ datasource_uid: "ex-logs", expr: "a" })), split: true }),
+      /Explore shows two/,
+    );
+    await assert.rejects(() => callTool("grafana_explore_link", { queries: [{ datasource_uid: "ex-logs" }] }), /needs expr/);
+  });
+});
+
+test("grafana_explore_link: a CloudWatch link carries the billing notice, and Logs Insights is refused", async () => {
+  await withDatasourceTypes(EXPLORE_TYPES, async () => {
+    const out = await callTool("grafana_explore_link", {
+      queries: [{ datasource_uid: "ex-cw", query: { namespace: "AWS/S3", metricName: "BucketSizeBytes", queryMode: "Metrics" } }],
+    });
+    assert.ok(out.billing_notice, JSON.stringify(out));
+    await assert.rejects(
+      () => callTool("grafana_explore_link", { queries: [{ datasource_uid: "ex-cw", query: { queryMode: "Logs", expression: "fields @message" } }] }),
+    );
+  });
+});

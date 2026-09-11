@@ -290,6 +290,7 @@ class LocalToolingTest(unittest.TestCase):
                 "grafana_http_requests",
                 "grafana_first_occurrence",
                 "grafana_failure_topology",
+                "grafana_explore_link",
             },
             "a tool was added or renamed - confirm it is read-only before updating this set",
         )

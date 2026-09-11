@@ -2102,3 +2102,74 @@ export function buildFailureTopology({ errorRows = [], siblingPods = [], podInfo
     thresholds: T,
   };
 }
+
+// ---------------------------------------------------------------------------
+// Explore links
+// ---------------------------------------------------------------------------
+//
+// Multi-query and split-pane Explore links had to be URL-encoded by hand during
+// an incident. The format below was verified on the live instance (Grafana 13.3)
+// by opening each shape and reading back the URL Grafana rewrote itself to:
+// split panes keyed by any id, a pane holding queries for several datasources
+// via the Mixed datasource, absolute epoch-millisecond ranges and relative ones.
+// Grafana adds editor state of its own on load (editorMode, direction, compact);
+// none of it is needed in the link.
+//
+// Time zone: Explore displays times in the VIEWER's preference and ignores a
+// timezone parameter in the URL. Absolute epoch milliseconds are the same
+// instant for every viewer, which is why links default to an absolute range —
+// and a relative range pasted into a ticket shows a different window tomorrow.
+
+export const MIXED_DATASOURCE_UID = "-- Mixed --";
+// Explore's split view shows two panes.
+export const EXPLORE_MAX_PANES = 2;
+
+const refIdFor = (i) => (i < 26 ? String.fromCharCode(65 + i) : `Q${i + 1}`);
+
+function exploreQuery(q, i) {
+  const { type, uid } = q.datasource || {};
+  if (!uid || !type) throw new Error(`query ${i + 1} needs a datasource uid and type`);
+  const pinned = { refId: q.refId || refIdFor(i), datasource: { type, uid } };
+  if (type === "loki") {
+    if (!q.expr) throw new Error(`query ${i + 1} (loki) needs expr`);
+    return { ...pinned, expr: q.expr, queryType: q.instant ? "instant" : "range" };
+  }
+  if (type === "prometheus") {
+    if (!q.expr) throw new Error(`query ${i + 1} (prometheus) needs expr`);
+    return { ...pinned, expr: q.expr, range: !q.instant, instant: Boolean(q.instant) };
+  }
+  if (!q.query || typeof q.query !== "object") {
+    throw new Error(`query ${i + 1} (${type}) needs a native query object; expr is for Loki and Prometheus only`);
+  }
+  // Native fields first, so they cannot replace the refId or datasource.
+  return { ...q.query, ...pinned };
+}
+
+export function buildExploreLink({ panes = [], from = "now-1h", to = "now", absolute = true, now = Date.now() } = {}) {
+  if (!Array.isArray(panes) || !panes.length) throw new Error("at least one pane with at least one query is required");
+  if (panes.length > EXPLORE_MAX_PANES) {
+    throw new Error(`Explore's split view shows ${EXPLORE_MAX_PANES} panes; got ${panes.length}. Put more queries in a pane instead.`);
+  }
+  const win = resolvedWindow(from, to, 3600, now);
+  if (!(win.end_ms > win.start_ms)) throw new Error("to must be after from");
+  const range = absolute
+    ? { from: String(Math.round(win.start_ms)), to: String(Math.round(win.end_ms)) }
+    : { from: String(from), to: String(to) };
+
+  const out = {};
+  panes.forEach((pane, p) => {
+    const queries = pane?.queries || [];
+    if (!queries.length) throw new Error(`pane ${p + 1} has no queries`);
+    const built = queries.map(exploreQuery);
+    const uids = [...new Set(built.map((q) => q.datasource.uid))];
+    out[`p${p + 1}`] = { datasource: uids.length === 1 ? uids[0] : MIXED_DATASOURCE_UID, queries: built, range };
+  });
+
+  return {
+    url: `${BASE_URL}/explore?schemaVersion=1&orgId=1&panes=${encodeURIComponent(JSON.stringify(out))}`,
+    panes: out,
+    range,
+    range_utc: `${win.from_utc} .. ${win.to_utc}`,
+    absolute,
+  };
+}
