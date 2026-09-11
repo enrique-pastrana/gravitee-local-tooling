@@ -508,25 +508,18 @@ as `grafanacloud-gravitee-logs` but its uid is `grafanacloud-logs`.
 
 ### Rotating the token (or any `GRAFANA_*` value)
 
-`GRAFANA_*` reaches the container through the compose `environment:` block, which
-is captured when the container is **created**. So the container's own copy of the
-token goes stale the moment `.env` changes.
-
-`bin/local-tooling exec-mcp grafana` therefore forwards the resolved `GRAFANA_*`
-values into each exec session (`docker exec -e GRAFANA_TOKEN ...`, by name — never
-`-e VAR=value`, which would put the token on the command line where `ps` exposes
-it). `.env` is authoritative at **connect** time, so:
+`bin/local-tooling exec-mcp grafana` starts a fresh container for every MCP
+connection (`docker compose run --rm -T grafana-mcp-adapter`), and compose fills
+the service's `environment:` block from `.env` at that moment. So `.env` is
+authoritative at **connect** time:
 
 ```bash
-# edit .env, then simply reconnect the MCP client. No container recreate.
+# edit .env, then reconnect the MCP client. Nothing to rebuild or recreate.
 ```
 
-An **already-connected** MCP session keeps the values it started with, because its
-`docker exec` is still running. Reconnect that client to pick up a new token —
+An **already-connected** MCP session keeps the values it started with, because
+its container is still running. Reconnect that client to pick up a new token —
 `doctor` reads `.env` and so describes what the *next* connection will use.
-
-Only variables that are actually set are forwarded: `docker exec -e VAR` for an
-unset VAR does not leave the container's baked value in place, it removes it.
 
 ### The customer snapshot is never committed
 
