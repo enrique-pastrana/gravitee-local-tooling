@@ -1871,3 +1871,234 @@ export function buildOwnerRollup(weights, { controlPlaneClusters = {}, customers
     note,
   };
 }
+
+// ---------------------------------------------------------------------------
+// Is it the application, or the node?
+// ---------------------------------------------------------------------------
+//
+// The root cause of an incident only became clear once errors were grouped by
+// pod and pods joined to nodes: every failing pod sat on one node, and sibling
+// pods on other nodes were healthy. That took three manual queries across Loki
+// and Prometheus. The verdict compares each node's share of matching lines with
+// its share of pods — a node running most of the pods is expected to carry most
+// of the errors, so error share alone would mislead.
+
+export const TOPOLOGY_THRESHOLDS = Object.freeze({
+  // The fewest nodes carrying at least this share of matching lines...
+  concentratedErrorSharePct: 80,
+  // ...run at most this share of the pods...
+  concentratedMaxPodSharePct: 50,
+  // ...carry at least this multiple of their pod share...
+  concentratedMinRatio: 2,
+  // ...and are at most this fraction of the nodes (always at least one).
+  concentratedMaxNodeFraction: 0.25,
+  // Otherwise: spread when the distributions of lines and pods over nodes
+  // differ by less than this in total.
+  spreadMaxDistancePct: 30,
+});
+
+export function buildFailureTopology({ errorRows = [], siblingPods = [], podInfo = [], maxNodes = 25, maxPodsPerNode = 20 } = {}) {
+  // "|" cannot appear in a cluster, namespace, node or pod name.
+  const key = (c, n, p) => `${c || ""}|${n || ""}|${p || ""}`;
+  const loose = (n, p) => `${n || ""}|${p || ""}`;
+  const pods = new Map();
+  const touch = (m) => {
+    if (!m?.pod) return null;
+    const k = key(m.cluster, m.namespace, m.pod);
+    let e = pods.get(k);
+    if (!e) {
+      e = { cluster: m.cluster || null, namespace: m.namespace || null, pod: m.pod, errors: 0, sampled: 0 };
+      pods.set(k, e);
+    }
+    return e;
+  };
+  for (const s of siblingPods || []) touch(s);
+  for (const r of errorRows || []) {
+    const e = touch(r?.metric);
+    const n = Number(r?.value?.[1]);
+    if (!e || !Number.isFinite(n)) continue;
+    e.errors += n;
+    const sv = r.metric?.[ADAPTIVE_LOGS_LABEL];
+    if (sv !== undefined && sv !== null && String(sv) !== "") e.sampled += n;
+  }
+
+  const info = new Map();
+  const infoLoose = new Map();
+  for (const m of podInfo || []) {
+    if (!m?.pod || !m?.node) continue;
+    info.set(key(m.cluster, m.namespace, m.pod), m);
+    infoLoose.set(loose(m.namespace, m.pod), m);
+  }
+
+  const nodes = new Map();
+  const withoutNode = [];
+  let matching = 0;
+  for (const p of pods.values()) {
+    matching += p.errors;
+    const m = info.get(key(p.cluster, p.namespace, p.pod)) || infoLoose.get(loose(p.namespace, p.pod));
+    if (!m) {
+      withoutNode.push(p);
+      continue;
+    }
+    const nk = `${m.cluster || p.cluster || ""}|${m.node}`;
+    const n = nodes.get(nk) || { node: m.node, host_ip: m.host_ip || null, cluster: m.cluster || p.cluster || null, pods: [], errors: 0 };
+    n.pods.push(p);
+    n.errors += p.errors;
+    nodes.set(nk, n);
+  }
+
+  const pct = (a, b) => (b ? Math.round((a / b) * 1000) / 10 : 0);
+  const placedPods = [...nodes.values()].reduce((a, n) => a + n.pods.length, 0);
+  const placedErrors = [...nodes.values()].reduce((a, n) => a + n.errors, 0);
+  const ranked = [...nodes.values()]
+    .map((n) => ({
+      ...n,
+      error_share_pct: pct(n.errors, placedErrors),
+      pod_share_pct: pct(n.pods.length, placedPods),
+      affected: n.pods.filter((p) => p.errors > 0).length,
+    }))
+    .sort((a, b) => b.errors - a.errors || b.pods.length - a.pods.length);
+
+  const T = TOPOLOGY_THRESHOLDS;
+  const erroring = [...pods.values()].filter((p) => p.errors > 0);
+  const notes = [];
+  let verdict;
+  let concentration = null;
+  let distance = null;
+  if (!matching) {
+    verdict = "no_errors";
+    notes.push(`No matching lines on any of the ${pods.size} pod(s) in scope.`);
+  } else if (!ranked.length) {
+    verdict = "insufficient";
+    notes.push("No pod could be placed on a node, so there is nothing to compare across nodes.");
+  } else if (ranked.length === 1) {
+    verdict = "single_node";
+    notes.push(`Every placed pod runs on one node (${ranked[0].node}), so errors cannot be compared across nodes.`);
+  } else {
+    // How far the distribution of matching lines over nodes is from the
+    // distribution of pods over nodes: half the summed absolute difference of
+    // the shares (total variation distance), in percent. 0 means the errors
+    // follow the pods exactly. Measured over the whole fleet because a per-node
+    // gap cannot see concentration on several nodes: live, every "mongo" line
+    // across 777 control-plane pods sat on 5 of 39 nodes, each only ~25 points
+    // over its pod share — and a per-node check called that "spread".
+    distance = Math.round((ranked.reduce((a, n) => a + Math.abs(n.error_share_pct - n.pod_share_pct), 0) / 2) * 10) / 10;
+
+    // The fewest nodes that carry most of the matching lines, and how much of
+    // the fleet they are.
+    let k = 0;
+    let lineShare = 0;
+    let podShare = 0;
+    for (const n of ranked) {
+      if (lineShare >= T.concentratedErrorSharePct) break;
+      k++;
+      lineShare += n.error_share_pct;
+      podShare += n.pod_share_pct;
+    }
+    lineShare = Math.round(lineShare * 10) / 10;
+    podShare = Math.round(podShare * 10) / 10;
+    const hot = ranked.slice(0, k);
+    const cleanElsewhere = ranked.slice(k).reduce((a, n) => a + n.pods.filter((p) => p.errors === 0).length, 0);
+    concentration = { nodes_carrying_most_lines: k, their_line_share_pct: lineShare, their_pod_share_pct: podShare };
+    const maxNodes = Math.max(1, Math.floor(ranked.length * T.concentratedMaxNodeFraction));
+    const concentrated =
+      lineShare >= T.concentratedErrorSharePct &&
+      podShare <= T.concentratedMaxPodSharePct &&
+      podShare > 0 &&
+      lineShare / podShare >= T.concentratedMinRatio &&
+      k <= maxNodes &&
+      cleanElsewhere > 0;
+
+    if (concentrated && k === 1) {
+      verdict = "node_concentrated";
+      const top = hot[0];
+      notes.push(
+        `${top.error_share_pct}% of matching lines come from node ${top.node}, which runs ${top.pod_share_pct}% of the ` +
+          `pods in scope (${top.affected} of its ${top.pods.length} affected), while ${cleanElsewhere} sibling pod(s) on ` +
+          "other nodes have none. That points at the node rather than the application.",
+      );
+    } else if (concentrated) {
+      verdict = "nodes_concentrated";
+      const names = hot.slice(0, 5).map((n) => n.node).join(", ") + (k > 5 ? ", …" : "");
+      notes.push(
+        `${lineShare}% of matching lines come from ${k} of ${ranked.length} nodes (${names}), which run ${podShare}% of ` +
+          `the pods in scope, while ${cleanElsewhere} sibling pod(s) on the other nodes have none. Concentrated on a ` +
+          "few nodes: check what they share (a node pool, a zone, a recent roll) before reading this as the application.",
+      );
+    } else if (distance < T.spreadMaxDistancePct) {
+      verdict = "spread";
+      notes.push(
+        `Matching lines follow the pods: across all ${ranked.length} nodes, where the lines are differs from where the ` +
+          `pods are by ${distance}% in total (under ${T.spreadMaxDistancePct}%). Not node-specific.`,
+      );
+    } else {
+      verdict = "uneven";
+      notes.push(
+        `Uneven across nodes (${distance}% total difference between where the lines are and where the pods are), but ` +
+          `not concentrated enough to single out a node or a few: the ${k} busiest node(s) carry ${lineShare}% of ` +
+          `matching lines with ${podShare}% of the pods.`,
+      );
+    }
+  }
+
+  const sampledErroring = erroring.filter((p) => p.sampled > 0);
+  if (sampledErroring.length) {
+    notes.push(
+      `Adaptive Logs is sampling lines on ${sampledErroring.length} of ${erroring.length} erroring pod(s), so per-pod ` +
+        "counts are lower bounds and not strictly comparable: a pod whose lines are not sampled can look worse than " +
+        "a sampled sibling.",
+    );
+  }
+  const unplacedErroring = withoutNode.filter((p) => p.errors > 0).length;
+  if (withoutNode.length) {
+    notes.push(
+      `${withoutNode.length} pod(s) could not be placed on a node and are listed separately` +
+        `${unplacedErroring ? `, ${unplacedErroring} of them with matching lines` : ""}.`,
+    );
+  }
+
+  const podOut = (p) => ({
+    ...(p.cluster ? { cluster: p.cluster } : {}),
+    namespace: p.namespace,
+    pod: p.pod,
+    errors: p.errors,
+    ...(p.sampled ? { sampled_errors: p.sampled } : {}),
+  });
+  const byPodErrors = (a, b) => b.errors - a.errors || String(a.pod).localeCompare(String(b.pod));
+  return {
+    verdict,
+    note: notes.join(" "),
+    pods_in_scope: pods.size,
+    pods_with_errors: erroring.length,
+    healthy_pods: pods.size - erroring.length,
+    matching_lines: matching,
+    nodes: ranked.length,
+    nodes_with_errors: ranked.filter((n) => n.errors > 0).length,
+    ...(distance !== null ? { distribution_distance_pct: distance } : {}),
+    ...(concentration ? { concentration } : {}),
+    by_node: ranked.slice(0, maxNodes).map((n) => ({
+      node: n.node,
+      host_ip: n.host_ip,
+      cluster: n.cluster,
+      pod_count: n.pods.length,
+      pods_with_errors: n.affected,
+      errors: n.errors,
+      error_share_pct: n.error_share_pct,
+      pod_share_pct: n.pod_share_pct,
+      pods: [...n.pods].sort(byPodErrors).slice(0, maxPodsPerNode).map(podOut),
+      ...(n.pods.length > maxPodsPerNode ? { pods_truncated: n.pods.length - maxPodsPerNode } : {}),
+    })),
+    ...(ranked.length > maxNodes ? { by_node_truncated: ranked.length - maxNodes } : {}),
+    ...(withoutNode.length ? { pods_without_node: [...withoutNode].sort(byPodErrors).slice(0, 50).map(podOut) } : {}),
+    ...(sampledErroring.length
+      ? {
+          sampling: {
+            erroring_pods_with_sampled_lines: sampledErroring.length,
+            erroring_pods: erroring.length,
+            sampled_matching_lines: sampledErroring.reduce((a, p) => a + p.sampled, 0),
+          },
+        }
+      : {}),
+    thresholds: T,
+  };
+}

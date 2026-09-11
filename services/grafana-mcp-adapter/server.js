@@ -68,6 +68,7 @@ import {
   buildOwnerRollup,
   controlPlaneOfNamespace,
   OWNER_ROLLUP_MIN_NAMESPACES,
+  buildFailureTopology,
 } from "./helpers.js";
 import { loadCustomerMap, warmCustomerMap, resolveCustomerNamespaces, matchCustomers, groupByCustomer, lookupById, dataPlaneNamespace, controlPlaneNamespace } from "./customerMap.js";
 
@@ -80,7 +81,7 @@ const LOGS_DATASOURCE_UID = (process.env.GRAFANA_LOGS_DATASOURCE_UID || "").trim
 // Optional Prometheus datasource scraping kube-state-metrics. Used only to turn
 // the upstream IPs in an access log into pods and nodes; everything else works
 // without it, and the result says how to enable it when it is unset.
-const METRICS_DATASOURCE_UID = (process.env.GRAFANA_METRICS_DATASOURCE_UID || "").trim();
+const metricsDatasourceUid = () => (process.env.GRAFANA_METRICS_DATASOURCE_UID || "").trim();
 
 // Allowlist of datasource types whose QUERY LANGUAGE cannot write. This is the
 // whole basis of the read-only guarantee — it is not about token permissions, so
@@ -691,6 +692,64 @@ async function exactEdgeCounts(uid, logQuery, buckets) {
   return applyEdgeCounts(buckets, exact);
 }
 
+// Node placement for a set of pods, via kube_pod_info.
+//
+// Queried per cluster, 40 namespaces at a time: a broad scope spans hundreds of
+// namespaces, and one alternation of all of them would not fit in a URL.
+// last_over_time over the window so a pod replaced during it is still placed.
+async function kubePodInfo(pods, { start, end }) {
+  const uid = metricsDatasourceUid();
+  if (!uid) {
+    return {
+      note:
+        "Pods were not placed on nodes: set GRAFANA_METRICS_DATASOURCE_UID to a Prometheus datasource that scrapes " +
+        "kube-state-metrics.",
+    };
+  }
+  try {
+    const ds = await assertReadOnly(uid);
+    if (ds.type !== "prometheus") {
+      return { note: `GRAFANA_METRICS_DATASOURCE_UID is a ${ds.type} datasource, not prometheus; pods not placed on nodes.` };
+    }
+  } catch (err) {
+    return { note: `Pods not placed on nodes: ${err.message}` };
+  }
+  const byCluster = new Map();
+  for (const p of pods || []) {
+    if (!p?.namespace || !p?.pod) continue;
+    const c = p.cluster || "";
+    if (!byCluster.has(c)) byCluster.set(c, new Set());
+    byCluster.get(c).add(p.namespace);
+  }
+  const range = `${Math.max(end - start, 60)}s`;
+  const queries = [];
+  for (const [c, nsSet] of byCluster) {
+    const ns = [...nsSet];
+    for (let i = 0; i < ns.length; i += 40) {
+      const alternation = ns.slice(i, i + 40).map((n) => escapeRegex(n)).join("|");
+      const clusterMatch = c ? `cluster="${String(c).replace(/["\\]/g, "")}", ` : "";
+      queries.push(
+        "max by (cluster, namespace, pod, node, host_ip) (" +
+          `last_over_time(kube_pod_info{${clusterMatch}namespace=~\`^(?:${alternation})$\`}[${range}]))`,
+      );
+    }
+  }
+  const MAX_QUERIES = 30;
+  const settled = await Promise.allSettled(
+    queries.slice(0, MAX_QUERIES).map((query) => grafanaDatasourceProxyGet(uid, "api/v1/query", { query, time: String(end) })),
+  );
+  const out = [];
+  let failed = 0;
+  for (const r of settled) {
+    if (r.status === "fulfilled") for (const x of r.value?.data?.result || []) out.push(x?.metric || {});
+    else failed++;
+  }
+  const notes = [];
+  if (failed) notes.push(`${failed} of ${settled.length} node-placement queries failed; their pods are listed without a node.`);
+  if (queries.length > MAX_QUERIES) notes.push("The scope spans too many namespaces to place every pod on a node; narrow it.");
+  return { pods: out, ...(notes.length ? { note: notes.join(" ") } : {}) };
+}
+
 // Upstream IPs -> pods and nodes, via kube-state-metrics.
 //
 // kube_pod_info carries node and host_ip but no pod IP; kube_pod_ips carries the
@@ -700,7 +759,7 @@ async function exactEdgeCounts(uid, logQuery, buckets) {
 // that was replaced during it is still found; an IP can therefore list more
 // than one pod, and the result says so.
 async function podsByIp(cluster, ips, { start, end }) {
-  if (!METRICS_DATASOURCE_UID) {
+  if (!metricsDatasourceUid()) {
     return {
       note:
         "Upstream IPs were not resolved to pods: set GRAFANA_METRICS_DATASOURCE_UID to a Prometheus " +
@@ -710,7 +769,7 @@ async function podsByIp(cluster, ips, { start, end }) {
   const unique = [...new Set((ips || []).filter((ip) => /^[0-9a-f.:]+$/i.test(ip)))].slice(0, 100);
   if (!unique.length) return { pods: new Map() };
   try {
-    const ds = await assertReadOnly(METRICS_DATASOURCE_UID);
+    const ds = await assertReadOnly(metricsDatasourceUid());
     if (ds.type !== "prometheus") {
       return { note: `GRAFANA_METRICS_DATASOURCE_UID is a ${ds.type} datasource, not prometheus; pods not resolved.` };
     }
@@ -725,7 +784,7 @@ async function podsByIp(cluster, ips, { start, end }) {
     "* on (namespace, pod) group_left (node, host_ip) " +
     `max by (namespace, pod, node, host_ip) (last_over_time(kube_pod_info{cluster="${safeCluster}"}[${range}])))`;
   try {
-    const data = await grafanaDatasourceProxyGet(METRICS_DATASOURCE_UID, "api/v1/query", { query, time: String(end) });
+    const data = await grafanaDatasourceProxyGet(metricsDatasourceUid(), "api/v1/query", { query, time: String(end) });
     const pods = new Map();
     for (const r of data?.data?.result || []) {
       const m = r?.metric || {};
@@ -2619,6 +2678,128 @@ registerTool(
         peak: trend.peak,
         before_window: beforeWindow,
         ramp,
+        ...(sampling ? { adaptive_logs_sampling: sampling } : {}),
+      });
+    }),
+);
+
+registerTool(
+  "grafana_failure_topology",
+  "Read-only: WHERE are the failures — matching log lines per pod, joined to the node each pod runs on, with the " +
+    "healthy sibling pods of the same service for contrast. It answers 'is this the application, or the node?'. In " +
+    "a real incident the cause only became clear after grouping errors by pod and joining pods to nodes: every " +
+    "failing pod sat on one node while siblings elsewhere were healthy — three manual queries across Loki and " +
+    "Prometheus. " +
+    "Siblings are the pods whose streams match the same selector in the window (Loki's index, no log bodies), so " +
+    "'healthy' means logging, but without matching lines. Each node reports its share of matching lines next to " +
+    "its share of pods, and the verdict — node_concentrated, nodes_concentrated (a few nodes), spread, uneven, " +
+    "single_node or no_errors — comes from " +
+    "comparing the two, with the thresholds in the result: a node that runs most of the pods is expected to carry " +
+    "most of the errors. " +
+    "Adaptive Logs sampling is reported per pod: a pod whose lines are not sampled can look worse than a sampled " +
+    "sibling. Node placement needs GRAFANA_METRICS_DATASOURCE_UID (Prometheus with kube-state-metrics). For HTTP " +
+    "failures per upstream pod and node, use grafana_http_requests.",
+  {
+    line_filter: z.string().describe("The failures to locate: a substring of the log line, e.g. 'MongoTimeoutException'. Required."),
+    case_sensitive: z
+      .boolean()
+      .default(false)
+      .optional()
+      .describe("Match line_filter case-sensitively. Default false, so a wrong-case filter does not read as healthy."),
+    client: z.string().optional().describe("Customer name fragment. Pass exactly one of client, namespace or namespace_pattern."),
+    component: z.string().optional().describe("With client: component fragment, e.g. 'gateway'."),
+    namespace: z.string().optional().describe("Exact namespace."),
+    namespace_pattern: z
+      .string()
+      .optional()
+      .describe("Namespace regex for a wider scope, e.g. 'apim-cp-.*'. A pattern matching every namespace is refused."),
+    service_name: z.string().optional().describe("With namespace or namespace_pattern: exact service_name."),
+    cluster: z.string().optional().describe("Restrict to one cluster."),
+    control_plane_id: z.string().optional().describe("With client: narrow to one Cockpit organization."),
+    from: z.string().default("now-1h").describe("Window start."),
+    to: z.string().default("now").describe("Window end."),
+    max_nodes: z.number().int().min(1).max(100).default(25).optional().describe("Nodes to list, most matching lines first."),
+  },
+  async ({
+    line_filter,
+    case_sensitive = false,
+    client,
+    component,
+    namespace,
+    namespace_pattern,
+    service_name,
+    cluster,
+    control_plane_id,
+    from = "now-1h",
+    to = "now",
+    max_nodes = 25,
+  }) =>
+    withToolLogging("grafana_failure_topology", { client, namespace, namespace_pattern, cluster, from, to }, async () => {
+      const uid = requireDatasourceUid(LOGS_DATASOURCE_UID);
+      if (!line_filter || !String(line_filter).trim()) {
+        throw new Error("line_filter is required: the failures to locate, e.g. 'MongoTimeoutException' or 'connection refused'.");
+      }
+      if ([client, namespace, namespace_pattern].filter(Boolean).length !== 1) {
+        throw new Error("Pass exactly one of client, namespace or namespace_pattern.");
+      }
+      if (namespace_pattern && /^\^?\.[*+]\$?$/.test(String(namespace_pattern).trim())) {
+        throw new Error("namespace_pattern matches every namespace; narrow it, e.g. 'apim-cp-.*'.");
+      }
+
+      // Values inside a double-quoted LogQL string: escape, do not strip — a
+      // namespace regex needs its backslashes.
+      const lq = (v) => String(v).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+      let selector;
+      let resolution = null;
+      if (client) {
+        const resolved = await resolveCustomerSelector({ client, component, from, controlPlaneId: control_plane_id });
+        selector = resolved.selector;
+        resolution = resolved.resolution;
+        if (cluster) selector = selector.replace(/^\{/, `{cluster="${lq(cluster)}", `);
+      } else {
+        const matchers = [namespace ? `namespace="${lq(namespace)}"` : `namespace=~"${lq(namespace_pattern)}"`];
+        if (service_name) matchers.push(`service_name="${lq(service_name)}"`);
+        if (cluster) matchers.push(`cluster="${lq(cluster)}"`);
+        selector = `{${matchers.join(", ")}}`;
+      }
+
+      const errorQuery = `${selector}${lineFilterExpr(line_filter, { caseSensitive: case_sensitive })}`;
+      const { start, end } = rangeSeconds(from, to);
+      if (end <= start) throw new Error("to must be after from.");
+      const rangeS = Math.max(end - start, 60);
+      const countQuery = `sum by (cluster, namespace, pod, ${ADAPTIVE_LOGS_LABEL}) (count_over_time(${errorQuery} [${rangeS}s]))`;
+
+      const [errorsRes, seriesRes] = await Promise.all([
+        grafanaDatasourceProxyGet(uid, "loki/api/v1/query", { query: countQuery, time: `${end}000000000` }).catch((err) => {
+          throw new Error(`count query failed: ${err.message} | LogQL: ${countQuery}`);
+        }),
+        grafanaDatasourceProxyGet(uid, "loki/api/v1/series", {
+          "match[]": selector,
+          start: `${start}000000000`,
+          end: `${end}000000000`,
+        }).catch(() => null),
+      ]);
+      const errorRows = errorsRes?.data?.result || [];
+      const siblingPods = seriesRes
+        ? (seriesRes.data || []).filter((st) => st?.pod).map((st) => ({ cluster: st.cluster, namespace: st.namespace, pod: st.pod }))
+        : [];
+
+      const placement = await kubePodInfo([...siblingPods, ...errorRows.map((r) => r?.metric || {})], { start, end });
+      const topology = buildFailureTopology({ errorRows, siblingPods, podInfo: placement.pods || [], maxNodes: max_nodes });
+      const sampling = samplingFromGroupedCounts(errorRows);
+
+      return textResult({
+        query: countQuery,
+        scope_applied: selector,
+        scope_note: scopeNote(selector),
+        ...(resolution ? resolutionReport(resolution) : {}),
+        range: { from, to },
+        resolved_window_utc: `${new Date(start * 1000).toISOString()} .. ${new Date(end * 1000).toISOString()}`,
+        ...topology,
+        ...(seriesRes
+          ? {}
+          : { siblings_note: "Sibling pods could not be listed, so pods without matching lines are missing from the comparison." }),
+        ...(placement.note ? { node_placement_note: placement.note } : {}),
         ...(sampling ? { adaptive_logs_sampling: sampling } : {}),
       });
     }),

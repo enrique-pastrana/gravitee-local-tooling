@@ -1665,3 +1665,101 @@ test("grafana_query: no rollup for a result that is not broad", async () => {
     assert.equal(out.owner_rollup, undefined);
   });
 });
+
+// ---------------------------------------------------------------------------
+// grafana_failure_topology
+// ---------------------------------------------------------------------------
+
+const TOPOLOGY_CLUSTER = "shared-worker-us-east-prod";
+
+function topologyFixture(spec) {
+  return {
+    series: spec.map(([pod]) => ({ cluster: TOPOLOGY_CLUSTER, namespace: "acme-prod", pod, service_name: "gw" })),
+    errorRows: spec
+      .filter(([, , e]) => e > 0)
+      .map(([pod, , e]) => ({ metric: { cluster: TOPOLOGY_CLUSTER, namespace: "acme-prod", pod }, value: [0, String(e)] })),
+    podInfo: spec.map(([pod, node]) => ({ cluster: TOPOLOGY_CLUSTER, namespace: "acme-prod", pod, node, host_ip: `10.0.0.${node.slice(-1)}` })),
+  };
+}
+
+async function withTopologyStub({ series = [], errorRows = [], podInfo = [], metricsUid = "prom-ds" }, fn) {
+  const orig = globalThis.fetch;
+  const before = process.env.GRAFANA_METRICS_DATASOURCE_UID;
+  if (metricsUid) process.env.GRAFANA_METRICS_DATASOURCE_UID = metricsUid;
+  else delete process.env.GRAFANA_METRICS_DATASOURCE_UID;
+  const calls = { loki: [], prom: [] };
+  globalThis.fetch = (url) => {
+    const u = String(url);
+    if (u.includes("/datasources/uid/")) return jsonResponse(JSON.stringify({ uid: "prom-ds", name: "prom", type: "prometheus" }));
+    if (u.includes("loki/api/v1/series")) return jsonResponse(series);
+    if (u.includes("loki/api/v1/query")) {
+      calls.loki.push(new URL(u).searchParams.get("query"));
+      return jsonResponse({ resultType: "vector", result: errorRows });
+    }
+    if (u.includes("/api/v1/query")) {
+      calls.prom.push(new URL(u).searchParams.get("query"));
+      return jsonResponse({ resultType: "vector", result: podInfo.map((metric) => ({ metric, value: [0, "1"] })) });
+    }
+    return jsonResponse([]);
+  };
+  try {
+    return await fn(calls);
+  } finally {
+    globalThis.fetch = orig;
+    if (before === undefined) delete process.env.GRAFANA_METRICS_DATASOURCE_UID;
+    else process.env.GRAFANA_METRICS_DATASOURCE_UID = before;
+  }
+}
+
+test("grafana_failure_topology: failing pods on one node, healthy siblings elsewhere", async () => {
+  const fx = topologyFixture([
+    ["gw-a", "node-1", 30], ["gw-b", "node-1", 25], ["gw-c", "node-1", 20],
+    ["gw-d", "node-2", 0], ["gw-e", "node-2", 1], ["gw-f", "node-3", 0], ["gw-g", "node-4", 0],
+  ]);
+  await withTopologyStub(fx, async (calls) => {
+    const out = await callTool("grafana_failure_topology", { namespace: "acme-prod", line_filter: "MongoTimeoutException", from: "now-1h" });
+    assert.equal(out.verdict, "node_concentrated");
+    assert.equal(out.by_node[0].node, "node-1");
+    assert.equal(out.pods_in_scope, 7);
+    assert.equal(out.healthy_pods, 3);
+    // Errors counted per pod, grouped by the sampling label as well.
+    assert.match(calls.loki[0], /^sum by \(cluster, namespace, pod, __adaptive_logs_sampled__\)/);
+    assert.match(calls.loki[0], /MongoTimeoutException/);
+    // Placement for the pods in scope, not a whole-cluster dump.
+    assert.ok(calls.prom[0].includes("namespace=~`^(?:acme-prod)$`"), calls.prom[0]);
+    assert.ok(calls.prom[0].includes(`cluster="${TOPOLOGY_CLUSTER}"`), calls.prom[0]);
+  });
+});
+
+test("grafana_failure_topology: without a metrics datasource it says what is missing", async () => {
+  const fx = topologyFixture([["gw-a", "node-1", 5], ["gw-b", "node-2", 0]]);
+  await withTopologyStub({ ...fx, metricsUid: null }, async (calls) => {
+    const out = await callTool("grafana_failure_topology", { namespace: "acme-prod", line_filter: "boom" });
+    assert.equal(out.verdict, "insufficient");
+    assert.match(out.node_placement_note, /GRAFANA_METRICS_DATASOURCE_UID/);
+    assert.equal(out.pods_without_node.length, 2);
+    assert.equal(calls.prom.length, 0);
+  });
+});
+
+test("grafana_failure_topology: validates its scope", async () => {
+  await withTopologyStub({}, async () => {
+    await assert.rejects(() => callTool("grafana_failure_topology", { namespace: "acme-prod" }), /line_filter is required/);
+    await assert.rejects(
+      () => callTool("grafana_failure_topology", { namespace: "acme-prod", client: "acme", line_filter: "x" }),
+      /exactly one of client, namespace or namespace_pattern/,
+    );
+    await assert.rejects(
+      () => callTool("grafana_failure_topology", { namespace_pattern: ".*", line_filter: "x" }),
+      /matches every namespace/,
+    );
+  });
+});
+
+test("grafana_failure_topology: a namespace pattern keeps its backslashes", async () => {
+  await withTopologyStub({}, async (calls) => {
+    const out = await callTool("grafana_failure_topology", { namespace_pattern: String.raw`apim-cp-\w+`, line_filter: "x" });
+    assert.equal(out.scope_applied, String.raw`{namespace=~"apim-cp-\\w+"}`);
+    assert.ok(calls.loki[0].includes(String.raw`namespace=~"apim-cp-\\w+"`), calls.loki[0]);
+  });
+});

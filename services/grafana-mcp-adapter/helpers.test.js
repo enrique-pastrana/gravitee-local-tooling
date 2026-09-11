@@ -58,6 +58,7 @@ const {
   controlPlaneOfNamespace,
   namespaceWeightsFromPayload,
   buildOwnerRollup,
+  buildFailureTopology,
   mergeContextStreams,
   normaliseLogLine,
   profileNoise,
@@ -1983,4 +1984,109 @@ test("buildOwnerRollup: nothing to roll up below the threshold", () => {
     ["apim-dp-cp1111-dp0002", { clusters: new Set(), series: 1, value: 1, lines: 0 }],
   ]);
   assert.equal(buildOwnerRollup(weights), null);
+});
+
+// ---------------------------------------------------------------------------
+// Failure topology
+// ---------------------------------------------------------------------------
+
+const TOPO_CLUSTER = "shared-worker-us-east-prod";
+function fleet(spec, { sampled = {} } = {}) {
+  // spec: [pod, node, errors]
+  return {
+    siblingPods: spec.map(([pod]) => ({ cluster: TOPO_CLUSTER, namespace: "acme-prod", pod })),
+    errorRows: spec
+      .filter(([, , e]) => e > 0)
+      .map(([pod, , e]) => ({
+        metric: { cluster: TOPO_CLUSTER, namespace: "acme-prod", pod, ...(sampled[pod] ? { __adaptive_logs_sampled__: "99.00" } : {}) },
+        value: [0, String(e)],
+      })),
+    podInfo: spec.filter(([, node]) => node).map(([pod, node]) => ({ cluster: TOPO_CLUSTER, namespace: "acme-prod", pod, node, host_ip: `10.0.0.${node.slice(-1)}` })),
+  };
+}
+
+test("buildFailureTopology: failures on one node, healthy siblings elsewhere, is node_concentrated", () => {
+  // The incident shape: every failing pod on one node, siblings clean.
+  const out = buildFailureTopology(fleet([
+    ["gw-a", "node-1", 30], ["gw-b", "node-1", 25], ["gw-c", "node-1", 20],
+    ["gw-d", "node-2", 0], ["gw-e", "node-2", 1], ["gw-f", "node-3", 0], ["gw-g", "node-4", 0],
+  ]));
+  assert.equal(out.verdict, "node_concentrated");
+  assert.equal(out.by_node[0].node, "node-1");
+  assert.equal(out.by_node[0].pods_with_errors, 3);
+  assert.equal(out.by_node[0].pod_share_pct, 42.9);
+  assert.equal(out.by_node[0].error_share_pct, 98.7);
+  assert.equal(out.pods_in_scope, 7);
+  assert.equal(out.healthy_pods, 3);
+  assert.match(out.note, /node node-1/);
+  assert.match(out.note, /3 sibling pod\(s\) on other nodes have none/);
+});
+
+test("buildFailureTopology: a node with most of the pods carrying most of the errors is not concentration", () => {
+  // Error share alone would single this node out; it simply runs most of the pods.
+  const out = buildFailureTopology(fleet([
+    ["gw-a", "node-1", 10], ["gw-b", "node-1", 10], ["gw-c", "node-1", 10], ["gw-d", "node-1", 10],
+    ["gw-e", "node-2", 9],
+  ]));
+  assert.equal(out.verdict, "spread");
+  assert.equal(out.by_node[0].pod_share_pct, 80);
+});
+
+test("buildFailureTopology: errors in proportion to pods are spread; a lopsided node is uneven", () => {
+  assert.equal(buildFailureTopology(fleet([["a", "node-1", 10], ["b", "node-2", 12], ["c", "node-3", 9]])).verdict, "spread");
+  assert.equal(buildFailureTopology(fleet([["a", "node-1", 60], ["b", "node-2", 20], ["c", "node-3", 20], ["d", "node-3", 0]])).verdict, "uneven");
+});
+
+test("buildFailureTopology: no errors, one node, and no placement each say so", () => {
+  assert.equal(buildFailureTopology(fleet([["a", "node-1", 0], ["b", "node-2", 0]])).verdict, "no_errors");
+  assert.equal(buildFailureTopology(fleet([["a", "node-1", 5], ["b", "node-1", 0]])).verdict, "single_node");
+  const unplaced = buildFailureTopology(fleet([["a", null, 5], ["b", null, 0]]));
+  assert.equal(unplaced.verdict, "insufficient");
+  assert.equal(unplaced.pods_without_node.length, 2);
+  assert.match(unplaced.note, /could not be placed/);
+});
+
+test("buildFailureTopology: uneven sampling across pods is called out", () => {
+  // Live: two of five gateway pods had lines in a sampled group, three did not.
+  const out = buildFailureTopology(
+    fleet([["gw-a", "node-1", 30], ["gw-b", "node-2", 3], ["gw-c", "node-3", 0]], { sampled: { "gw-b": true } }),
+  );
+  assert.equal(out.sampling.erroring_pods_with_sampled_lines, 1);
+  assert.equal(out.by_node.find((n) => n.node === "node-2").pods[0].sampled_errors, 3);
+  assert.match(out.note, /not strictly comparable/);
+});
+
+test("buildFailureTopology: bounded output", () => {
+  const spec = Array.from({ length: 30 }, (_, i) => [`p${i}`, `node-${i}`, i % 2]);
+  const out = buildFailureTopology({ ...fleet(spec), maxNodes: 5 });
+  assert.equal(out.by_node.length, 5);
+  assert.equal(out.by_node_truncated, 25);
+});
+
+test("buildFailureTopology: every error on a few of many nodes is nodes_concentrated, not spread", () => {
+  // Live: every "mongo" line across 777 control-plane pods sat on 5 of 39 nodes,
+  // each only ~25 points over its pod share. A per-node gap check called that
+  // "spread ... in proportion to where the pods run".
+  const spec = [];
+  for (let n = 0; n < 20; n++) {
+    for (let j = 0; j < 5; j++) {
+      let errors = 0;
+      if ((n === 0 || n === 1) && j < 2) errors = 10;
+      if (n === 2 && j === 0) errors = 10;
+      spec.push([`p${n}-${j}`, `node-${n}`, errors]);
+    }
+  }
+  const out = buildFailureTopology(fleet(spec));
+  assert.equal(out.verdict, "nodes_concentrated");
+  assert.deepEqual(out.concentration, { nodes_carrying_most_lines: 2, their_line_share_pct: 80, their_pod_share_pct: 10 });
+  assert.ok(out.distribution_distance_pct > 30, String(out.distribution_distance_pct));
+  assert.match(out.note, /2 of 20 nodes/);
+  assert.match(out.note, /node pool, a zone, a recent roll/);
+});
+
+test("buildFailureTopology: errors on half the fleet are not 'a few nodes'", () => {
+  const spec = Array.from({ length: 30 }, (_, i) => [`p${i}`, `node-${i}`, i % 2]);
+  const out = buildFailureTopology(fleet(spec));
+  assert.notEqual(out.verdict, "nodes_concentrated");
+  assert.equal(out.verdict, "uneven");
 });

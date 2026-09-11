@@ -36,6 +36,7 @@ not chained to one another.
 | `grafana_logs_context` | Every line around a moment in time, **unfiltered** — "what else was happening right then". Refuses a line filter, because a filter is what hides the continuation lines. |
 | `grafana_logs_noise` | What is actually filling a stream: lines reduced to their shape, ranked, each with a pasteable LogQL exclusion. Covers what pattern detection cannot see below its floor. |
 | `grafana_first_occurrence` | "When did this start?" — the exact first matching line (to the nanosecond), a per-minute ramp around it, and whether the pattern was already running before the window. |
+| `grafana_failure_topology` | "Is it the application or the node?" — matching log lines per pod, joined to nodes, with healthy sibling pods for contrast and a verdict. |
 | `grafana_find_customer` | Which customer or deployment is this, by name or by id — and **which cluster** they are on. Touches no logs. |
 | `grafana_http_requests` | HTTP request logs from both ingress controllers: status distribution, latency percentiles, retries, and failures per upstream pod and node. The only tool that can reach them (see below). |
 
@@ -109,6 +110,49 @@ points per series — unreadable in the digest and over the tool-result limit ra
 `grafana_query` now sends `intervalMs` from `max_data_points` (or an explicit
 `step`), reports `step_seconds`, and `output="timeline"` returns
 `[timestamp, value]` pairs so you can see *when* something changed.
+
+### Is it the application or the node?
+
+In an incident the cause only became clear once errors were grouped by pod and
+the pods joined to nodes: every failing pod sat on one node, and sibling pods on
+other nodes were healthy. That took three manual queries across Loki and
+Prometheus. `grafana_failure_topology` does it in one call:
+
+1. Matching lines per pod — a Loki count grouped by `cluster, namespace, pod` and
+   the sampling label.
+2. Sibling pods — the pods whose streams match the same selector in the window,
+   from Loki's index (`/series`, no log bodies). "Healthy" means logging, without
+   matching lines.
+3. Node placement — `kube_pod_info` via `GRAFANA_METRICS_DATASOURCE_UID`, batched
+   per cluster, 40 namespaces a query.
+
+Each node reports its share of matching lines **next to its share of pods**. A
+node running most of the pods is expected to carry most of the errors, so error
+share alone would single it out wrongly. The verdict — `node_concentrated`,
+`nodes_concentrated`, `spread`, `uneven`, `single_node`, `no_errors` or
+`insufficient` — comes from comparing the two over the whole fleet, and the
+thresholds are in every result:
+
+- `distribution_distance_pct` — how far where the lines are is from where the
+  pods are, over all nodes (half the summed difference of shares). Under 30% is
+  `spread`.
+- `concentration` — the fewest nodes carrying 80% of the lines and the share of
+  pods they run. Concentrated when that is at most half the pods, at least twice
+  their pod share, no more than a quarter of the nodes, and clean siblings exist
+  elsewhere.
+
+It is measured over the whole distribution because a per-node check cannot see
+concentration on several nodes. Checked live: every "mongo" line across 777
+control-plane pods sat on 5 of 39 nodes, each only ~25 points over its pod share,
+and a per-node check called that "spread".
+
+Sampling is reported per pod, and flagged when it is uneven: checked against the
+live instance, two of five gateway pods had lines in a sampled group and three
+did not, and a pod whose lines are not sampled looks worse than a sampled sibling
+with the same problem.
+
+For HTTP failures per upstream pod and node, `grafana_http_requests` already
+reports `by_upstream` and `by_node`.
 
 ### Who owns a broad result
 
