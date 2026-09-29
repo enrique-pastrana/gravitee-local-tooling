@@ -21,8 +21,8 @@ import {
   buildExactLogsQuery,
   toLokiNs,
   rankClientSuggestions,
-  splitClientEnv,
   matchNamespaces,
+  matchNamespacesPhrase,
   chooseInterval,
   durationSeconds,
   buildTrendBuckets,
@@ -71,7 +71,7 @@ import {
   buildFailureTopology,
   buildExploreLink,
 } from "./helpers.js";
-import { loadCustomerMap, warmCustomerMap, resolveCustomerNamespaces, matchCustomers, groupByCustomer, lookupById, dataPlaneNamespace, controlPlaneNamespace } from "./customerMap.js";
+import { loadCustomerMap, warmCustomerMap, resolveCustomerNamespaces, splitNameAndTail, matchCustomers, groupByCustomer, lookupById, dataPlaneNamespace, controlPlaneNamespace } from "./customerMap.js";
 
 // Loki datasource uid for the logs tools. Required — deliberately NOT defaulted:
 // a uid that is correct for one Grafana org is a silent, plausible failure in
@@ -370,8 +370,8 @@ async function fetchMatchingStreams({ query, from, to }) {
 // Returns which route answered, and any warning about the map's freshness, so a
 // caller can tell a live mapping from a fallback one.
 async function resolveNamespaces(client, { from, control_plane_id } = {}) {
-  const { core, envs } = splitClientEnv(client);
-  if (!core) return { namespaces: [], via: "none" };
+  const phrase = String(client || "").trim();
+  if (!phrase) return { namespaces: [], via: "none" };
 
   let values = [];
   try {
@@ -387,9 +387,15 @@ async function resolveNamespaces(client, { from, control_plane_id } = {}) {
   // both populations at once: acme has a hosted `acme-prod` namespace
   // AND Cockpit data planes under `apim-dp-cp1111-*`. Returning early on the
   // label match searched half its logs and reported that as the whole story.
-  const byLabel = matchNamespaces(values, core);
+  // Neither route classifies words. The namespace route matches the phrase as
+  // typed and gives ground one trailing word at a time; the map route asks the
+  // map where the customer name ends. What the caller meant by the last word is
+  // decided by what exists, not by a list of known environment names.
+  const label = matchNamespacesPhrase(values, phrase);
+  const byLabel = label.namespaces;
   const map = await loadCustomerMap();
-  const resolved = resolveCustomerNamespaces(map.rows, { core, envs, controlPlaneId: control_plane_id });
+  const { core, tail } = splitNameAndTail(map.rows, phrase);
+  const resolved = resolveCustomerNamespaces(map.rows, { core, qualifiers: tail, controlPlaneId: control_plane_id });
   const namespaces = [...new Set([...byLabel, ...resolved.namespaces])];
 
   // An ambiguous fragment contributes NOTHING from the map rather than merging
@@ -440,6 +446,9 @@ async function resolveNamespaces(client, { from, control_plane_id } = {}) {
   return {
     namespaces,
     via,
+    // The namespace route ignored the tail (no namespace carries it); say so, in
+    // case the map did not explain it either.
+    ...(label.tail.length && byLabel.length ? { namespace_match_ignored: label.tail.join(" ") } : {}),
     ...(absent.length ? { mapped_namespaces_absent_in_range: absent } : {}),
     ...(resolved.namespaces.length
       ? {
@@ -841,6 +850,11 @@ function resolutionReport(resolution = {}) {
     "label_namespaces",
     "matched_deployments",
     "env_filter_applied",
+    "namespace_match_ignored",
+    "unknown_qualifiers",
+    "known_environments",
+    "known_regions",
+    "qualifier_note",
     "shared_control_plane_namespaces",
     "ambiguous_customer",
     "candidates",
@@ -1265,29 +1279,12 @@ registerTool(
       let query = buildLogsQuery({ client, component, namespaces: pinned, caseSensitive: case_sensitive });
       let streams = await fetchMatchingStreams({ query, from, to });
 
-      // Env tokens (prod, stage, …) aren't reliably in the service_name either —
-      // some customers name their prod `plt-live`/`multitenant`. So if we pinned
-      // the customer's namespace, asked for an env, and got nothing, drop the env
-      // filter and retry once: the namespace pin still scopes us to the customer,
-      // which beats a misleading empty result. (We can't be perfect against
-      // legacy/inconsistent labels; this just maximizes useful hits.)
-      let env_filter_dropped = false;
-      if (streams.length === 0 && pinned && splitClientEnv(client).envs.length) {
-        const retryQuery = buildLogsQuery({ client: splitClientEnv(client).core, component, namespaces: pinned });
-        const retryStreams = await fetchMatchingStreams({ query: retryQuery, from, to });
-        if (retryStreams.length) {
-          query = retryQuery;
-          streams = retryStreams;
-          env_filter_dropped = true;
-        }
-      }
-
       // Re-attach the line filter to the reported query so the caller sees the
       // full LogQL (the discovery query above intentionally omitted it). Only
       // rebuild when there's actually a line filter to add — otherwise `query`
       // (already env-adjusted by the retry) is exactly what we'd produce.
       const reportedQuery = line_filter
-        ? buildLogsQuery({ client: env_filter_dropped ? splitClientEnv(client).core : client, component, lineFilter: line_filter, namespaces: pinned, caseSensitive: case_sensitive })
+        ? buildLogsQuery({ client, component, lineFilter: line_filter, namespaces: pinned, caseSensitive: case_sensitive })
         : query;
 
       const result = {
@@ -1297,7 +1294,6 @@ registerTool(
         scope_note: scopeNote(reportedQuery),
         resolved_namespaces: namespaces,
         ...resolutionReport(resolution),
-        ...(env_filter_dropped ? { env_filter_dropped: true } : {}),
         range: { from, to },
         matched_count: streams.length,
         matched_streams: streams,
@@ -1617,15 +1613,16 @@ registerTool(
   async ({ query, max_results = 20 }) =>
     withToolLogging("grafana_find_customer", { query }, async () => {
       const uid = requireDatasourceUid(LOGS_DATASOURCE_UID);
-      const { core } = splitClientEnv(query);
-      const needle = (core || query || "").trim();
+      const needle = String(query || "").trim();
 
       const map = await loadCustomerMap();
       // Ids are the only handle a Cockpit tenant has in an alert or a pod name, so
       // the reverse lookup is always attempted - no guessing whether the query
       // "looks like" an id.
       const byId = lookupById(map.rows, query);
-      const groups = groupByCustomer(matchCustomers(map.rows, needle));
+      // Ask the map where the name ends, so "acme recette" finds acme.
+      const { core: mapName } = splitNameAndTail(map.rows, needle);
+      const groups = groupByCustomer(matchCustomers(map.rows, mapName));
       const cockpit = [...groups.entries()]
         .map(([customer, rows]) => ({
           customer,

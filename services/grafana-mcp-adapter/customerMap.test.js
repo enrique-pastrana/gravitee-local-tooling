@@ -300,3 +300,37 @@ test("lookupById: a wholly unknown id says so rather than guessing", () => {
   assert.match(out.note, /Neither/);
   assert.equal(lookupById(parseCustomerCsv(CSV), ""), null);
 });
+
+// ---------------------------------------------------------------------------
+// Name and tail, decided by the map rather than a word list
+// ---------------------------------------------------------------------------
+
+const { splitNameAndTail } = await import("./customerMap.js");
+
+test("splitNameAndTail: the map decides where the name ends", () => {
+  const rows = parseCustomerCsv(CSV);
+  assert.deepEqual(splitNameAndTail(rows, "acme"), { core: "acme", tail: [] });
+  assert.deepEqual(splitNameAndTail(rows, "acme prod"), { core: "acme", tail: ["prod"] });
+  // The point of the change: an environment nobody listed is still a tail.
+  assert.deepEqual(splitNameAndTail(rows, "acme gatewaytesting"), { core: "acme", tail: ["gatewaytesting"] });
+  assert.deepEqual(splitNameAndTail(rows, "nosuchcustomer at all"), { core: "nosuchcustomer at all", tail: [] });
+});
+
+test("resolveCustomerNamespaces: a qualifier narrows by environment, region or provider", () => {
+  const rows = parseCustomerCsv(CSV);
+  const prod = resolveCustomerNamespaces(rows, { core: "acme", qualifiers: ["prod"] });
+  assert.deepEqual(prod.namespaces, ["apim-dp-cp1111-dp0001"]);
+  assert.equal(prod.env_filter_applied, true);
+  const byRegion = resolveCustomerNamespaces(rows, { core: "acme", qualifiers: ["unitedstates"] });
+  assert.equal(byRegion.namespaces.length, 2);
+});
+
+test("resolveCustomerNamespaces: a tail that describes nothing is reported, not silently dropped", () => {
+  // Enrique's question: what if the removed string matches no environment?
+  const rows = parseCustomerCsv(CSV);
+  const out = resolveCustomerNamespaces(rows, { core: "acme", qualifiers: ["gatewaytesting"] });
+  assert.equal(out.namespaces.length, 2, "all of the customer's deployments, not none");
+  assert.deepEqual(out.unknown_qualifiers, ["gatewaytesting"]);
+  assert.deepEqual(out.known_environments, ["dev", "prod"]);
+  assert.match(out.qualifier_note, /does not describe any deployment of acme/);
+});

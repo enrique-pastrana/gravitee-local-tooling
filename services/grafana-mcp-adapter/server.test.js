@@ -125,27 +125,21 @@ test("grafana_logs_link: line_filter attaches an explore_url fallback per drilld
 // grafana_logs_link: env auto-retry
 // ---------------------------------------------------------------------------
 
-test("grafana_logs_link: drops the env token and retries when the env-narrowed query is empty", async () => {
-  // Customer 'blueyonder' resolves to namespace 'blueyonder-plt-live'. The env
-  // 'prod' isn't in service_name (prod lives as 'plt-live'), so the first
-  // /series (env-narrowed) returns nothing; dropping 'prod' finds streams.
-  let seriesCall = 0;
+test("grafana_logs_link: a pinned namespace does not repeat the environment against service_name", async () => {
+  // Customers call production `plt-live` or `multitenant`, so a service_name
+  // filter of ".*prod.*" matched nothing and the tool retried without it. The
+  // namespace list already expresses the environment, so there is nothing to
+  // repeat and nothing to retry.
   await withLokiStub(
-    {
-      [NS_VALUES]: ["blueyonder-plt-live"],
-      [SERIES]: () => {
-        seriesCall += 1;
-        // First discovery (with the env token) is empty; the retry (env dropped)
-        // returns streams.
-        return seriesCall === 1 ? [] : [stream("blueyonder-plt-live", "by-live-gateway")];
-      },
-    },
-    async () => {
-      const out = await callTool("grafana_logs_link", { client: "blueyonder prod", component: "gateway" });
-      assert.equal(seriesCall, 2, "should have retried /series once");
-      assert.equal(out.env_filter_dropped, true);
-      assert.equal(out.matched_count, 1);
-      assert.deepEqual(out.resolved_namespaces, ["blueyonder-plt-live"]);
+    { [NS_VALUES]: ["orbit-plt-live"], [SERIES]: [stream("orbit-plt-live", "by-live-gateway")] },
+    async (calls) => {
+      const out = await callTool("grafana_logs_link", { client: "orbit prod", component: "gateway" });
+      assert.deepEqual(out.resolved_namespaces, ["orbit-plt-live"]);
+      assert.ok(!/prod/.test(out.query), out.query);
+      assert.equal(calls.filter((u) => u.includes(SERIES)).length, 1, "no retry should be needed");
+      assert.equal(out.env_filter_dropped, undefined);
+      // The word the namespaces could not account for is still reported.
+      assert.equal(out.namespace_match_ignored, "prod");
     },
   );
 });

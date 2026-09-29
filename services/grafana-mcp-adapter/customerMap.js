@@ -251,7 +251,38 @@ export function groupByCustomer(rows = []) {
 // thirdco and acme together), so including it would return one
 // customer's logs under another's name — wrong, and a data-boundary problem, not
 // just a precision one.
-export function resolveCustomerNamespaces(rows = [], { core, envs = [], includeControlPlane = false, controlPlaneId } = {}) {
+// Split a free-text phrase into a customer the map knows and a tail describing
+// the deployment, by asking the map instead of a word list.
+//
+// The old split classified each word against 16 known environment names. Anything
+// it had not seen stayed part of the customer name, so the name matched nobody:
+// measured across the whole map, 39 of 416 deployments could not be resolved at
+// all — `acme recette`, `beacon staging`, `orbit gatewaytesting`, and
+// `production` failing where `prod` worked.
+export function splitNameAndTail(rows = [], phrase = "") {
+  const words = String(phrase || "").trim().split(/\s+/).filter(Boolean);
+  for (let n = words.length; n > 0; n--) {
+    const core = words.slice(0, n).join(" ");
+    if (matchCustomers(rows, core).length) return { core, tail: words.slice(n) };
+  }
+  return { core: words.join(" "), tail: [] };
+}
+
+const normalise = (v) => String(v || "").toLowerCase().replace(/[\s_-]/g, "");
+
+// Does this deployment answer to that word? Environment, region and provider are
+// all things a person says out loud ("acme dev europe"), and region separates 30
+// of the 46 customer+environment pairs that have more than one deployment.
+function qualifierMatches(row, word) {
+  const w = normalise(word);
+  if (!w) return true;
+  return [row.env, row.region, row.provider].some((v) => {
+    const n = normalise(v);
+    return n && (n === w || (w.length >= 3 && n.startsWith(w)));
+  });
+}
+
+export function resolveCustomerNamespaces(rows = [], { core, envs = [], qualifiers = [], includeControlPlane = false, controlPlaneId } = {}) {
   const matched = matchCustomers(rows, core);
   if (!matched.length) return { matched: [], namespaces: [], control_plane_namespaces: [] };
 
@@ -276,7 +307,14 @@ export function resolveCustomerNamespaces(rows = [], { core, envs = [], includeC
   // Env words only narrow when they actually select something; a customer with no
   // matching env is better served by all of its deployments than by none.
   const envFiltered = wanted.length ? matched.filter((r) => r.env && wanted.includes(r.env)) : [];
-  const rowsToUse = envFiltered.length ? envFiltered : matched;
+  // Free-text qualifiers (the tail of the phrase) are matched against what the
+  // deployment actually is, not against a list of allowed words.
+  const quals = (qualifiers || []).map(String).filter(Boolean);
+  const qualFiltered = quals.length ? matched.filter((r) => quals.every((q) => qualifierMatches(r, q))) : [];
+  const rowsToUse = qualFiltered.length ? qualFiltered : envFiltered.length ? envFiltered : matched;
+  // A tail that describes none of this customer's deployments is reported, with
+  // what they do have — the answer to "what if the word matches no environment?".
+  const unknownQualifiers = quals.length && !qualFiltered.length ? quals : [];
 
   // A trial's control plane is its own: `apim-cp-trial-tt0002` hosts exactly that
   // trial (verified — every trial control plane maps to a single trial), unlike
@@ -298,7 +336,17 @@ export function resolveCustomerNamespaces(rows = [], { core, envs = [], includeC
     namespaces: includeControlPlane || allTrials ? [...namespaces, ...controlPlanes] : namespaces,
     control_plane_namespaces: controlPlanes,
     ...(allTrials ? { control_plane_is_single_tenant: true } : {}),
-    env_filter_applied: envFiltered.length > 0,
+    env_filter_applied: envFiltered.length > 0 || qualFiltered.length > 0,
+    ...(unknownQualifiers.length
+      ? {
+          unknown_qualifiers: unknownQualifiers,
+          known_environments: [...new Set(matched.map((r) => r.env).filter(Boolean))].sort(),
+          known_regions: [...new Set(matched.map((r) => r.region).filter(Boolean))].sort(),
+          qualifier_note:
+            `"${unknownQualifiers.join(" ")}" does not describe any deployment of ${matched[0].customer}: ` +
+            "all of their deployments are included instead. The environments and regions they do have are listed here.",
+        }
+      : {}),
     control_plane_ids: orgs,
     // Hazard 2: same name, several Cockpit organizations. Resolved, but said out
     // loud so a very wide answer is not mistaken for a precise one.

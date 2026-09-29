@@ -228,6 +228,43 @@ limit-1 query, and a per-minute ramp around it. Two things it will not do:
 
 `first_occurrence.ns` goes straight into `grafana_logs_context` as `at`.
 
+### Finding a customer without guessing which word is the environment
+
+`client: "acme rec"` has to be split into a customer and an environment. That
+split used to run against a list of 16 known environment words. A list cannot be
+finished: measured against every live customer, **38 of 82** multi-namespace
+customers have a suffix it did not contain (`staging`, `prd`, `sit`, `qualif`,
+`multitenant`, `plt-live-ap`), and `one customer`'s environments are `ab`, `ge`,
+`pr`, `se`.
+
+Worse, an unlisted word was not noticed at all. It stayed part of the name, the
+name matched nobody, and the answer was empty with no reason given — **39 of 416**
+Cockpit deployments (`acme recette`, `beacon staging`, and `production`
+failing where `prod` worked). The reverse bit too: seven namespaces are *called*
+`prod` or `dev`, so the split left an empty name.
+
+Nothing is classified now. Both routes match the phrase as typed, and give ground
+only when it matches nothing:
+
+- **Namespaces** in tiers — whole name, then whole `-` segments, then substring.
+  `orbit plt live` returns that namespace, not it plus its `-ap`/`-au`/`-eu`
+  siblings.
+- **The map** is asked where the name ends: drop one trailing word at a time
+  until a customer matches. The tail is then matched against what the deployment
+  *is* — environment, region or provider — so `acme dev europe` narrows, and a
+  tail describing nothing is reported along with the environments that customer
+  actually has.
+
+Measured live after the change: hosted **286 of 286** exact (was 104, with 7
+resolving to nothing), Cockpit **0** failures (was 39). The 133 Cockpit phrases
+that still return several deployments are genuinely several: 46 customer+
+environment pairs have more than one data plane, and region or provider
+separates 30 of them.
+
+One consequence: a pinned namespace already expresses the environment, so
+`service_name` no longer repeats it — and the "drop the env token and retry"
+fallback is gone with it.
+
 ### Compare against the same window, earlier
 
 `grafana_query`, `grafana_logs_trend` and `grafana_http_requests` take
