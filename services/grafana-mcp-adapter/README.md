@@ -579,6 +579,30 @@ map from GitHub at runtime and, if GitHub is unreachable AND no snapshot exists,
 reports that Gravitee Cloud customers cannot be resolved rather than failing or
 guessing. Hosted customers are unaffected either way — they resolve from Loki.
 
+### Customer-map environment variables
+
+The Gravitee Cloud customer map is fetched at runtime from a private GitHub repo.
+These variables control where it comes from and how it is cached. Only the token
+is required for a live fetch. Without it, the adapter falls back to the local
+snapshot (if you generated one) or reports that Cloud customers cannot be
+resolved. Hosted customers are not affected.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `GITHUB_PERSONAL_ACCESS_TOKEN` | *(none)* | Auth for the GitHub fetch. Used at **runtime** every time the map loads, not only by `npm run refresh-customers`. |
+| `GRAFANA_CUSTOMER_MAP_REPO` | `gravitee-io/cloud-deployments-configuration` | Repo holding the customer CSV. |
+| `GRAFANA_CUSTOMER_MAP_PATH` | `docs/summary/customers_summary.csv` | Path to the CSV inside that repo. |
+| `GRAFANA_CUSTOMER_MAP_REF` | `prod` | Branch or tag the CSV is read from. |
+| `GRAFANA_CUSTOMER_MAP_TTL_SECONDS` | `3600` | How long a successful fetch stays cached in memory. |
+| `GRAFANA_CUSTOMER_MAP_TIMEOUT_MS` | `5000` | Timeout for the GitHub fetch. |
+| `GRAFANA_CUSTOMER_MAP_STALE_DAYS` | `30` | Age after which the map is reported as stale. |
+
+> **Token type.** The token needs read access to
+> `gravitee-io/cloud-deployments-configuration`. In our tests a classic token
+> worked and a fine-grained one returned 404. We have not confirmed why. If you
+> use a fine-grained token and get a 404, check that its resource owner is
+> `gravitee-io` and that the org has approved it, or use a classic token instead.
+
 ### Why hosted customers are NOT in the bundled map
 
 The map covers Gravitee Cloud (Cockpit) tenants only. Hosted/standalone customers
