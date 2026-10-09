@@ -64,7 +64,22 @@ function buildSearch(params = {}) {
   return search;
 }
 
+// The adapter is read-only, and this is the one place every Grafana call passes
+// through, so the rule is enforced here rather than by convention at call sites.
+// GET reads. POST is allowed only for /ds/query, which Grafana requires for
+// queries even though it changes nothing. The path is matched exactly, so a
+// suffix, query string or dot segment cannot reach another endpoint.
+const POST_ALLOWED_PATHS = new Set(["/ds/query"]);
+
+export function assertReadOnlyRequest(method, path) {
+  const verb = String(method || "").toUpperCase();
+  if (verb === "GET") return;
+  if (verb === "POST" && POST_ALLOWED_PATHS.has(path)) return;
+  throw new Error(`Grafana adapter is read-only: refusing ${verb} ${path}`);
+}
+
 async function request(method, path, { params = {}, body } = {}) {
+  assertReadOnlyRequest(method, path);
   requireConfig();
   const search = buildSearch(params);
   const url = `${BASE_URL}/api${path}${search.size ? `?${search.toString()}` : ""}`;
