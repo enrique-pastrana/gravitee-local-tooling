@@ -159,6 +159,32 @@ async function resolveNamespaces(client, { from, control_plane_id } = {}) {
   const resolved = resolveCustomerNamespaces(map.rows, { core, qualifiers: tail, controlPlaneId: control_plane_id });
   const namespaces = [...new Set([...byLabel, ...resolved.namespaces])];
 
+  // control_plane_id only ever narrows. If it selected nothing from the map —
+  // an id that is not this customer's, a customer the map does not have, or a
+  // name too ambiguous to pick one customer — refuse instead of searching
+  // without it: the label route, or the caller's service_name fallback, would
+  // return logs the id was meant to exclude.
+  if (control_plane_id && !resolved.namespaces.length) {
+    const note =
+      resolved.reason && resolved.unknown_control_plane
+        ? resolved.reason
+        : resolved.ambiguous
+          ? `${resolved.reason} control_plane_id "${control_plane_id}" was not applied to any of them: pass the exact customer name.`
+          : `control_plane_id "${control_plane_id}" only narrows a Gravitee Cloud customer, and "${phrase}" is not one ` +
+            "in the customer map. Nothing was searched. Drop control_plane_id, or check the name.";
+    return {
+      namespaces: [],
+      via: "none",
+      unknown_control_plane: true,
+      requested_control_plane_id: control_plane_id,
+      control_plane_ids: resolved.control_plane_ids || [],
+      ...(resolved.ambiguous ? { ambiguous_customer: true, candidates: resolved.candidates } : {}),
+      note,
+      map_source: map.source,
+      map_warning: map.warning,
+    };
+  }
+
   // An ambiguous fragment contributes NOTHING from the map rather than merging
   // several customers together. The label route is unaffected — a hosted
   // customer that matched by name is still searched — but the caller is told
@@ -278,6 +304,8 @@ function resolutionReport(resolution = {}) {
     "organizations_note",
     "control_plane_ids",
     "mapped_namespaces_absent_in_range",
+    "unknown_control_plane",
+    "requested_control_plane_id",
   ]) {
     if (resolution[key] !== undefined && resolution[key] !== null) out[key] = resolution[key];
   }
@@ -420,6 +448,19 @@ registerTool(
       // live in a shared namespace (`prod`) resolve to [] and fall back to the
       // plain service_name match.
       const resolution = await resolveNamespaces(client, { from, control_plane_id });
+      // Refused before any stream discovery: with no namespaces the selector
+      // below would fall back to a service_name match across all of Loki.
+      if (resolution.unknown_control_plane) {
+        return textResult({
+          refused: true,
+          link_style,
+          resolved_namespaces: [],
+          ...resolutionReport(resolution),
+          range: { from, to },
+          links: [],
+          note: resolution.note,
+        });
+      }
       const namespaces = resolution.namespaces;
       const pinned = namespaces.length ? namespaces : undefined;
       // The selector we discover streams with carries no line filter — /series
