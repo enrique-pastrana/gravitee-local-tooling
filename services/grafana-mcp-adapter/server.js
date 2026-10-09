@@ -19,10 +19,21 @@ import {
   buildExactLogsQuery,
   toLokiNs,
   rankClientSuggestions,
+  matchNamespaces,
   matchNamespacesPhrase,
   requireDatasourceUid,
 } from "./helpers.js";
-import { loadCustomerMap, warmCustomerMap, resolveCustomerNamespaces, splitNameAndTail } from "./customerMap.js";
+import {
+  loadCustomerMap,
+  warmCustomerMap,
+  resolveCustomerNamespaces,
+  splitNameAndTail,
+  matchCustomers,
+  groupByCustomer,
+  lookupById,
+  dataPlaneNamespace,
+  controlPlaneNamespace,
+} from "./customerMap.js";
 
 // Loki datasource uid for the logs tools. Required — deliberately NOT defaulted:
 // a uid that is correct for one Grafana org is a silent, plausible failure in
@@ -394,7 +405,7 @@ registerTool(
       .enum(["drilldown", "explore"])
       .default("drilldown")
       .describe("Link format: 'drilldown' (Logs Drilldown app, per-namespace; default) or 'explore' (raw LogQL Explore)."),
-    control_plane_id: z.string().optional().describe("Narrow to one Cockpit organization when a customer name spans several."),
+    control_plane_id: z.string().optional().describe("Narrow to one Cockpit organization when a customer name spans several (see grafana_find_customer)."),
     from: z.string().default("now-1h").describe("Range start, e.g. 'now-1h', 'now-6h', or epoch ms."),
     to: z.string().default("now").describe("Range end, e.g. 'now' or epoch ms."),
   },
@@ -490,8 +501,8 @@ registerTool(
           result.note =
             `No log streams matched, and ${absent.length} of the mapped namespace(s) (${absent.join(", ")}) do not ` +
             "appear in Loki for this range at all. That usually means the customer map is stale — the deployment was " +
-            "recreated under a new id — rather than that the customer has no logs. Widen from/to in case the " +
-            "deployment is simply dormant.";
+            "recreated under a new id — rather than that the customer has no logs. Check grafana_find_customer, or " +
+            "widen from/to in case the deployment is simply dormant.";
         } else if (namespaces.length) {
           result.note = `No log streams in this range for namespace(s) ${namespaces.join(", ")}. Try widening from/to or relaxing component/env.`;
         } else {
@@ -503,6 +514,129 @@ registerTool(
             result.note = `No log streams matched in this range. Try widening from/to or adjusting client/component.`;
           }
         }
+      }
+      return textResult(result);
+    }),
+);
+
+// An id or namespace as it appears in an alert, a pod name or a dashboard
+// (`apim-dp-cp1111-dp0001`, `cp1111-dp0001`), as opposed to a customer name.
+const ID_SHAPED = /^(apim-(dp|cp)-[0-9a-z-]+|[0-9a-z]+(-[0-9a-z]+)+)$/i;
+
+registerTool(
+  "grafana_find_customer",
+  "Read-only: find which customers and deployments match a name, WITHOUT querying any " +
+    "logs. Use this when a name is ambiguous, when grafana_logs_link reports " +
+    "ambiguous_customer, or simply to see what a customer has. Searches both populations: " +
+    "Gravitee Cloud (Cockpit) customers via the deployment map, and hosted customers via " +
+    "Loki's namespace label. Returns per customer: deployment count, Cockpit organizations " +
+    "(control plane ids), environments, regions and the exact namespaces — so the caller can " +
+    "pass a precise client (or control_plane_id) to grafana_logs_link.",
+  {
+    query: z
+      .string()
+      .describe(
+        "Customer name or fragment ('money', 'orbit'), OR an id/namespace seen in an alert, pod or " +
+          "dashboard ('apim-dp-cp1111-dp0001', 'cp1111-dp0001', 'cp1111') to look up who owns it.",
+      ),
+    max_results: z.number().int().min(1).max(50).default(20).optional(),
+  },
+  async ({ query, max_results = 20 }) =>
+    withToolLogging("grafana_find_customer", { query }, async () => {
+      const uid = requireDatasourceUid(LOGS_DATASOURCE_UID);
+      const needle = String(query || "").trim();
+
+      const map = await loadCustomerMap();
+      // Ids are the only handle a Cockpit tenant has in an alert or a pod name, so
+      // the reverse lookup is always attempted - no guessing whether the query
+      // "looks like" an id.
+      const byId = lookupById(map.rows, query);
+      // Ask the map where the name ends, so "acme recette" finds acme.
+      const { core: mapName } = splitNameAndTail(map.rows, needle);
+      const groups = groupByCustomer(matchCustomers(map.rows, mapName));
+      const cockpit = [...groups.entries()]
+        .map(([customer, rows]) => ({
+          customer,
+          kind: "gravitee_cloud",
+          deployments: rows.length,
+          organizations: [...new Set(rows.map((r) => r.control_plane_id).filter(Boolean))],
+          envs: [...new Set(rows.map((r) => r.env).filter(Boolean))].sort(),
+          regions: [...new Set(rows.map((r) => r.region).filter(Boolean))].sort(),
+          namespaces: [...new Set(rows.map((r) => dataPlaneNamespace(r.data_plane_id)))],
+          shared_control_plane_namespaces: [
+            ...new Set(rows.map((r) => r.control_plane_id).filter(Boolean).map(controlPlaneNamespace)),
+          ],
+        }))
+        .sort((a, b) => a.customer.localeCompare(b.customer));
+
+      // Hosted customers have no map entry; their namespace carries the name.
+      let hostedNamespaces = [];
+      let allNamespaces = [];
+      try {
+        const data = await grafanaDatasourceProxyGet(uid, "loki/api/v1/label/namespace/values", {
+          // 30 days: a deployment absent over that window is gone, not merely quiet.
+          start: toLokiNs("now-30d", 30 * 24 * 3600),
+        });
+        allNamespaces = data?.data || [];
+        hostedNamespaces = matchNamespaces(allNamespaces, needle);
+      } catch {
+        hostedNamespaces = [];
+      }
+
+      // Data planes that are live on this customer's control planes but which the
+      // map does not attribute to anyone. They may belong to another customer on
+      // the same (shared) control plane, so they are reported as unattributed and
+      // never folded into the customer's namespaces.
+      const mappedNs = new Set(map.rows.map((r) => dataPlaneNamespace(r.data_plane_id)));
+      const cpOf = (n) => n.replace("apim-dp-", "").split("-").slice(0, -1).join("-");
+      for (const entry of cockpit) {
+        const unattributed = allNamespaces.filter(
+          (n) => n.startsWith("apim-dp-") && entry.organizations.includes(cpOf(n)) && !mappedNs.has(n),
+        );
+        if (unattributed.length) {
+          entry.unattributed_namespaces_on_same_control_plane = unattributed;
+          entry.unattributed_note =
+            "Live data planes on this customer's control plane that the map does not attribute to any customer. " +
+            "A control plane is shared, so these may belong to someone else — they are NOT searched as this customer.";
+        }
+      }
+
+      const result = {
+        query,
+        ...(byId && byId.kind !== "unknown" ? { matched_by_id: byId } : {}),
+        map_source: map.source,
+        ...(map.generated_at ? { map_generated_at: map.generated_at } : {}),
+        ...(map.generated_days_ago !== undefined ? { map_generated_days_ago: map.generated_days_ago } : {}),
+        ...(map.warning ? { map_warning: map.warning } : {}),
+        gravitee_cloud_customers: cockpit.slice(0, max_results),
+        gravitee_cloud_truncated: cockpit.length > max_results ? cockpit.length - max_results : 0,
+        hosted_namespaces: hostedNamespaces,
+      };
+
+      if (cockpit.length > 1) {
+        result.note =
+          `"${query}" matches ${cockpit.length} different Gravitee Cloud customers. The log tools will not ` +
+          "search them together — pass one exact customer name.";
+      } else if (cockpit.length === 1 && cockpit[0].organizations.length > 1) {
+        result.note =
+          `"${cockpit[0].customer}" spans ${cockpit[0].organizations.length} separate Cockpit organizations ` +
+          `(${cockpit[0].organizations.join(", ")}). Pass control_plane_id to narrow to one.`;
+      } else if (byId && byId.kind === "unknown" && !cockpit.length && ID_SHAPED.test(query.trim())) {
+        // A live namespace the map cannot attribute — 116 of these exist, 67 on
+        // control planes the CSV has never heard of. Saying nothing here would
+        // leave the caller thinking the lookup simply failed, when the real
+        // answer is "this exists and nobody knows whose it is".
+        const live = hostedNamespaces.length > 0;
+        result.note =
+          `${byId.note}${live ? " The namespace does exist in Loki, so this is a real deployment the map does not " +
+          "cover — you can still query it directly by namespace, but its owner cannot be determined from the map." : ""}`;
+      } else if (byId && byId.kind !== "unknown" && byId.note) {
+        result.note = byId.note;
+      } else if (!cockpit.length && !hostedNamespaces.length) {
+        result.note =
+          byId && byId.kind === "unknown"
+            ? `No Gravitee Cloud customer, hosted namespace, or known id matched "${query}".`
+            : `No Gravitee Cloud customer or hosted namespace matched "${query}".`;
       }
       return textResult(result);
     }),
