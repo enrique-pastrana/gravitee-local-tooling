@@ -266,6 +266,26 @@ test("grafana_logs_link: an env word narrows the map to that deployment", async 
   );
 });
 
+test("grafana_logs_link: an env word matching no deployment widens to all, and says so", async () => {
+  // Regression: the map computed this note and resolveNamespaces dropped it, so
+  // the caller got every environment's logs with no sign that "staging" was
+  // ignored.
+  await withLokiStub(
+    {
+      [NS_VALUES]: ["apim-dp-cp1111-dp0001", "apim-dp-cp1111-dp0002", "apim-dp-cp1111-dp0003"],
+      [SERIES]: [stream("apim-dp-cp1111-dp0001", "apim-gateway")],
+    },
+    async () => {
+      const out = await callTool("grafana_logs_link", { client: "acme staging" });
+      assert.equal(out.resolved_namespaces.length, 3);
+      assert.equal(out.env_filter_applied, false);
+      assert.deepEqual(out.unknown_qualifiers, ["staging"]);
+      assert.deepEqual(out.known_environments, ["dev", "prod", "qa"]);
+      assert.match(out.qualifier_note, /"staging" does not describe any deployment of acme/);
+    },
+  );
+});
+
 test("grafana_logs_link: no streams for a mapped namespace Loki does not know -> stale-map note", async () => {
   // acme qa maps to dp0003, which Loki has never seen in this range. "No logs for
   // this customer" would be a false negative; the likelier cause is a stale map.

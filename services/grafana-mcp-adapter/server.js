@@ -254,6 +254,17 @@ async function resolveNamespaces(client, { from, control_plane_id } = {}) {
       env: r.env,
     })),
     env_filter_applied: resolved.env_filter_applied,
+    // A tail that describes none of the customer's deployments widens to all of
+    // them. Say so, with what they do have, rather than let the wider answer pass
+    // for the one asked for.
+    ...(resolved.unknown_qualifiers
+      ? {
+          unknown_qualifiers: resolved.unknown_qualifiers,
+          known_environments: resolved.known_environments,
+          known_regions: resolved.known_regions,
+          qualifier_note: resolved.qualifier_note,
+        }
+      : {}),
     control_plane_ids: resolved.control_plane_ids,
     ...(resolved.spans_multiple_organizations
       ? { spans_multiple_organizations: true, organizations_note: resolved.organizations_note }

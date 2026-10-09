@@ -93,6 +93,9 @@ The response also says how the customer was found:
   ever narrows; it is never dropped to search more widely.
 - `namespace_match_ignored` — trailing words no namespace carries (e.g. `prod`
   for a customer whose production namespace is `orbit-plt-live`).
+- `unknown_qualifiers`, `known_environments`, `known_regions`, `qualifier_note`
+  — the trailing words describe none of the Cloud customer's deployments, so
+  all of them were included. Lists the environments and regions it does have.
 - `mapped_namespaces_absent_in_range` — namespaces the map lists that Loki has
   not seen in this range. When nothing matches and these exist, the `note` says
   the map is probably stale rather than reporting "no logs".
