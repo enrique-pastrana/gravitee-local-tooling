@@ -153,3 +153,83 @@ test("grafanaPost: sends JSON body with Content-Type", async () => {
   assert.equal(capturedOpts.headers["Content-Type"], "application/json");
   assert.deepEqual(JSON.parse(capturedOpts.body), { from: "now-1h", to: "now", queries: [] });
 });
+
+// ---------------------------------------------------------------------------
+// Read-only enforcement at the HTTP boundary
+// ---------------------------------------------------------------------------
+
+function stubFetch() {
+  const calls = [];
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = (url, opts) => {
+    calls.push({ url, opts });
+    return Promise.resolve({
+      ok: true,
+      text: () => Promise.resolve("{}"),
+      headers: { get: () => null },
+    });
+  };
+  return { calls, restore: () => (globalThis.fetch = origFetch) };
+}
+
+const ENABLED_ENV = {
+  GRAFANA_ENABLED: "true",
+  GRAFANA_BASE_URL: "https://g.example.com",
+  GRAFANA_TOKEN: "glsa_secret",
+};
+
+test("grafanaPost: refuses any path other than /ds/query without calling fetch", async () => {
+  const { grafanaPost } = await freshClient(ENABLED_ENV);
+  const { calls, restore } = stubFetch();
+  try {
+    for (const path of [
+      "/dashboards/db",
+      "/annotations",
+      "/alertmanager/grafana/api/v2/silences",
+      "/datasources/proxy/uid/loki/loki/api/v1/push",
+      "/ds/query/../dashboards/db",
+      "/ds/query/",
+      "/ds/query?x=1",
+      "/DS/QUERY",
+    ]) {
+      await assert.rejects(() => grafanaPost(path, {}), /read-only: refusing POST/, path);
+    }
+  } finally {
+    restore();
+  }
+  assert.equal(calls.length, 0, "a refused request must never reach the network");
+});
+
+test("grafanaPost and grafanaGet: allowed requests reach fetch", async () => {
+  const { grafanaPost, grafanaGet, grafanaDatasourceProxyGet } = await freshClient(ENABLED_ENV);
+  const { calls, restore } = stubFetch();
+  try {
+    await grafanaPost("/ds/query", { queries: [] });
+    await grafanaGet("/datasources");
+    await grafanaDatasourceProxyGet("loki-uid", "loki/api/v1/query_range", { query: "{a=\"b\"}" });
+  } finally {
+    restore();
+  }
+  assert.deepEqual(
+    calls.map((c) => [c.opts.method, new URL(c.url).pathname]),
+    [
+      ["POST", "/api/ds/query"],
+      ["GET", "/api/datasources"],
+      ["GET", "/api/datasources/proxy/uid/loki-uid/loki/api/v1/query_range"],
+    ],
+  );
+});
+
+test("assertReadOnlyRequest: mutating verbs are refused on every path", async () => {
+  const { assertReadOnlyRequest } = await freshClient(ENABLED_ENV);
+  for (const verb of ["PUT", "PATCH", "DELETE", "put", undefined]) {
+    assert.throws(() => assertReadOnlyRequest(verb, "/ds/query"), /read-only/, String(verb));
+  }
+  assert.doesNotThrow(() => assertReadOnlyRequest("get", "/anything"));
+  assert.doesNotThrow(() => assertReadOnlyRequest("POST", "/ds/query"));
+});
+
+test("read-only check runs before config validation", async () => {
+  const { grafanaPost } = await freshClient({ GRAFANA_ENABLED: "false" });
+  await assert.rejects(() => grafanaPost("/dashboards/db", {}), /read-only/);
+});
