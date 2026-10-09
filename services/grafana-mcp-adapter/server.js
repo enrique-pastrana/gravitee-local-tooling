@@ -19,10 +19,10 @@ import {
   buildExactLogsQuery,
   toLokiNs,
   rankClientSuggestions,
-  splitClientEnv,
-  matchNamespaces,
+  matchNamespacesPhrase,
   requireDatasourceUid,
 } from "./helpers.js";
+import { loadCustomerMap, warmCustomerMap, resolveCustomerNamespaces, splitNameAndTail } from "./customerMap.js";
 
 // Loki datasource uid for the logs tools. Required — deliberately NOT defaulted:
 // a uid that is correct for one Grafana org is a silent, plausible failure in
@@ -105,18 +105,24 @@ async function fetchMatchingStreams({ query, from, to }) {
   }));
 }
 
-// Resolve a free-text `client` to the customer's own namespace(s). Many
-// customers have a dedicated namespace that names them (`april-prod`,
-// `blueyonder-plt-live`) — that namespace is the most reliable customer
-// identifier, more so than `service_name` (which for some tenants carries an
-// opaque id, not the name). We fetch the `namespace` label values and keep the
-// ones whose name contains the customer "core" (env tokens excluded — they
-// aren't reliably in the namespace). Returns [] for customers that only live in
-// a shared namespace (e.g. `prod`), which tells the caller to fall back to a
-// plain `service_name` match.
-async function resolveNamespaces(client, { from } = {}) {
-  const { core } = splitClientEnv(client);
-  if (!core) return [];
+// Resolve a free-text client to the namespaces holding its logs, by two routes:
+//
+//  1. The namespace label itself. Hosted/standalone customers get a namespace
+//     named after them (`april-prod`, `demo-qa`), so matching label values works.
+//
+//  2. The Gravitee Cloud customer map. Cockpit tenants live in
+//     `apim-dp-<controlPlaneId>-<dataPlaneId>` and carry their name NOWHERE in
+//     their labels, so route 1 returns nothing for them however the name is
+//     spelled — the customers this tooling is most useful for were exactly the
+//     ones it could not find.
+//
+// Returns which route answered, and any warning about the map's freshness, so a
+// caller can tell a live mapping from a fallback one. An empty `namespaces`
+// tells the caller to fall back to a plain `service_name` match.
+async function resolveNamespaces(client, { from, control_plane_id } = {}) {
+  const phrase = String(client || "").trim();
+  if (!phrase) return { namespaces: [], via: "none" };
+
   let values = [];
   try {
     const data = await grafanaDatasourceProxyGet(LOGS_DATASOURCE_UID, "loki/api/v1/label/namespace/values", {
@@ -124,9 +130,102 @@ async function resolveNamespaces(client, { from } = {}) {
     });
     values = data?.data || [];
   } catch {
-    return [];
+    values = [];
   }
-  return matchNamespaces(values, core);
+
+  // BOTH routes, always — never stop at the first hit. A customer can exist in
+  // both populations at once: acme has a hosted `acme-prod` namespace
+  // AND Cockpit data planes under `apim-dp-cp1111-*`. Returning early on the
+  // label match searched half its logs and reported that as the whole story.
+  // Neither route classifies words. The namespace route matches the phrase as
+  // typed and gives ground one trailing word at a time; the map route asks the
+  // map where the customer name ends. What the caller meant by the last word is
+  // decided by what exists, not by a list of known environment names.
+  const label = matchNamespacesPhrase(values, phrase);
+  const byLabel = label.namespaces;
+  const map = await loadCustomerMap();
+  const { core, tail } = splitNameAndTail(map.rows, phrase);
+  const resolved = resolveCustomerNamespaces(map.rows, { core, qualifiers: tail, controlPlaneId: control_plane_id });
+  const namespaces = [...new Set([...byLabel, ...resolved.namespaces])];
+
+  // An ambiguous fragment contributes NOTHING from the map rather than merging
+  // several customers together. The label route is unaffected — a hosted
+  // customer that matched by name is still searched — but the caller is told
+  // which Cockpit customers were withheld and why.
+  // A customer that does not resolve may simply be missing from a stale map, and
+  // that is a different answer from "no such customer".
+  if (resolved.ambiguous) {
+    return {
+      namespaces: byLabel,
+      via: byLabel.length ? "namespace_label" : "none",
+      ambiguous_customer: true,
+      candidates: resolved.candidates,
+      note: resolved.reason,
+      map_source: map.source,
+      map_warning: map.warning,
+    };
+  }
+
+  if (!namespaces.length) {
+    return {
+      namespaces: [],
+      via: "none",
+      map_source: map.source,
+      map_generated_at: map.generated_at,
+      map_generated_days_ago: map.generated_days_ago,
+      map_warning: map.warning,
+    };
+  }
+
+  const via =
+    byLabel.length && resolved.namespaces.length
+      ? "namespace_label+customer_map"
+      : byLabel.length
+        ? "namespace_label"
+        : "customer_map";
+
+  // The map is not complete or eternally fresh: measured against a 30-day window,
+  // 129 of 462 live data planes are absent from it, and some customers' mapped
+  // ids no longer exist because their deployment was recreated. A mapped
+  // namespace that Loki has never heard of in this range would otherwise produce
+  // a confident "no logs for this customer" — a false negative dressed as an
+  // answer. Flag it instead.
+  const liveNamespaces = new Set(values);
+  const absent = resolved.namespaces.filter((n) => !liveNamespaces.has(n));
+
+  return {
+    namespaces,
+    via,
+    // The namespace route ignored the tail (no namespace carries it); say so, in
+    // case the map did not explain it either.
+    ...(label.tail.length && byLabel.length ? { namespace_match_ignored: label.tail.join(" ") } : {}),
+    ...(absent.length ? { mapped_namespaces_absent_in_range: absent } : {}),
+    ...(resolved.namespaces.length
+      ? {
+          map_source: map.source,
+          map_generated_at: map.generated_at,
+          map_generated_days_ago: map.generated_days_ago,
+          map_warning: map.warning,
+        }
+      : {}),
+    label_namespaces: byLabel,
+    matched_deployments: resolved.matched.map((r) => ({
+      customer: r.customer,
+      data_plane_id: r.data_plane_id,
+      region: r.region,
+      provider: r.provider,
+      env: r.env,
+    })),
+    env_filter_applied: resolved.env_filter_applied,
+    control_plane_ids: resolved.control_plane_ids,
+    ...(resolved.spans_multiple_organizations
+      ? { spans_multiple_organizations: true, organizations_note: resolved.organizations_note }
+      : {}),
+    // Control-plane namespaces are SHARED by every customer on that control
+    // plane, so they are never searched implicitly under one customer's name.
+    // Reported so the caller knows they exist and can ask for them explicitly.
+    shared_control_plane_namespaces: resolved.control_plane_namespaces,
+  };
 }
 
 // When a logs query returns nothing, the `client` text often just doesn't match
@@ -143,6 +242,37 @@ async function suggestClients(client, { from } = {}) {
     return [];
   }
   return rankClientSuggestions(values, client);
+}
+
+// The parts of a resolution worth returning to the caller: how the customer was
+// found, and whether the mapping behind it was live or a fallback.
+function resolutionReport(resolution = {}) {
+  const out = { resolved_via: resolution.via };
+  for (const key of [
+    "map_source",
+    "map_generated_at",
+    "map_generated_days_ago",
+    "label_namespaces",
+    "matched_deployments",
+    "env_filter_applied",
+    "namespace_match_ignored",
+    "unknown_qualifiers",
+    "known_environments",
+    "known_regions",
+    "qualifier_note",
+    "shared_control_plane_namespaces",
+    "ambiguous_customer",
+    "candidates",
+    "spans_multiple_organizations",
+    "organizations_note",
+    "control_plane_ids",
+    "mapped_namespaces_absent_in_range",
+  ]) {
+    if (resolution[key] !== undefined && resolution[key] !== null) out[key] = resolution[key];
+  }
+  if (resolution.map_warning) out.map_warning = resolution.map_warning;
+  if (resolution.note) out.customer_note = resolution.note;
+  return out;
 }
 
 async function withToolLogging(tool, fields, fn) {
@@ -264,10 +394,11 @@ registerTool(
       .enum(["drilldown", "explore"])
       .default("drilldown")
       .describe("Link format: 'drilldown' (Logs Drilldown app, per-namespace; default) or 'explore' (raw LogQL Explore)."),
+    control_plane_id: z.string().optional().describe("Narrow to one Cockpit organization when a customer name spans several."),
     from: z.string().default("now-1h").describe("Range start, e.g. 'now-1h', 'now-6h', or epoch ms."),
     to: z.string().default("now").describe("Range end, e.g. 'now' or epoch ms."),
   },
-  async ({ client, component, line_filter, link_style = "drilldown", from = "now-1h", to = "now" }) =>
+  async ({ client, component, line_filter, link_style = "drilldown", control_plane_id, from = "now-1h", to = "now" }) =>
     withToolLogging("grafana_logs_link", { client, component, link_style, from, to }, async () => {
       // Fail loudly and once, rather than querying a nonexistent datasource and
       // reporting "no log streams matched" for what is really a config error.
@@ -277,44 +408,27 @@ registerTool(
       // whereas `service_name` doesn't for every tenant. Customers that only
       // live in a shared namespace (`prod`) resolve to [] and fall back to the
       // plain service_name match.
-      const namespaces = await resolveNamespaces(client, { from });
+      const resolution = await resolveNamespaces(client, { from, control_plane_id });
+      const namespaces = resolution.namespaces;
       const pinned = namespaces.length ? namespaces : undefined;
       // The selector we discover streams with carries no line filter — /series
       // matches on the stream selector only, and the line_filter is applied in
       // the generated link itself, not here.
-      let query = buildLogsQuery({ client, component, namespaces: pinned });
-      let streams = await fetchMatchingStreams({ query, from, to });
-
-      // Env tokens (prod, stage, …) aren't reliably in the service_name either —
-      // some customers name their prod `plt-live`/`multitenant`. So if we pinned
-      // the customer's namespace, asked for an env, and got nothing, drop the env
-      // filter and retry once: the namespace pin still scopes us to the customer,
-      // which beats a misleading empty result. (We can't be perfect against
-      // legacy/inconsistent labels; this just maximizes useful hits.)
-      let env_filter_dropped = false;
-      if (streams.length === 0 && pinned && splitClientEnv(client).envs.length) {
-        const retryQuery = buildLogsQuery({ client: splitClientEnv(client).core, component, namespaces: pinned });
-        const retryStreams = await fetchMatchingStreams({ query: retryQuery, from, to });
-        if (retryStreams.length) {
-          query = retryQuery;
-          streams = retryStreams;
-          env_filter_dropped = true;
-        }
-      }
+      const query = buildLogsQuery({ client, component, namespaces: pinned });
+      const streams = await fetchMatchingStreams({ query, from, to });
 
       // Re-attach the line filter to the reported query so the caller sees the
       // full LogQL (the discovery query above intentionally omitted it). Only
-      // rebuild when there's actually a line filter to add — otherwise `query`
-      // (already env-adjusted by the retry) is exactly what we'd produce.
+      // rebuild when there's actually a line filter to add.
       const reportedQuery = line_filter
-        ? buildLogsQuery({ client: env_filter_dropped ? splitClientEnv(client).core : client, component, lineFilter: line_filter, namespaces: pinned })
+        ? buildLogsQuery({ client, component, lineFilter: line_filter, namespaces: pinned })
         : query;
 
       const result = {
         query: reportedQuery,
         link_style,
         resolved_namespaces: namespaces,
-        ...(env_filter_dropped ? { env_filter_dropped: true } : {}),
+        ...resolutionReport(resolution),
         range: { from, to },
         matched_count: streams.length,
         matched_streams: streams,
@@ -371,7 +485,14 @@ registerTool(
       // component/env narrowed too far). Otherwise the `client` text likely
       // didn't match any service_name; offer close matches to correct it.
       if (streams.length === 0) {
-        if (namespaces.length) {
+        const absent = resolution.mapped_namespaces_absent_in_range || [];
+        if (absent.length) {
+          result.note =
+            `No log streams matched, and ${absent.length} of the mapped namespace(s) (${absent.join(", ")}) do not ` +
+            "appear in Loki for this range at all. That usually means the customer map is stale — the deployment was " +
+            "recreated under a new id — rather than that the customer has no logs. Widen from/to in case the " +
+            "deployment is simply dormant.";
+        } else if (namespaces.length) {
           result.note = `No log streams in this range for namespace(s) ${namespaces.join(", ")}. Try widening from/to or relaxing component/env.`;
         } else {
           const suggestions = await suggestClients(client, { from });
@@ -393,6 +514,9 @@ registerTool(
 
 async function main() {
   log("info", "Starting MCP adapter", { enabled: ENABLED, base_url: BASE_URL || null });
+  // Warm the customer map now, so the GitHub round trip overlaps the MCP
+  // handshake instead of being paid by whoever runs the first query.
+  warmCustomerMap();
   const transport = new StdioServerTransport();
   await server.connect(transport);
   log("info", "MCP adapter connected", { transport: "stdio" });
